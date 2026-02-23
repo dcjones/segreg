@@ -1,0 +1,13 @@
+[project]
+name = "segreg"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "anndata>=0.12.7",
+    "jax[cuda12]>=0.8.2",
+    "optax>=0.2.6",
+    "patsy>=1.0.2",
+    "tqdm>=4.67.1",
+]
