@@ -28,16 +28,20 @@ class Dataset:
         2. Jax's jit will recompile if the input array sizes change, so we have to pad these to always be the same length.
     """
 
-    def __init__(self, X: csr_matrix, P: csr_matrix, batch_size: int):
+    def __init__(self, X: csr_matrix, P: csr_matrix, D: np.ndarray, batch_size: int):
         assert isinstance(X, csr_matrix)
         assert isinstance(P, csr_matrix)
+        assert isinstance(D, np.ndarray)
 
         m, n = X.shape
         assert P.shape[0] == m and P.shape[1] == m
+        assert D.shape[0] == m
 
         X = X.astype(np.float32)
         P = P.astype(np.float32)
+        D = D.astype(np.float32)
         self.n = n
+        self.k = D.shape[1]
 
         # Shuffle once at initialization
         idx = np.arange(m)
@@ -131,8 +135,29 @@ class Dataset:
             else:
                 p_indptr = p_sliced.indptr.copy()
 
+            d_sliced = D[batch_neighborhood_idx, :]
+            if x_nrows_pad > 0:
+                d_data = np.concatenate(
+                    [
+                        d_sliced,
+                        np.zeros((x_nrows_pad, self.k), dtype=np.float32),
+                    ],
+                    axis=0,
+                )
+            else:
+                d_data = d_sliced.copy()
+
             self._batches.append(
-                (n_target, x_data, x_indices, x_indptr, p_data, p_indices, p_indptr)
+                (
+                    n_target,
+                    x_data,
+                    x_indices,
+                    x_indptr,
+                    p_data,
+                    p_indices,
+                    p_indptr,
+                    d_data,
+                )
             )
 
         self.max_nrows = max_nrows
@@ -147,7 +172,9 @@ class Dataset:
             p_data,
             p_indices,
             p_indptr,
+            d_data,
         ) in self._batches:
+
             x_batch = BCSR(
                 (
                     jnp.array(x_data),
@@ -166,7 +193,9 @@ class Dataset:
                 shape=(self.max_nrows, self.max_nrows),
             )
 
+            d_batch = jnp.array(d_data)
+
             # Mask identifying the target cells in the batch (the first n_target rows)
             mask = jnp.arange(self.max_nrows) < n_target
 
-            yield x_batch, p_batch, mask
+            yield x_batch, p_batch, d_batch, mask

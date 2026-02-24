@@ -34,6 +34,8 @@ class RegressionModel:
         m, n = adata.shape
 
         design = cast(DesignMatrix, dmatrix(formula, adata.obs))
+        # Convert design matrix to a plain numpy array
+        D = np.asarray(design)
 
         if batch_size is None:
             batch_size = m
@@ -44,11 +46,11 @@ class RegressionModel:
         P = adata.obsp["state_transitions"]
         assert isinstance(P, csr_matrix)
 
-        self._dataset = Dataset(adata.X, P, batch_size)
+        self._dataset = Dataset(adata.X, P, D, batch_size)
 
         # Let's just check that we can iterate batches
-        for x_batch, p_batch, mask in self._dataset:
-            print(x_batch.shape, p_batch.shape, mask.shape)
+        for x_batch, p_batch, d_batch, mask in self._dataset:
+            print(x_batch.shape, p_batch.shape, d_batch.shape, mask.shape)
 
     def fit(self):
         pass
