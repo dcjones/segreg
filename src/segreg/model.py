@@ -47,8 +47,8 @@ class RegressionModel:
         self._dataset = Dataset(adata.X, P, batch_size)
 
         # Let's just check that we can iterate batches
-        for x_batch, p_batch in self._dataset:
-            print(x_batch.shape, p_batch.shape)
+        for x_batch, p_batch, mask in self._dataset:
+            print(x_batch.shape, p_batch.shape, mask.shape)
 
     def fit(self):
         pass

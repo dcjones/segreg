@@ -36,6 +36,7 @@ class Dataset:
         assert P.shape[0] == m and P.shape[1] == m
 
         X = X.astype(np.float32)
+        P = P.astype(np.float32)
         self.n = n
 
         # Shuffle once at initialization
@@ -43,14 +44,12 @@ class Dataset:
         np.random.shuffle(idx)
 
         # Compute batches along with their neighbors
-        batch_idxs = []
+        batch_info = []
         for fr in range(0, m, batch_size):
             to = min(fr + batch_size, m)
-
             batch_idx = idx[fr:to]
 
             # Use numpy operations to gather all neighbor indices at once
-            # Get the CSR slices for all rows in batch_idx
             neighbor_indices = (
                 np.concatenate(
                     [P.indices[P.indptr[i] : P.indptr[i + 1]] for i in batch_idx]
@@ -59,25 +58,20 @@ class Dataset:
                 else np.array([], dtype=np.int32)
             )
 
-            # Use np.unique to get sorted unique neighbor indices
             batch_senders_idx = np.unique(neighbor_indices)
 
-            # Sort batch_idx and compute union with neighbors
-            batch_idx_sorted = np.sort(batch_idx)
-            batch_neighborhood_idx = np.union1d(batch_idx_sorted, batch_senders_idx)
+            # To easily subset the main batch cells, we put them at the beginning of the neighborhood
+            neighbors_exclusive = np.setdiff1d(batch_senders_idx, batch_idx)
+            batch_neighborhood_idx = np.concatenate([batch_idx, neighbors_exclusive])
 
-            batch_idxs.append([batch_idx_sorted, batch_neighborhood_idx])
-
-        # TODO: Feel like I may need to arrange these indices so we can easily subset
-        # the main batch cells (exclude the neighborhood cells).
+            batch_info.append((len(batch_idx), batch_neighborhood_idx))
 
         # First pass: determine max nse across all batches
         x_max_nse = 0
         p_max_nse = 0
         max_nrows = 0
-        for batch_idx, batch_neighborhood_idx in batch_idxs:
+        for n_target, batch_neighborhood_idx in batch_info:
             x_sliced = X[batch_neighborhood_idx, :]
-            # p_sliced = P[batch_neighborhood_idx, batch_neighborhood_idx] # This unfortunately seems to produce a dense matrix
             p_sliced = P[batch_neighborhood_idx, :][:, batch_neighborhood_idx]
 
             x_max_nse = max(x_max_nse, x_sliced.nnz)
@@ -86,9 +80,9 @@ class Dataset:
 
         # Second pass: Compute batch arrays
         self._batches = []
-        for batch_idx, batch_neighborhood_idx in batch_idxs:
+        for n_target, batch_neighborhood_idx in batch_info:
             x_sliced = X[batch_neighborhood_idx, :]
-            x_nse_pad = x_max_nse - x_sliced.data.shape[0]
+            x_nse_pad = x_max_nse - x_sliced.nnz
             x_nrows_pad = max_nrows - x_sliced.shape[0]
 
             if x_nse_pad > 0:
@@ -106,15 +100,14 @@ class Dataset:
                 x_indptr = np.concatenate(
                     [
                         x_sliced.indptr,
-                        np.full(x_nrows_pad, x_sliced.shape[0], dtype=np.int32),
+                        np.full(x_nrows_pad, x_sliced.indptr[-1], dtype=np.int32),
                     ]
                 )
             else:
                 x_indptr = x_sliced.indptr.copy()
 
-            # p_sliced = P[batch_neighborhood_idx, batch_neighborhood_idx] # again, this produces a dense matrix
             p_sliced = P[batch_neighborhood_idx, :][:, batch_neighborhood_idx]
-            p_nse_pad = p_max_nse - p_sliced.data.shape[0]
+            p_nse_pad = p_max_nse - p_sliced.nnz
             p_nrows_pad = max_nrows - p_sliced.shape[0]
 
             if p_nse_pad > 0:
@@ -132,20 +125,14 @@ class Dataset:
                 p_indptr = np.concatenate(
                     [
                         p_sliced.indptr,
-                        np.full(p_nrows_pad, p_sliced.shape[0], dtype=np.int32),
+                        np.full(p_nrows_pad, p_sliced.indptr[-1], dtype=np.int32),
                     ]
                 )
             else:
                 p_indptr = p_sliced.indptr.copy()
 
-            m_batch = x_sliced.shape[0]
-            assert p_sliced.shape[0] == m_batch
-
-            print(f"x_nrows_pad: {x_nrows_pad}")
-            print(f"p_nrows_pad: {p_nrows_pad}")
-
             self._batches.append(
-                (m_batch, x_data, x_indices, x_indptr, p_data, p_indices, p_indptr)
+                (n_target, x_data, x_indices, x_indptr, p_data, p_indices, p_indptr)
             )
 
         self.max_nrows = max_nrows
@@ -153,7 +140,7 @@ class Dataset:
 
     def __iter__(self):
         for (
-            _m_batch,
+            n_target,
             x_data,
             x_indices,
             x_indptr,
@@ -170,16 +157,16 @@ class Dataset:
                 shape=(self.max_nrows, self.n),
             )
 
-            # TODO: I don't think this is quite right because
-            #
             p_batch = BCSR(
                 (
                     jnp.array(p_data),
                     jnp.array(p_indices, dtype=jnp.int32),
                     jnp.array(p_indptr, dtype=jnp.int32),
                 ),
-                # shape=(m_batch, m_batch),
                 shape=(self.max_nrows, self.max_nrows),
             )
 
-            yield x_batch, p_batch
+            # Mask identifying the target cells in the batch (the first n_target rows)
+            mask = jnp.arange(self.max_nrows) < n_target
+
+            yield x_batch, p_batch, mask
