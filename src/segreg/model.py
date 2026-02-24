@@ -54,3 +54,33 @@ class RegressionModel:
 
     def fit(self):
         pass
+
+
+# TODO:
+# Now we move on to the really tricky part of trying write the model.
+#
+# The hard part is that we need to try to infer diffusion between every pair of
+# cells. Since we are working with minibatches, we can't keep that in memory,
+# and instead have to use some kind of amortized analysis. I'm really not sure
+# what that looks like though. Some kind of graph neural network presumably.
+#
+# What is the input and output for such a thing though? Certainly it can't just
+# be a MLP across neighbors, right?
+#
+# Questions:
+#   - Do we want to use numpyro for this, or try to get away without it?
+#   - Do we
+#
+# I think I just have to review graph neural networks. Surely there is a way to
+# make edge predictions, right?
+#
+# Maybe I should just use pytorch since that has pytorch geometric and is maybe
+# better suited to do GNNs.
+#
+# So there are GNNs that operate on edges, so we should be able to use something like
+# that to predict
+#
+# But remember, we're also going to have to predict λ values for every cell as well. That's
+# also hidden state that we can't assume we can store.
+#
+#
