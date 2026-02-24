@@ -10,11 +10,52 @@ from scipy.sparse import csr_matrix
 from spatialdata import SpatialData
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
+from torch_geometric.nn import GCNConv, Linear
 
-# from .model import RegressionModel
+
+class Encoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # TODO: layers
+        pass
+
+    def forward(self, x, edge_index):
+        # TODO: apply layers
+        #
+        # Architerture is going to be something like:
+        #
+        # - Linear to get dense low dimensional representation
+        # - GCN into softplus or exp to get μ and σ in the latent space
+        #
+        pass
+
+
+class Decoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        pass
+
+    def forward(self, z):
+        # TODO:
+        # Two-header architecture to get
+        #
+        # Head 1: mlp to predict λ from z
+        # Head 2: concatenate edge latent features with proseg prior (logit first?)
+        #         mlp to sigmoid to get diffusion coeffficients
+        #
+        # Compute corrupted λ values to score observed x against
+        pass
+
+
+def objective():
+    pass
 
 
 class RegressionModel:
+    X: csr_matrix
+    data: Data
+    design: DesignMatrix
+
     def __init__(
         self,
         data: SpatialData | AnnData,
@@ -50,7 +91,9 @@ class RegressionModel:
             x=torch.tensor(np.asarray(self.design), dtype=torch.float32),
         )
 
-        print(self.data)
+        self.X = adata.X
+        # TODO: cast to csr_matrix if we aren't already
+        assert isinstance(self.X, csr_matrix)
 
     def fit(self, nepochs: int = 100, nneighbors: int = 10, batch_size: int = 1024):
         loader = NeighborLoader(
@@ -64,4 +107,19 @@ class RegressionModel:
         for epoch in range(nepochs):
             print(f"Epoch {epoch}")
             for batch in loader:
-                pass
+                node_idx = batch.n_id.numpy()
+                x_sub = self.X[node_idx]
+                assert isinstance(x_sub, csr_matrix)
+
+                x_sub_tensor = torch.sparse_csr_tensor(
+                    torch.from_numpy(x_sub.indptr).to(torch.int32),
+                    torch.from_numpy(x_sub.indices).to(torch.int32),
+                    torch.from_numpy(x_sub.data).to(torch.float32),
+                    size=x_sub.shape,
+                ).to("cuda")
+
+                print(x_sub_tensor)
+
+                edge_index = batch.edge_index.to("cuda")
+
+                # TODO: train step

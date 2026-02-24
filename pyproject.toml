@@ -10,10 +10,14 @@ dependencies = [
     "optax>=0.2.6",
     "patsy>=1.0.2",
     "spatialdata>=0.7.2",
-    "torch>=2.10.0",
+    "torch>=2.8.0, <2.9.0",
     "torch-geometric>=2.7.0",
+    "pyg-lib>=0.5.0",
     "tqdm>=4.67.1",
 ]
+
+[tool.uv.sources]
+pyg-lib = { url = "https://data.pyg.org/whl/torch-2.8.0%2Bcu128/pyg_lib-0.5.0%2Bpt28cu128-cp313-cp313-linux_x86_64.whl" }
 
 [tool.pyright]
 venvPath = "."
