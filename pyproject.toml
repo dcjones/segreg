@@ -9,5 +9,10 @@ dependencies = [
     "jax[cuda12]>=0.8.2",
     "optax>=0.2.6",
     "patsy>=1.0.2",
+    "spatialdata>=0.7.2",
     "tqdm>=4.67.1",
 ]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"

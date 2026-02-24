@@ -1,21 +1,25 @@
+from typing import cast
 
 import jax.numpy as jnp
 import numpy as np
 from anndata import AnnData
 from jax.experimental.sparse import BCSR, bcsr_extract
 from scipy.sparse import csr_matrix
+from spatialdata import SpatialData
 
 # TODO:
 # I think I precompute CSR batches, but along with neighbors.
 # We need to keep track of indices of the main group of cells.
 
-# TODO:
-# Eventually we'll need to figure how to do this with different diffusion
-# matrices for each gene. (Possibly sharing the same (indptr, indexes) arrays).
 
 # TODO:
 # This should also probably handle subsetting the observation matrix we
 # are regressing on, right?
+
+
+# TODO: Ok, maybe this part should be lower level and we have some different interface
+# for
+
 
 class Dataset:
     """
@@ -25,6 +29,9 @@ class Dataset:
     """
 
     def __init__(self, X: csr_matrix, P: csr_matrix, batch_size: int):
+        assert isinstance(X, csr_matrix)
+        assert isinstance(P, csr_matrix)
+
         m, n = X.shape
         assert P.shape[0] == m and P.shape[1] == m
 
@@ -70,7 +77,9 @@ class Dataset:
         max_nrows = 0
         for batch_idx, batch_neighborhood_idx in batch_idxs:
             x_sliced = X[batch_neighborhood_idx, :]
-            p_sliced = P[batch_neighborhood_idx, batch_neighborhood_idx]
+            # p_sliced = P[batch_neighborhood_idx, batch_neighborhood_idx] # This unfortunately seems to produce a dense matrix
+            p_sliced = P[batch_neighborhood_idx, :][:, batch_neighborhood_idx]
+
             x_max_nse = max(x_max_nse, x_sliced.nnz)
             max_nrows = max(max_nrows, x_sliced.shape[0])
             p_max_nse = max(p_max_nse, p_sliced.nnz)
@@ -103,7 +112,8 @@ class Dataset:
             else:
                 x_indptr = x_sliced.indptr.copy()
 
-            p_sliced = P[batch_neighborhood_idx, batch_neighborhood_idx]
+            # p_sliced = P[batch_neighborhood_idx, batch_neighborhood_idx] # again, this produces a dense matrix
+            p_sliced = P[batch_neighborhood_idx, :][:, batch_neighborhood_idx]
             p_nse_pad = p_max_nse - p_sliced.data.shape[0]
             p_nrows_pad = max_nrows - p_sliced.shape[0]
 
@@ -131,15 +141,19 @@ class Dataset:
             m_batch = x_sliced.shape[0]
             assert p_sliced.shape[0] == m_batch
 
+            print(f"x_nrows_pad: {x_nrows_pad}")
+            print(f"p_nrows_pad: {p_nrows_pad}")
+
             self._batches.append(
                 (m_batch, x_data, x_indices, x_indptr, p_data, p_indices, p_indptr)
             )
 
+        self.max_nrows = max_nrows
         self.n = n
 
     def __iter__(self):
         for (
-            m_batch,
+            _m_batch,
             x_data,
             x_indices,
             x_indptr,
@@ -153,16 +167,19 @@ class Dataset:
                     jnp.array(x_indices, dtype=jnp.int32),
                     jnp.array(x_indptr, dtype=jnp.int32),
                 ),
-                shape=(m_batch, self.n),
+                shape=(self.max_nrows, self.n),
             )
 
+            # TODO: I don't think this is quite right because
+            #
             p_batch = BCSR(
                 (
                     jnp.array(p_data),
                     jnp.array(p_indices, dtype=jnp.int32),
                     jnp.array(p_indptr, dtype=jnp.int32),
                 ),
-                shape=(m_batch, m_batch),
+                # shape=(m_batch, m_batch),
+                shape=(self.max_nrows, self.max_nrows),
             )
 
             yield x_batch, p_batch
