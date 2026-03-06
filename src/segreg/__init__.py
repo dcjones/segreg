@@ -185,7 +185,7 @@ class RegressionModel:
             x=torch.tensor(np.asarray(self.design), dtype=torch.float32),
         )
 
-        self.state_transitions_t = state_transitions.transpose()
+        self.state_transitions_t = state_transitions.transpose().tocsr()
 
         self.data = Data(
             edge_index=torch.tensor(edge_index, dtype=torch.long),
@@ -241,8 +241,10 @@ class RegressionModel:
                 )
 
                 # Fetch edge transition weights
+                global_src = batch.n_id[batch.edge_index[0, :]]
+                global_dst = batch.n_id[batch.edge_index[1, :]]
                 encoded_edge_index = (
-                    (batch.edge_index[0, :] + batch.edge_index[1, :] * self.m)
+                    (global_src + global_dst * self.m)
                     .cpu()
                     .numpy()
                 )
