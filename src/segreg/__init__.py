@@ -44,18 +44,18 @@ class Encoder(nn.Module):
 
 class NodeDecoder(nn.Module):
     """
-    Decodes the node latent representation back into true gene expression rates (lambda).
+    Decodes the node latent representation back into unconstrained expression rates (rho).
     """
 
     def __init__(self, latent_dim: int, hidden_channels: int, out_channels: int):
         super().__init__()
         self.lin1 = nn.Linear(latent_dim, hidden_channels)
-        self.lin2 = nn.Linear(hidden_channels, out_channels)
+        self.lin2 = nn.Linear(hidden_channels, out_channels, bias=False)
 
     def forward(self, z):
         h = F.relu(self.lin1(z))
-        # softplus ensures predicted expression rates are > 0
-        return F.softplus(self.lin2(h))
+        # Return unconstrained values to be added to the regression term
+        return self.lin2(h)
 
 
 class EdgeDecoder(nn.Module):
@@ -95,6 +95,11 @@ class SegregVAE(nn.Module):
         self.node_decoder = NodeDecoder(latent_dim, hidden_channels, n_genes)
         self.edge_decoder = EdgeDecoder(latent_dim, hidden_channels, n_genes)
 
+        # Global regression parameters (Surrogate model for Variational Inference)
+        self.beta_mu = nn.Parameter(torch.zeros(n_covariates, n_genes))
+        # Initialize logstd to a small value so that initial samples are close to the mean
+        self.beta_logstd = nn.Parameter(torch.full((n_covariates, n_genes), -3.0))
+
     def reparameterize(self, mu, logstd):
         if self.training:
             std = torch.exp(logstd)
@@ -102,13 +107,25 @@ class SegregVAE(nn.Module):
             return mu + eps * std
         return mu
 
-    def forward(self, x, edge_index, prior_alpha):
+    def forward(self, x, covariates, edge_index, prior_alpha):
         # 1. Encode into node latents
         mu, logstd = self.encoder(x, edge_index)
         z = self.reparameterize(mu, logstd)
 
-        # 2. Decode true expression rates per cell
-        lam = self.node_decoder(z)
+        # 2. Decode unconstrained expression rates per cell
+        rho = self.node_decoder(z)
+
+        # 2.5 Sample global regression coefficients
+        if self.training:
+            beta_std = torch.exp(self.beta_logstd)
+            eps = torch.randn_like(beta_std)
+            beta = self.beta_mu + eps * beta_std
+        else:
+            beta = self.beta_mu
+
+        # Compute predicted expression rates (lambda)
+        # Use clamp to prevent overflow when applying exp
+        lam = torch.exp(torch.clamp(rho + covariates @ beta, min=-15.0, max=15.0))
 
         # 3. Decode edge diffusion parameters
         # edge_index is shape [2, E]. We assume edge_index[0] is source, edge_index[1] is target
@@ -243,11 +260,7 @@ class RegressionModel:
                 # Fetch edge transition weights
                 global_src = batch.n_id[batch.edge_index[0, :]]
                 global_dst = batch.n_id[batch.edge_index[1, :]]
-                encoded_edge_index = (
-                    (global_src + global_dst * self.m)
-                    .cpu()
-                    .numpy()
-                )
+                encoded_edge_index = (global_src + global_dst * self.m).cpu().numpy()
 
                 prior_alpha = torch.tensor(
                     self.state_transitions_t[encoded_edge_index, :].todense(),
@@ -261,7 +274,7 @@ class RegressionModel:
 
                 # Forward Pass
                 x_hat, mu, logstd, a, b, alpha = self.model(
-                    encoder_in, batch.edge_index, prior_alpha
+                    encoder_in, batch.x, batch.edge_index, prior_alpha
                 )
 
                 # Masking: We only calculate loss for the "target" nodes in the center of the sampled subgraph.
@@ -319,10 +332,41 @@ class RegressionModel:
                 else:
                     kl_alpha = torch.tensor(0.0, device=self.device)
 
-                loss = loss_recon + kl_z + kl_alpha
+                # 4. Global Regression Parameters KL Divergence (Standard Normal Prior)
+                kl_beta = (
+                    -0.5
+                    * torch.sum(
+                        1
+                        + 2 * self.model.beta_logstd
+                        - self.model.beta_mu.pow(2)
+                        - torch.exp(2 * self.model.beta_logstd)
+                    )
+                ) / self.m
+
+                loss = loss_recon + kl_z + kl_alpha + kl_beta
                 loss.backward()
                 optimizer.step()
 
                 total_loss += loss.item()
 
             print(f"Epoch {epoch} | Loss: {total_loss / len(loader):.4f}")
+
+        print("beta_mu")
+        print(
+            (
+                self.model.beta_mu.min(),
+                self.model.beta_mu.mean(),
+                self.model.beta_mu.max(),
+            )
+        )
+        print(self.model.beta_mu.shape)
+
+        print("beta_logstd")
+        print(
+            (
+                self.model.beta_logstd.min(),
+                self.model.beta_logstd.mean(),
+                self.model.beta_logstd.max(),
+            )
+        )
+        print(self.model.beta_logstd.shape)
