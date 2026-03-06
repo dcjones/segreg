@@ -64,15 +64,15 @@ class EdgeDecoder(nn.Module):
     for the posterior Beta distribution of diffusion coefficients (alpha).
     """
 
-    def __init__(self, latent_dim: int, hidden_channels: int):
+    def __init__(self, latent_dim: int, hidden_channels: int, n_genes: int):
         super().__init__()
         # Input: z_i, z_j, prior_alpha
-        self.lin1 = nn.Linear(latent_dim * 2 + 1, hidden_channels)
+        self.lin1 = nn.Linear(latent_dim * 2 + n_genes, hidden_channels)
         self.lin_a = nn.Linear(hidden_channels, 1)
         self.lin_b = nn.Linear(hidden_channels, 1)
 
     def forward(self, z_src, z_dst, prior_alpha):
-        h = torch.cat([z_src, z_dst, prior_alpha.unsqueeze(-1)], dim=-1)
+        h = torch.cat([z_src, z_dst, prior_alpha], dim=-1)
         h = F.relu(self.lin1(h))
 
         # Beta distribution parameters a and b must be strictly positive
@@ -93,7 +93,7 @@ class SegregVAE(nn.Module):
         in_channels = n_genes + n_covariates
         self.encoder = Encoder(in_channels, hidden_channels, latent_dim)
         self.node_decoder = NodeDecoder(latent_dim, hidden_channels, n_genes)
-        self.edge_decoder = EdgeDecoder(latent_dim, hidden_channels)
+        self.edge_decoder = EdgeDecoder(latent_dim, hidden_channels, n_genes)
 
     def reparameterize(self, mu, logstd):
         if self.training:
@@ -143,6 +143,9 @@ class RegressionModel:
     design: DesignMatrix
     device: torch.device
     model: SegregVAE
+    state_transitions_t: csr_matrix
+    m: int
+    n: int
 
     def __init__(
         self,
@@ -164,22 +167,29 @@ class RegressionModel:
 
         self.design = cast(DesignMatrix, dmatrix(formula, adata.obs))
 
-        state_transitions = adata.obsp["state_transitions"]
+        # This is a flattened 3d array giving per-gene state transition probabilities
+        state_transitions = adata.varm["state_transitions"]
+        assert state_transitions.shape == (n, m * m)
         assert isinstance(state_transitions, csr_matrix)
-        state_transitions_coo = state_transitions.tocoo()
 
-        # NOTE: PyG NeighborLoader message passing treats edge_index[0] as source and edge_index[1] as target.
-        # If 'state_transitions' maps transcript misassignment, transcripts flow from source to target.
-        # We assign state_transitions_coo.col (original cell / source) to edge_index[0]
-        # and state_transitions_coo.row (receiving cell / target) to edge_index[1].
-        edge_index = np.stack(
-            [state_transitions_coo.col, state_transitions_coo.row], axis=0
-        )
+        # define a graph where there is an edge if there were any transcript transitions between cells
+        unique_indices = np.unique(state_transitions.indices, sorted=True)
+        col = unique_indices % m
+        row = unique_indices // m
+        edge_index = np.stack([col, row], axis=0)
 
         self.data = Data(
             edge_index=torch.tensor(edge_index, dtype=torch.long),
             n_id=torch.arange(adata.n_obs),
-            edge_attr=torch.tensor(state_transitions_coo.data, dtype=torch.float32),
+            # edge_attr=torch.tensor(state_transitions_coo.data, dtype=torch.float32),
+            x=torch.tensor(np.asarray(self.design), dtype=torch.float32),
+        )
+
+        self.state_transitions_t = state_transitions.transpose()
+
+        self.data = Data(
+            edge_index=torch.tensor(edge_index, dtype=torch.long),
+            n_id=torch.arange(adata.n_obs),
             x=torch.tensor(np.asarray(self.design), dtype=torch.float32),
         )
 
@@ -193,6 +203,8 @@ class RegressionModel:
         n_covariates = self.design.shape[1]
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = SegregVAE(n_genes, n_covariates).to(self.device)
+        self.m = m
+        self.n = n
 
     def fit(
         self,
@@ -228,11 +240,22 @@ class RegressionModel:
                     x_sub, dtype=torch.float32, device=self.device
                 )
 
+                # Fetch edge transition weights
+                encoded_edge_index = (
+                    (batch.edge_index[0, :] + batch.edge_index[1, :] * self.m)
+                    .cpu()
+                    .numpy()
+                )
+
+                prior_alpha = torch.tensor(
+                    self.state_transitions_t[encoded_edge_index, :].todense(),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+
                 # Prepare Encoder Input: log1p(counts) concatenated with design matrix
                 log_x = torch.log1p(x_sub_tensor)
                 encoder_in = torch.cat([log_x, batch.x], dim=-1)
-
-                prior_alpha = batch.edge_attr
 
                 # Forward Pass
                 x_hat, mu, logstd, a, b, alpha = self.model(
@@ -275,7 +298,7 @@ class RegressionModel:
                 if edge_mask.sum() > 0:
                     a_target = a[edge_mask]
                     b_target = b[edge_mask]
-                    prior_alpha_target = prior_alpha[edge_mask].unsqueeze(-1)
+                    prior_alpha_target = prior_alpha[edge_mask]
 
                     # Clamp prior to avoid 0 or 1 edge cases for the Beta distribution
                     prior_alpha_target = torch.clamp(
