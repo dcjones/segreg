@@ -2,6 +2,8 @@
 from typing import cast
 
 import numpy as np
+import pandas as pd
+import scipy.stats as stats
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -182,6 +184,9 @@ class RegressionModel:
 
         m, n = adata.shape
 
+        self.var_names = adata.var_names
+        self.obs_names = adata.obs_names
+
         self.design = cast(DesignMatrix, dmatrix(formula, adata.obs))
 
         # This is a flattened 3d array giving per-gene state transition probabilities
@@ -351,22 +356,127 @@ class RegressionModel:
 
             print(f"Epoch {epoch} | Loss: {total_loss / len(loader):.4f}")
 
-        print("beta_mu")
-        print(
-            (
-                self.model.beta_mu.min(),
-                self.model.beta_mu.mean(),
-                self.model.beta_mu.max(),
-            )
-        )
-        print(self.model.beta_mu.shape)
+    def get_regression_coefficients(
+        self, credible_interval: float | None = None
+    ) -> pd.DataFrame:
+        """
+        Returns a pandas DataFrame containing the posterior mean point estimates for the
+        regression coefficients. If a credible_interval is provided (e.g. 0.95), it also
+        calculates and includes the corresponding lower and upper bounds.
+        """
+        beta_mu = self.model.beta_mu.detach().cpu().numpy()
+        covariate_names = self.design.design_info.column_names
+        genes = self.var_names
 
-        print("beta_logstd")
-        print(
-            (
-                self.model.beta_logstd.min(),
-                self.model.beta_logstd.mean(),
-                self.model.beta_logstd.max(),
-            )
+        df = (
+            pd.DataFrame(beta_mu, index=covariate_names, columns=genes)
+            .melt(ignore_index=False, var_name="Gene", value_name="Mean")
+            .reset_index(names="Covariate")
         )
-        print(self.model.beta_logstd.shape)
+
+        if credible_interval is not None:
+            beta_std = torch.exp(self.model.beta_logstd).detach().cpu().numpy()
+            alpha = 1.0 - credible_interval
+            z = stats.norm.ppf(1.0 - alpha / 2.0)
+
+            lower = (
+                pd.DataFrame(
+                    beta_mu - z * beta_std, index=covariate_names, columns=genes
+                )
+                .melt(ignore_index=False, var_name="Gene", value_name="Lower")
+                .reset_index(names="Covariate")
+            )
+
+            upper = (
+                pd.DataFrame(
+                    beta_mu + z * beta_std, index=covariate_names, columns=genes
+                )
+                .melt(ignore_index=False, var_name="Gene", value_name="Upper")
+                .reset_index(names="Covariate")
+            )
+
+            df["Lower"] = lower["Lower"]
+            df["Upper"] = upper["Upper"]
+
+        return df
+
+    def get_corrected_expression(
+        self, threshold: float = 1e-4, batch_size: int = 4096, nneighbors: int = 10
+    ) -> csr_matrix:
+        """
+        Returns the 'corrected' estimates of gene expression rates (lambda), which
+        represent the modeled expression prior to diffusion effects from neighboring cells.
+        The result is a sparse CSR matrix with values below `threshold` set to 0.
+        """
+        self.model.eval()
+
+        loader = NeighborLoader(
+            self.data,
+            num_neighbors=[nneighbors, nneighbors],
+            batch_size=batch_size,
+            input_nodes=None,
+            shuffle=False,
+        )
+
+        rows = []
+        cols = []
+        data = []
+
+        current_row = 0
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to(self.device)
+
+                # Fetch sparse counts for the sampled nodes and convert to dense tensor
+                node_idx = batch.n_id.cpu().numpy()
+                x_sub = self.X[node_idx].toarray()
+                x_sub_tensor = torch.tensor(
+                    x_sub, dtype=torch.float32, device=self.device
+                )
+
+                log_x = torch.log1p(x_sub_tensor)
+                encoder_in = torch.cat([log_x, batch.x], dim=-1)
+
+                # Forward pass through encoder
+                mu, _ = self.model.encoder(encoder_in, batch.edge_index)
+
+                # PyG places the target nodes first in the batch up to `batch.batch_size`
+                target_mask = slice(0, batch.batch_size)
+                mu_target = mu[target_mask]
+                covariates_target = batch.x[target_mask]
+
+                rho_target = self.model.node_decoder(mu_target)
+
+                # Compute predicted expression rates (lambda) without message passing
+                beta = self.model.beta_mu
+                lam_target = torch.exp(
+                    torch.clamp(
+                        rho_target + covariates_target @ beta, min=-15.0, max=15.0
+                    )
+                )
+
+                lam_np = lam_target.cpu().numpy()
+
+                # Thresholding
+                lam_np[lam_np < threshold] = 0.0
+
+                # Extract non-zero elements to build CSR matrix
+                r, c = np.nonzero(lam_np)
+                v = lam_np[r, c]
+
+                rows.append(r + current_row)
+                cols.append(c)
+                data.append(v)
+
+                current_row += batch.batch_size
+
+        if rows:
+            rows = np.concatenate(rows)
+            cols = np.concatenate(cols)
+            data = np.concatenate(data)
+        else:
+            rows = np.array([], dtype=int)
+            cols = np.array([], dtype=int)
+            data = np.array([], dtype=float)
+
+        return csr_matrix((data, (rows, cols)), shape=(self.m, self.n))

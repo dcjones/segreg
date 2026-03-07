@@ -16,7 +16,15 @@ dependencies = [
 
 [tool.uv.sources]
 pyg-lib = { url = "https://data.pyg.org/whl/torch-2.8.0%2Bcu128/pyg_lib-0.5.0%2Bpt28cu128-cp313-cp313-linux_x86_64.whl" }
+dapple = { path = "../dapple_py", editable = true }
 
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
+
+[dependency-groups]
+debug = [
+    "dapple",
+    "marimo>=0.20.4",
+    "umap-learn>=0.5.11",
+]
