@@ -90,17 +90,42 @@ class SegregVAE(nn.Module):
         n_covariates: int,
         hidden_channels: int = 64,
         latent_dim: int = 32,
+        kappa: float = 100.0,
+        include_diffusion: bool = True,
+        log_mean_expr: torch.Tensor | None = None,
     ):
         super().__init__()
+        self.include_diffusion = include_diffusion
         in_channels = n_genes + n_covariates
         self.encoder = Encoder(in_channels, hidden_channels, latent_dim)
         self.node_decoder = NodeDecoder(latent_dim, hidden_channels, n_genes)
-        self.edge_decoder = EdgeDecoder(latent_dim, hidden_channels, n_genes)
+
+        if self.include_diffusion:
+            self.edge_decoder = EdgeDecoder(latent_dim, hidden_channels, n_genes)
+
+            # Global concentration parameter for Beta prior (kappa).
+            # We model it as a point estimate (MLE) to be inferred during training.
+            # Use softplus to ensure it stays positive.
+            self.kappa_unconstrained = nn.Parameter(torch.tensor(kappa))
+
+        print(log_mean_expr)
+
+        # Empirical gene baseline to help the model start at the correct scale
+        if log_mean_expr is not None:
+            self.gene_bias = nn.Parameter(log_mean_expr.clone())
+        else:
+            self.gene_bias = nn.Parameter(torch.zeros(n_genes))
 
         # Global regression parameters (Surrogate model for Variational Inference)
         self.beta_mu = nn.Parameter(torch.zeros(n_covariates, n_genes))
         # Initialize logstd to a small value so that initial samples are close to the mean
         self.beta_logstd = nn.Parameter(torch.full((n_covariates, n_genes), -3.0))
+
+    @property
+    def kappa(self):
+        if not self.include_diffusion:
+            return None
+        return F.softplus(self.kappa_unconstrained)
 
     def reparameterize(self, mu, logstd):
         if self.training:
@@ -109,7 +134,7 @@ class SegregVAE(nn.Module):
             return mu + eps * std
         return mu
 
-    def forward(self, x, covariates, edge_index, prior_alpha):
+    def forward(self, x, covariates, edge_index, prior_alpha=None):
         # 1. Encode into node latents
         mu, logstd = self.encoder(x, edge_index)
         z = self.reparameterize(mu, logstd)
@@ -127,31 +152,39 @@ class SegregVAE(nn.Module):
 
         # Compute predicted expression rates (lambda)
         # Use clamp to prevent overflow when applying exp
-        lam = torch.exp(torch.clamp(rho + covariates @ beta, min=-15.0, max=15.0))
+        lam = torch.exp(
+            torch.clamp(rho + covariates @ beta + self.gene_bias, min=-15.0, max=15.0)
+        )
 
-        # 3. Decode edge diffusion parameters
-        # edge_index is shape [2, E]. We assume edge_index[0] is source, edge_index[1] is target
-        src, dst = edge_index
-        z_src, z_dst = z[src], z[dst]
-        a, b = self.edge_decoder(z_src, z_dst, prior_alpha)
+        if self.include_diffusion and prior_alpha is not None:
+            # 3. Decode edge diffusion parameters
+            # edge_index is shape [2, E]. We assume edge_index[0] is source, edge_index[1] is target
+            src, dst = edge_index
+            z_src, z_dst = z[src], z[dst]
+            a, b = self.edge_decoder(z_src, z_dst, prior_alpha)
 
-        # Sample alpha during training, use mean during evaluation
-        if self.training:
-            alpha_dist = Beta(a, b)
-            alpha = alpha_dist.rsample()
+            # Sample alpha during training, use mean during evaluation
+            if self.training:
+                alpha_dist = Beta(a, b)
+                alpha = alpha_dist.rsample()
+            else:
+                alpha = a / (a + b)
+
+            alpha = alpha.squeeze(-1)
+
+            # 4. Forward Generative Model (Reconstruction)
+            # x_hat_i = \lambda_i + \sum_j \alpha_{ij} \lambda_j
+            messages = alpha.unsqueeze(-1) * lam[src]
+
+            diffused = torch.zeros_like(lam)
+            diffused.scatter_add_(
+                0, dst.unsqueeze(-1).expand(-1, lam.size(1)), messages
+            )
+
+            x_hat = lam + diffused
         else:
-            alpha = a / (a + b)
-
-        alpha = alpha.squeeze(-1)
-
-        # 4. Forward Generative Model (Reconstruction)
-        # x_hat_i = \lambda_i + \sum_j \alpha_{ij} \lambda_j
-        messages = alpha.unsqueeze(-1) * lam[src]
-
-        diffused = torch.zeros_like(lam)
-        diffused.scatter_add_(0, dst.unsqueeze(-1).expand(-1, lam.size(1)), messages)
-
-        x_hat = lam + diffused
+            x_hat = lam
+            a = b = alpha = None
 
         return x_hat, mu, logstd, a, b, alpha
 
@@ -171,6 +204,10 @@ class RegressionModel:
         data: SpatialData | AnnData,
         formula: str,
         batch_size: int | None = 4096,
+        include_diffusion: bool = True,
+        hidden_channels: int = 64,
+        latent_dim: int = 32,
+        kappa: float = 100.0,
     ):
         if isinstance(data, AnnData):
             adata = data
@@ -220,11 +257,26 @@ class RegressionModel:
         if not isinstance(self.X, csr_matrix):
             self.X = self.X.tocsr()
 
+        # Compute empirical log mean expression for initialization
+        # Add a small epsilon to avoid log(0)
+        mean_expr = torch.tensor(
+            np.asarray(self.X.mean(axis=0)).squeeze(), dtype=torch.float32
+        )
+        log_mean_expr = torch.log(mean_expr + 1e-4)
+
         # Initialize Model
         n_genes = self.X.shape[1]
         n_covariates = self.design.shape[1]
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = SegregVAE(n_genes, n_covariates).to(self.device)
+        self.model = SegregVAE(
+            n_genes,
+            n_covariates,
+            hidden_channels=hidden_channels,
+            latent_dim=latent_dim,
+            kappa=kappa,
+            include_diffusion=include_diffusion,
+            log_mean_expr=log_mean_expr,
+        ).to(self.device)
         self.m = m
         self.n = n
 
@@ -234,7 +286,6 @@ class RegressionModel:
         nneighbors: int = 10,
         batch_size: int = 1024,
         lr: float = 1e-3,
-        kappa: float = 100.0,
         beta_kl: float = 0.01,
     ):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
@@ -263,16 +314,21 @@ class RegressionModel:
                     x_sub, dtype=torch.float32, device=self.device
                 )
 
-                # Fetch edge transition weights
-                global_src = batch.n_id[batch.edge_index[0, :]]
-                global_dst = batch.n_id[batch.edge_index[1, :]]
-                encoded_edge_index = (global_src + global_dst * self.m).cpu().numpy()
+                if self.model.include_diffusion:
+                    # Fetch edge transition weights
+                    global_src = batch.n_id[batch.edge_index[0, :]]
+                    global_dst = batch.n_id[batch.edge_index[1, :]]
+                    encoded_edge_index = (
+                        (global_src + global_dst * self.m).cpu().numpy()
+                    )
 
-                prior_alpha = torch.tensor(
-                    self.state_transitions_t[encoded_edge_index, :].todense(),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
+                    prior_alpha = torch.tensor(
+                        self.state_transitions_t[encoded_edge_index, :].todense(),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                else:
+                    prior_alpha = None
 
                 # Prepare Encoder Input: log1p(counts) concatenated with design matrix
                 log_x = torch.log1p(x_sub_tensor)
@@ -313,28 +369,36 @@ class RegressionModel:
                 )
 
                 # 3. Edge KL Divergence (Beta Prior from Proseg)
-                dst = batch.edge_index[1]
-                edge_mask = dst < batch.batch_size
+                if self.model.include_diffusion:
+                    dst = batch.edge_index[1]
+                    edge_mask = dst < batch.batch_size
 
-                if edge_mask.sum() > 0:
-                    a_target = a[edge_mask]
-                    b_target = b[edge_mask]
-                    prior_alpha_target = prior_alpha[edge_mask]
+                    if edge_mask.sum() > 0:
+                        a_target = a[edge_mask]
+                        b_target = b[edge_mask]
+                        prior_alpha_target = prior_alpha[edge_mask]
 
-                    # Clamp prior to avoid 0 or 1 edge cases for the Beta distribution
-                    prior_alpha_target = torch.clamp(
-                        prior_alpha_target, 1e-4, 1.0 - 1e-4
-                    )
+                        # Clamp prior to avoid 0 or 1 edge cases for the Beta distribution
+                        prior_alpha_target = torch.clamp(
+                            prior_alpha_target, 1e-4, 1.0 - 1e-4
+                        )
 
-                    # Prior distribution parameterized using kappa (concentration) and prior_alpha (mean)
-                    prior_a = kappa * prior_alpha_target
-                    prior_b = kappa * (1.0 - prior_alpha_target)
+                        # Use the inferred kappa concentration parameter
+                        kappa = self.model.kappa
 
-                    q_alpha = Beta(a_target, b_target)
-                    p_alpha = Beta(prior_a, prior_b)
+                        # Prior distribution parameterized using kappa (concentration) and prior_alpha (mean)
+                        prior_a = kappa * prior_alpha_target
+                        prior_b = kappa * (1.0 - prior_alpha_target)
 
-                    # Normalize by batch size to keep loss scale invariant
-                    kl_alpha = kl_divergence(q_alpha, p_alpha).sum() / batch.batch_size
+                        q_alpha = Beta(a_target, b_target)
+                        p_alpha = Beta(prior_a, prior_b)
+
+                        # Normalize by batch size to keep loss scale invariant
+                        kl_alpha = (
+                            kl_divergence(q_alpha, p_alpha).sum() / batch.batch_size
+                        )
+                    else:
+                        kl_alpha = torch.tensor(0.0, device=self.device)
                 else:
                     kl_alpha = torch.tensor(0.0, device=self.device)
 
@@ -355,10 +419,16 @@ class RegressionModel:
 
                 total_loss += loss.item()
 
+            if self.model.include_diffusion:
+                kappa_val = self.model.kappa.item()
+                kappa_str = f", Kappa: {kappa_val:.2f}"
+            else:
+                kappa_str = ""
+
             print(
                 f"Epoch {epoch} | Loss: {total_loss / len(loader):.4f} "
                 f"(Recon: {loss_recon.item():.4f}, KL_z: {kl_z.item():.4f}, "
-                f"KL_alpha: {kl_alpha.item():.4f}, KL_beta: {kl_beta.item():.4f})"
+                f"KL_alpha: {kl_alpha.item():.4f}, KL_beta: {kl_beta.item():.4f}{kappa_str})"
             )
 
     def get_regression_coefficients(
@@ -406,12 +476,17 @@ class RegressionModel:
         return df
 
     def get_corrected_expression(
-        self, threshold: float = 1e-4, batch_size: int = 4096, nneighbors: int = 10
+        self,
+        threshold: float = 1e-4,
+        batch_size: int = 4096,
+        nneighbors: int = 10,
+        n_samples: int = 10,
     ) -> csr_matrix:
         """
         Returns the 'corrected' estimates of gene expression rates (lambda), which
         represent the modeled expression prior to diffusion effects from neighboring cells.
         The result is a sparse CSR matrix with values below `threshold` set to 0.
+        By default, it uses Monte Carlo sampling (`n_samples`) to estimate the expected rates.
         """
         self.model.eval()
 
@@ -443,23 +518,37 @@ class RegressionModel:
                 encoder_in = torch.cat([log_x, batch.x], dim=-1)
 
                 # Forward pass through encoder
-                mu, _ = self.model.encoder(encoder_in, batch.edge_index)
+                mu, logstd = self.model.encoder(encoder_in, batch.edge_index)
 
                 # PyG places the target nodes first in the batch up to `batch.batch_size`
                 target_mask = slice(0, batch.batch_size)
                 mu_target = mu[target_mask]
+                logstd_target = logstd[target_mask]
                 covariates_target = batch.x[target_mask]
-
-                rho_target = self.model.node_decoder(mu_target)
-
-                # Compute predicted expression rates (lambda) without message passing
                 beta = self.model.beta_mu
-                lam_target = torch.exp(
-                    torch.clamp(
-                        rho_target + covariates_target @ beta, min=-15.0, max=15.0
-                    )
+
+                std_target = torch.exp(logstd_target)
+
+                lam_target_sum = torch.zeros(
+                    (batch.batch_size, self.n), device=self.device
                 )
 
+                # Monte Carlo sampling to compute expected rates
+                for _ in range(n_samples):
+                    z_target = mu_target + torch.randn_like(std_target) * std_target
+                    rho_target = self.model.node_decoder(z_target)
+
+                    lam_target_sum += torch.exp(
+                        torch.clamp(
+                            rho_target
+                            + covariates_target @ beta
+                            + self.model.gene_bias,
+                            min=-15.0,
+                            max=15.0,
+                        )
+                    )
+
+                lam_target = lam_target_sum / n_samples
                 lam_np = lam_target.cpu().numpy()
 
                 # Thresholding
