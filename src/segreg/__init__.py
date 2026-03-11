@@ -235,6 +235,7 @@ class RegressionModel:
         batch_size: int = 1024,
         lr: float = 1e-3,
         kappa: float = 100.0,
+        beta_kl: float = 0.01,
     ):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
@@ -348,13 +349,17 @@ class RegressionModel:
                     )
                 ) / self.m
 
-                loss = loss_recon + kl_z + kl_alpha + kl_beta
+                loss = loss_recon + beta_kl * (kl_z + kl_alpha + kl_beta)
                 loss.backward()
                 optimizer.step()
 
                 total_loss += loss.item()
 
-            print(f"Epoch {epoch} | Loss: {total_loss / len(loader):.4f}")
+            print(
+                f"Epoch {epoch} | Loss: {total_loss / len(loader):.4f} "
+                f"(Recon: {loss_recon.item():.4f}, KL_z: {kl_z.item():.4f}, "
+                f"KL_alpha: {kl_alpha.item():.4f}, KL_beta: {kl_beta.item():.4f})"
+            )
 
     def get_regression_coefficients(
         self, credible_interval: float | None = None
