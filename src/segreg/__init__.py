@@ -78,8 +78,9 @@ class EdgeDecoder(nn.Module):
         h = F.relu(self.lin1(h))
 
         # Beta distribution parameters a and b must be strictly positive
-        a = F.softplus(self.lin_a(h)) + 1e-4
-        b = F.softplus(self.lin_b(h)) + 1e-4
+        # We add 1.0 to ensure they never create an asymptote at 0 or 1
+        a = F.softplus(self.lin_a(h)) + 1.0
+        b = F.softplus(self.lin_b(h)) + 1.0
         return a, b
 
 
@@ -172,16 +173,26 @@ class SegregVAE(nn.Module):
 
             alpha = alpha.squeeze(-1)
 
+            # Enforce physical conservation of mass: a cell cannot diffuse more than 100% of its transcripts.
+            # Sum the inferred alpha values over all outgoing edges from each source node.
+            total_alpha = torch.zeros(lam.size(0), device=lam.device)
+            total_alpha.scatter_add_(0, src, alpha)
+            
+            # If total_alpha > 1.0, we normalize the outgoing alphas down. 
+            # If < 1.0, we leave them (allowing loss to background).
+            normalization = torch.clamp(total_alpha, min=1.0)
+            alpha_normalized = alpha / normalization[src]
+
             # 4. Forward Generative Model (Reconstruction)
-            # x_hat_i = \lambda_i + \sum_j \alpha_{ij} \lambda_j
-            messages = alpha.unsqueeze(-1) * lam[src]
+            # The edge_index and alpha values include self-loops (i->i).
+            # Therefore, the total transcripts ending up in cell i is just the sum of messages.
+            # x_hat_i = \sum_{j} \alpha_{ji} \lambda_j
+            messages = alpha_normalized.unsqueeze(-1) * lam[src]
 
             diffused = torch.zeros_like(lam)
-            diffused.scatter_add_(
-                0, dst.unsqueeze(-1).expand(-1, lam.size(1)), messages
-            )
+            diffused.scatter_add_(0, dst.unsqueeze(-1).expand(-1, lam.size(1)), messages)
 
-            x_hat = lam + diffused
+            x_hat = diffused
         else:
             x_hat = lam
             a = b = alpha = None
@@ -387,12 +398,12 @@ class RegressionModel:
                         kappa = self.model.kappa
 
                         # Prior distribution parameterized using kappa (concentration) and prior_alpha (mean)
-                        prior_a = kappa * prior_alpha_target
-                        prior_b = kappa * (1.0 - prior_alpha_target)
+                        # We add 1.0 to ensure the prior never has an asymptote at 0 or 1
+                        prior_a = 1.0 + kappa * prior_alpha_target
+                        prior_b = 1.0 + kappa * (1.0 - prior_alpha_target)
 
                         q_alpha = Beta(a_target, b_target)
                         p_alpha = Beta(prior_a, prior_b)
-
                         # Normalize by batch size to keep loss scale invariant
                         kl_alpha = (
                             kl_divergence(q_alpha, p_alpha).sum() / batch.batch_size
