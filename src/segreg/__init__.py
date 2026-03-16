@@ -227,6 +227,7 @@ class RegressionModel:
         batch_size: int | None = 4096,
         include_diffusion: bool = True,
         include_size_factor: bool = True,
+        sf_sigma: float = 0.5,
         hidden_channels: int = 64,
         latent_dim: int = 32,
         kappa: float = 100.0,
@@ -320,8 +321,20 @@ class RegressionModel:
             edge_index=torch.tensor(edge_index, dtype=torch.long),
             n_id=torch.arange(adata.n_obs),
             x=torch.tensor(np.asarray(design_df), dtype=torch.float32),
-            log_sf=torch.tensor(log_size_factors, dtype=torch.float32),
+            # Prior for the learned size factor: fixed geometric measurement from proseg.
+            log_sf_prior=torch.tensor(log_size_factors, dtype=torch.float32),
         )
+
+        # Learnable per-cell log size factor, initialized to the volume-based prior.
+        # During training it is regularized toward the prior with a Gaussian penalty,
+        # allowing small per-cell adjustments while staying anchored to cell geometry.
+        self.sf_sigma = sf_sigma
+        self.include_size_factor = include_size_factor
+        if include_size_factor:
+            self.log_sf_embed = nn.Embedding(m, 1)
+            self.log_sf_embed.weight.data = torch.tensor(
+                log_size_factors, dtype=torch.float32
+            ).unsqueeze(-1)
 
         # Compute empirical log mean expression for initialization.
         # With a size factor, gene_bias should reflect the mean normalized rate:
@@ -360,7 +373,12 @@ class RegressionModel:
         lr: float = 1e-3,
         beta_kl: float = 0.01,
     ):
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        if self.include_size_factor:
+            self.log_sf_embed = self.log_sf_embed.to(self.device)
+            params = list(self.model.parameters()) + list(self.log_sf_embed.parameters())
+        else:
+            params = list(self.model.parameters())
+        optimizer = torch.optim.Adam(params, lr=lr)
 
         loader = NeighborLoader(
             self.data,
@@ -426,16 +444,18 @@ class RegressionModel:
                 #     effects (e.g. tumor adjacency) into rho, leaving those effects solely to beta.
                 # Without a size factor, include both log-counts and covariates as before.
                 if self.model.include_size_factor:
-                    size_factor = torch.exp(batch.log_sf).unsqueeze(-1)
+                    log_sf = self.log_sf_embed(batch.n_id).squeeze(-1)
+                    size_factor = torch.exp(log_sf).unsqueeze(-1)
                     x_norm = x_sub_tensor / (size_factor + 1e-8) * 1000.0
                     encoder_in = torch.log1p(x_norm)
                 else:
+                    log_sf = None
                     encoder_in = torch.cat([torch.log1p(x_sub_tensor), batch.x], dim=-1)
 
                 # Forward Pass
                 x_hat, mu, logstd, a, b, alpha = self.model(
                     encoder_in, batch.x, batch.edge_index, prior_alpha,
-                    log_size_factor=batch.log_sf,
+                    log_size_factor=log_sf,
                 )
 
                 # Masking: We only calculate loss for the "target" nodes in the center of the sampled subgraph.
@@ -512,7 +532,18 @@ class RegressionModel:
                     )
                 ) / self.m
 
-                loss = loss_recon + beta_kl * (kl_z + kl_alpha + kl_beta)
+                # 5. Size Factor Regularization (Gaussian prior: log_sf ~ N(log_volume, sf_sigma^2))
+                if self.model.include_size_factor:
+                    log_sf_target = log_sf[:batch.batch_size]
+                    log_sf_prior_target = batch.log_sf_prior[:batch.batch_size]
+                    loss_sf = (
+                        (log_sf_target - log_sf_prior_target).pow(2).mean()
+                        / (2 * self.sf_sigma ** 2)
+                    )
+                else:
+                    loss_sf = torch.tensor(0.0, device=self.device)
+
+                loss = loss_recon + beta_kl * (kl_z + kl_alpha + kl_beta) + loss_sf
                 loss.backward()
                 optimizer.step()
 
@@ -527,7 +558,8 @@ class RegressionModel:
             print(
                 f"Epoch {epoch} | Loss: {total_loss / len(loader):.4f} "
                 f"(Recon: {loss_recon.item():.4f}, KL_z: {kl_z.item():.4f}, "
-                f"KL_alpha: {kl_alpha.item():.4f}, KL_beta: {kl_beta.item():.4f}{kappa_str})"
+                f"KL_alpha: {kl_alpha.item():.4f}, KL_beta: {kl_beta.item():.4f}, "
+                f"SF_reg: {loss_sf.item():.4f}{kappa_str})"
             )
 
     def get_regression_coefficients(
@@ -614,10 +646,12 @@ class RegressionModel:
                 )
 
                 if self.model.include_size_factor:
-                    size_factor = torch.exp(batch.log_sf).unsqueeze(-1)
+                    log_sf = self.log_sf_embed(batch.n_id).squeeze(-1)
+                    size_factor = torch.exp(log_sf).unsqueeze(-1)
                     x_norm = x_sub_tensor / (size_factor + 1e-8) * 1000.0
                     encoder_in = torch.log1p(x_norm)
                 else:
+                    log_sf = None
                     encoder_in = torch.cat([torch.log1p(x_sub_tensor), batch.x], dim=-1)
 
                 # Forward pass through encoder
@@ -628,7 +662,7 @@ class RegressionModel:
                 mu_target = mu[target_mask]
                 logstd_target = logstd[target_mask]
                 covariates_target = batch.x[target_mask]
-                log_sf_target = batch.log_sf[target_mask]
+                log_sf_target = log_sf[target_mask] if log_sf is not None else None
                 beta = self.model.beta_mu
 
                 std_target = torch.exp(logstd_target)
