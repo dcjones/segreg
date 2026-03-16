@@ -93,11 +93,16 @@ class SegregVAE(nn.Module):
         latent_dim: int = 32,
         kappa: float = 100.0,
         include_diffusion: bool = True,
+        include_size_factor: bool = True,
         log_mean_expr: torch.Tensor | None = None,
     ):
         super().__init__()
         self.include_diffusion = include_diffusion
-        in_channels = n_genes + n_covariates
+        self.include_size_factor = include_size_factor
+        # When using a size factor the encoder receives only expression data (not covariates),
+        # so the latent variable cannot absorb systematic covariate effects (e.g. tumor adjacency)
+        # and the regression coefficients remain the sole owner of those effects.
+        in_channels = n_genes if include_size_factor else n_genes + n_covariates
         self.encoder = Encoder(in_channels, hidden_channels, latent_dim)
         self.node_decoder = NodeDecoder(latent_dim, hidden_channels, n_genes)
 
@@ -108,8 +113,6 @@ class SegregVAE(nn.Module):
             # We model it as a point estimate (MLE) to be inferred during training.
             # Use softplus to ensure it stays positive.
             self.kappa_unconstrained = nn.Parameter(torch.tensor(kappa))
-
-        print(log_mean_expr)
 
         # Empirical gene baseline to help the model start at the correct scale
         if log_mean_expr is not None:
@@ -135,7 +138,7 @@ class SegregVAE(nn.Module):
             return mu + eps * std
         return mu
 
-    def forward(self, x, covariates, edge_index, prior_alpha=None):
+    def forward(self, x, covariates, edge_index, prior_alpha=None, log_size_factor=None):
         # 1. Encode into node latents
         mu, logstd = self.encoder(x, edge_index)
         z = self.reparameterize(mu, logstd)
@@ -151,11 +154,13 @@ class SegregVAE(nn.Module):
         else:
             beta = self.beta_mu
 
-        # Compute predicted expression rates (lambda)
-        # Use clamp to prevent overflow when applying exp
-        lam = torch.exp(
-            torch.clamp(rho + covariates @ beta + self.gene_bias, min=-15.0, max=15.0)
-        )
+        # Compute predicted expression rates (lambda).
+        # When include_size_factor is True, log_size_factor is added as a fixed offset
+        # so that beta captures rates per unit of total expression, not raw counts.
+        log_rate = rho + covariates @ beta + self.gene_bias
+        if self.include_size_factor and log_size_factor is not None:
+            log_rate = log_rate + log_size_factor.unsqueeze(-1)
+        lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
 
         if self.include_diffusion and prior_alpha is not None:
             # 3. Decode edge diffusion parameters
@@ -166,8 +171,11 @@ class SegregVAE(nn.Module):
 
             # Sample alpha during training, use mean during evaluation
             if self.training:
-                alpha_dist = Beta(a, b)
-                alpha = alpha_dist.rsample()
+                if a.numel() > 0:
+                    alpha_dist = Beta(a, b)
+                    alpha = alpha_dist.rsample()
+                else:
+                    alpha = torch.empty_like(a)
             else:
                 alpha = a / (a + b)
 
@@ -177,8 +185,8 @@ class SegregVAE(nn.Module):
             # Sum the inferred alpha values over all outgoing edges from each source node.
             total_alpha = torch.zeros(lam.size(0), device=lam.device)
             total_alpha.scatter_add_(0, src, alpha)
-            
-            # If total_alpha > 1.0, we normalize the outgoing alphas down. 
+
+            # If total_alpha > 1.0, we normalize the outgoing alphas down.
             # If < 1.0, we leave them (allowing loss to background).
             normalization = torch.clamp(total_alpha, min=1.0)
             alpha_normalized = alpha / normalization[src]
@@ -190,7 +198,9 @@ class SegregVAE(nn.Module):
             messages = alpha_normalized.unsqueeze(-1) * lam[src]
 
             diffused = torch.zeros_like(lam)
-            diffused.scatter_add_(0, dst.unsqueeze(-1).expand(-1, lam.size(1)), messages)
+            diffused.scatter_add_(
+                0, dst.unsqueeze(-1).expand(-1, lam.size(1)), messages
+            )
 
             x_hat = diffused
         else:
@@ -216,6 +226,7 @@ class RegressionModel:
         formula: str,
         batch_size: int | None = 4096,
         include_diffusion: bool = True,
+        include_size_factor: bool = True,
         hidden_channels: int = 64,
         latent_dim: int = 32,
         kappa: float = 100.0,
@@ -235,45 +246,94 @@ class RegressionModel:
         self.var_names = adata.var_names
         self.obs_names = adata.obs_names
 
-        self.design = cast(DesignMatrix, dmatrix(formula, adata.obs))
+        design_df = dmatrix(formula, adata.obs, return_type="dataframe")
+        self.design = cast(DesignMatrix, design_df)
+
+        # dmatrix drops rows with NaN by default; expand back to m rows with zeros
+        # so that Data.x aligns with n_id (which covers all m cells).
+        if design_df.shape[0] < m:
+            design_df = design_df.reindex(adata.obs.index, fill_value=0.0)
 
         # This is a flattened 3d array giving per-gene state transition probabilities
         state_transitions = adata.varm["state_transitions"]
+
+        # SciPy/AnnData zarr loaders sometimes use int32 for indices, which overflows if m*m > 2.14 billion.
+        # CSR row indices must be monotonically increasing, so we can detect and fix negative wraps.
+        if state_transitions.indices.dtype == np.int32 and m * m > 2147483647:
+            print("HERE")
+            indices_64 = state_transitions.indices.astype(np.int64)
+            for i in range(len(state_transitions.indptr) - 1):
+                start, end = (
+                    state_transitions.indptr[i],
+                    state_transitions.indptr[i + 1],
+                )
+                if start == end:
+                    continue
+                row_indices = indices_64[start:end]
+                diffs = np.diff(row_indices)
+                wraps = (diffs < 0).astype(np.int64)
+                if wraps.any():
+                    wrap_counts = np.cumsum(wraps)
+                    row_indices[1:] += wrap_counts * (2**32)
+                    indices_64[start:end] = row_indices
+
+            state_transitions = csr_matrix(
+                (state_transitions.data, indices_64, state_transitions.indptr),
+                shape=(n, m * m),
+            )
+
         assert state_transitions.shape == (n, m * m)
         assert isinstance(state_transitions, csr_matrix)
 
         # define a graph where there is an edge if there were any transcript transitions between cells
-        unique_indices = np.unique(state_transitions.indices, sorted=True)
-        col = unique_indices % m
-        row = unique_indices // m
+        self.unique_edge_indices = np.unique(state_transitions.indices)
+        col = self.unique_edge_indices % m
+        row = self.unique_edge_indices // m
+
         edge_index = np.stack([col, row], axis=0)
 
-        self.data = Data(
-            edge_index=torch.tensor(edge_index, dtype=torch.long),
-            n_id=torch.arange(adata.n_obs),
-            # edge_attr=torch.tensor(state_transitions_coo.data, dtype=torch.float32),
-            x=torch.tensor(np.asarray(self.design), dtype=torch.float32),
+        # Compress state transitions to only include columns with any non-zero entries
+        new_indices = np.searchsorted(
+            self.unique_edge_indices, state_transitions.indices
         )
-
-        self.state_transitions_t = state_transitions.transpose().tocsr()
-
-        self.data = Data(
-            edge_index=torch.tensor(edge_index, dtype=torch.long),
-            n_id=torch.arange(adata.n_obs),
-            x=torch.tensor(np.asarray(self.design), dtype=torch.float32),
+        compressed_state_transitions = csr_matrix(
+            (state_transitions.data, new_indices, state_transitions.indptr),
+            shape=(n, len(self.unique_edge_indices)),
         )
+        self.state_transitions_t = compressed_state_transitions.transpose().tocsr()
 
         self.X = adata.X
         # cast to csr_matrix if we aren't already
         if not isinstance(self.X, csr_matrix):
             self.X = self.X.tocsr()
 
-        # Compute empirical log mean expression for initialization
-        # Add a small epsilon to avoid log(0)
+        # Per-cell log size factor: use cell volume from proseg if available,
+        # otherwise fall back to total transcript count. Volume is the geometrically
+        # correct size measurement; counts/volume is flat across cell groups.
+        if include_size_factor and 'volume' in adata.obs.columns:
+            cell_size = np.asarray(adata.obs['volume']).squeeze().astype(np.float64)
+        else:
+            cell_size = np.asarray(self.X.sum(axis=1)).squeeze().astype(np.float64)
+        log_size_factors = np.log(cell_size + 1e-8).astype(np.float32)
+
+        self.data = Data(
+            edge_index=torch.tensor(edge_index, dtype=torch.long),
+            n_id=torch.arange(adata.n_obs),
+            x=torch.tensor(np.asarray(design_df), dtype=torch.float32),
+            log_sf=torch.tensor(log_size_factors, dtype=torch.float32),
+        )
+
+        # Compute empirical log mean expression for initialization.
+        # With a size factor, gene_bias should reflect the mean normalized rate:
+        # E[counts_g] = mean_sf * exp(gene_bias_g), so gene_bias = log(mean_expr/mean_sf).
         mean_expr = torch.tensor(
             np.asarray(self.X.mean(axis=0)).squeeze(), dtype=torch.float32
         )
-        log_mean_expr = torch.log(mean_expr + 1e-4)
+        if include_size_factor:
+            mean_sf = float(cell_size.mean())
+            log_mean_expr = torch.log(mean_expr / mean_sf + 1e-8)
+        else:
+            log_mean_expr = torch.log(mean_expr + 1e-4)
 
         # Initialize Model
         n_genes = self.X.shape[1]
@@ -286,6 +346,7 @@ class RegressionModel:
             latent_dim=latent_dim,
             kappa=kappa,
             include_diffusion=include_diffusion,
+            include_size_factor=include_size_factor,
             log_mean_expr=log_mean_expr,
         ).to(self.device)
         self.m = m
@@ -333,21 +394,48 @@ class RegressionModel:
                         (global_src + global_dst * self.m).cpu().numpy()
                     )
 
+                    # Map to the compressed index
+                    mapped_edge_index = np.searchsorted(
+                        self.unique_edge_indices, encoded_edge_index
+                    )
+                    invalid = (mapped_edge_index >= len(self.unique_edge_indices)) | (
+                        self.unique_edge_indices[
+                            np.minimum(
+                                mapped_edge_index, len(self.unique_edge_indices) - 1
+                            )
+                        ]
+                        != encoded_edge_index
+                    )
+                    if invalid.any():
+                        raise RuntimeError(
+                            f"Found {invalid.sum()} edges out of {len(encoded_edge_index)} that are not in unique_edge_indices!"
+                        )
+
                     prior_alpha = torch.tensor(
-                        self.state_transitions_t[encoded_edge_index, :].todense(),
+                        self.state_transitions_t[mapped_edge_index, :].todense(),
                         dtype=torch.float32,
                         device=self.device,
                     )
                 else:
                     prior_alpha = None
 
-                # Prepare Encoder Input: log1p(counts) concatenated with design matrix
-                log_x = torch.log1p(x_sub_tensor)
-                encoder_in = torch.cat([log_x, batch.x], dim=-1)
+                # Prepare Encoder Input.
+                # When using a size factor:
+                #   - Normalize counts to a common total so the latent space is size-independent.
+                #   - Exclude the design matrix so the encoder cannot absorb systematic covariate
+                #     effects (e.g. tumor adjacency) into rho, leaving those effects solely to beta.
+                # Without a size factor, include both log-counts and covariates as before.
+                if self.model.include_size_factor:
+                    size_factor = torch.exp(batch.log_sf).unsqueeze(-1)
+                    x_norm = x_sub_tensor / (size_factor + 1e-8) * 1000.0
+                    encoder_in = torch.log1p(x_norm)
+                else:
+                    encoder_in = torch.cat([torch.log1p(x_sub_tensor), batch.x], dim=-1)
 
                 # Forward Pass
                 x_hat, mu, logstd, a, b, alpha = self.model(
-                    encoder_in, batch.x, batch.edge_index, prior_alpha
+                    encoder_in, batch.x, batch.edge_index, prior_alpha,
+                    log_size_factor=batch.log_sf,
                 )
 
                 # Masking: We only calculate loss for the "target" nodes in the center of the sampled subgraph.
@@ -525,8 +613,12 @@ class RegressionModel:
                     x_sub, dtype=torch.float32, device=self.device
                 )
 
-                log_x = torch.log1p(x_sub_tensor)
-                encoder_in = torch.cat([log_x, batch.x], dim=-1)
+                if self.model.include_size_factor:
+                    size_factor = torch.exp(batch.log_sf).unsqueeze(-1)
+                    x_norm = x_sub_tensor / (size_factor + 1e-8) * 1000.0
+                    encoder_in = torch.log1p(x_norm)
+                else:
+                    encoder_in = torch.cat([torch.log1p(x_sub_tensor), batch.x], dim=-1)
 
                 # Forward pass through encoder
                 mu, logstd = self.model.encoder(encoder_in, batch.edge_index)
@@ -536,6 +628,7 @@ class RegressionModel:
                 mu_target = mu[target_mask]
                 logstd_target = logstd[target_mask]
                 covariates_target = batch.x[target_mask]
+                log_sf_target = batch.log_sf[target_mask]
                 beta = self.model.beta_mu
 
                 std_target = torch.exp(logstd_target)
@@ -544,19 +637,17 @@ class RegressionModel:
                     (batch.batch_size, self.n), device=self.device
                 )
 
-                # Monte Carlo sampling to compute expected rates
+                # Monte Carlo sampling to compute expected rates.
+                # The size factor is included so the output is on the same scale as raw counts.
                 for _ in range(n_samples):
                     z_target = mu_target + torch.randn_like(std_target) * std_target
                     rho_target = self.model.node_decoder(z_target)
 
+                    log_rate = rho_target + covariates_target @ beta + self.model.gene_bias
+                    if self.model.include_size_factor:
+                        log_rate = log_rate + log_sf_target.unsqueeze(-1)
                     lam_target_sum += torch.exp(
-                        torch.clamp(
-                            rho_target
-                            + covariates_target @ beta
-                            + self.model.gene_bias,
-                            min=-15.0,
-                            max=15.0,
-                        )
+                        torch.clamp(log_rate, min=-15.0, max=15.0)
                     )
 
                 lam_target = lam_target_sum / n_samples
