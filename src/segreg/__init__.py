@@ -12,7 +12,7 @@ from patsy import dmatrix
 from patsy.design_info import DesignMatrix
 from scipy.sparse import csr_matrix
 from spatialdata import SpatialData
-from torch.distributions import Beta, kl_divergence
+from torch.distributions import Beta, NegativeBinomial, kl_divergence
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.nn import GCNConv
@@ -95,6 +95,7 @@ class SegregVAE(nn.Module):
         include_diffusion: bool = True,
         include_size_factor: bool = True,
         log_mean_expr: torch.Tensor | None = None,
+        beta_init: torch.Tensor | None = None,
     ):
         super().__init__()
         self.include_diffusion = include_diffusion
@@ -120,8 +121,17 @@ class SegregVAE(nn.Module):
         else:
             self.gene_bias = nn.Parameter(torch.zeros(n_genes))
 
+        # Per-gene negative binomial dispersion: r = softplus(log_r).
+        # NB variance = mu + mu^2/r; as r -> inf this reduces to Poisson.
+        # Initialize to softplus_inv(10) ≈ 9.3 so training starts near-Poisson
+        # and learns overdispersion where the data supports it.
+        self.log_r = nn.Parameter(torch.full((n_genes,), 9.3))
+
         # Global regression parameters (Surrogate model for Variational Inference)
-        self.beta_mu = nn.Parameter(torch.zeros(n_covariates, n_genes))
+        if beta_init is not None:
+            self.beta_mu = nn.Parameter(beta_init.clone())
+        else:
+            self.beta_mu = nn.Parameter(torch.zeros(n_covariates, n_genes))
         # Initialize logstd to a small value so that initial samples are close to the mean
         self.beta_logstd = nn.Parameter(torch.full((n_covariates, n_genes), -3.0))
 
@@ -138,7 +148,9 @@ class SegregVAE(nn.Module):
             return mu + eps * std
         return mu
 
-    def forward(self, x, covariates, edge_index, prior_alpha=None, log_size_factor=None):
+    def forward(
+        self, x, covariates, edge_index, prior_alpha=None, log_size_factor=None
+    ):
         # 1. Encode into node latents
         mu, logstd = self.encoder(x, edge_index)
         z = self.reparameterize(mu, logstd)
@@ -230,7 +242,7 @@ class RegressionModel:
         sf_sigma: float = 0.5,
         hidden_channels: int = 64,
         latent_dim: int = 32,
-        kappa: float = 100.0,
+        kappa: float = 10.0,
     ):
         if isinstance(data, AnnData):
             adata = data
@@ -311,8 +323,8 @@ class RegressionModel:
         # Per-cell log size factor: use cell volume from proseg if available,
         # otherwise fall back to total transcript count. Volume is the geometrically
         # correct size measurement; counts/volume is flat across cell groups.
-        if include_size_factor and 'volume' in adata.obs.columns:
-            cell_size = np.asarray(adata.obs['volume']).squeeze().astype(np.float64)
+        if include_size_factor and "volume" in adata.obs.columns:
+            cell_size = np.asarray(adata.obs["volume"]).squeeze().astype(np.float64)
         else:
             cell_size = np.asarray(self.X.sum(axis=1)).squeeze().astype(np.float64)
         log_size_factors = np.log(cell_size + 1e-8).astype(np.float32)
@@ -348,9 +360,25 @@ class RegressionModel:
         else:
             log_mean_expr = torch.log(mean_expr + 1e-4)
 
-        # Initialize Model
+        # OLS initialization for beta_mu: solve log(x/sf + 1e-4) ≈ gene_bias + design @ beta
+        # One QR factorization of the (m × n_cov) design matrix solves all genes at once.
+        # This gives beta a near-correct starting point so training converges much faster.
         n_genes = self.X.shape[1]
         n_covariates = self.design.shape[1]
+        print("Computing OLS initialization for beta...")
+        X_dense = self.X.toarray().astype(np.float32)  # (m, n_genes)
+        sf_col = np.exp(log_size_factors).reshape(-1, 1)  # (m, 1)
+        y_log = np.log(
+            (X_dense + 0.5) / sf_col
+        )  # (m, n_genes); 0.5 half-count pseudocount
+        y_resid = y_log - log_mean_expr.numpy()  # subtract gene_bias
+        design_np = np.asarray(design_df, dtype=np.float64)  # (m, n_cov)
+        beta_init_np, _, _, _ = np.linalg.lstsq(
+            design_np, y_resid.astype(np.float64), rcond=None
+        )
+        beta_init = torch.tensor(beta_init_np, dtype=torch.float32)
+        print("Done.")
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = SegregVAE(
             n_genes,
@@ -361,6 +389,7 @@ class RegressionModel:
             include_diffusion=include_diffusion,
             include_size_factor=include_size_factor,
             log_mean_expr=log_mean_expr,
+            beta_init=beta_init,
         ).to(self.device)
         self.m = m
         self.n = n
@@ -375,7 +404,9 @@ class RegressionModel:
     ):
         if self.include_size_factor:
             self.log_sf_embed = self.log_sf_embed.to(self.device)
-            params = list(self.model.parameters()) + list(self.log_sf_embed.parameters())
+            params = list(self.model.parameters()) + list(
+                self.log_sf_embed.parameters()
+            )
         else:
             params = list(self.model.parameters())
         optimizer = torch.optim.Adam(params, lr=lr)
@@ -454,7 +485,10 @@ class RegressionModel:
 
                 # Forward Pass
                 x_hat, mu, logstd, a, b, alpha = self.model(
-                    encoder_in, batch.x, batch.edge_index, prior_alpha,
+                    encoder_in,
+                    batch.x,
+                    batch.edge_index,
+                    prior_alpha,
                     log_size_factor=log_sf,
                 )
 
@@ -464,14 +498,14 @@ class RegressionModel:
                 x_target = x_sub_tensor[target_mask]
                 x_hat_target = x_hat[target_mask]
 
-                # 1. Reconstruction Loss (Negative Log-Likelihood of Poisson)
-                # Poisson log PMF: x * log(lambda) - lambda - log(x!)
-                # Minimizing NLL: -x * log(lambda) + lambda
-                loss_recon = (
-                    (x_hat_target - x_target * torch.log(x_hat_target + 1e-8))
-                    .sum(dim=-1)
-                    .mean()
+                # 1. Reconstruction Loss (Negative Log-Likelihood of Negative Binomial)
+                # NB variance = mu + mu^2/r; reduces to Poisson as r -> inf.
+                r = F.softplus(self.model.log_r)  # (n_genes,)
+                nb = NegativeBinomial(
+                    total_count=r,
+                    probs=x_hat_target / (x_hat_target + r + 1e-8),
                 )
+                loss_recon = -nb.log_prob(x_target).sum(dim=-1).mean()
 
                 # 2. Node KL Divergence (Standard Normal Prior)
                 mu_target = mu[target_mask]
@@ -534,11 +568,10 @@ class RegressionModel:
 
                 # 5. Size Factor Regularization (Gaussian prior: log_sf ~ N(log_volume, sf_sigma^2))
                 if self.model.include_size_factor:
-                    log_sf_target = log_sf[:batch.batch_size]
-                    log_sf_prior_target = batch.log_sf_prior[:batch.batch_size]
-                    loss_sf = (
-                        (log_sf_target - log_sf_prior_target).pow(2).mean()
-                        / (2 * self.sf_sigma ** 2)
+                    log_sf_target = log_sf[: batch.batch_size]
+                    log_sf_prior_target = batch.log_sf_prior[: batch.batch_size]
+                    loss_sf = (log_sf_target - log_sf_prior_target).pow(2).mean() / (
+                        2 * self.sf_sigma**2
                     )
                 else:
                     loss_sf = torch.tensor(0.0, device=self.device)
@@ -677,7 +710,9 @@ class RegressionModel:
                     z_target = mu_target + torch.randn_like(std_target) * std_target
                     rho_target = self.model.node_decoder(z_target)
 
-                    log_rate = rho_target + covariates_target @ beta + self.model.gene_bias
+                    log_rate = (
+                        rho_target + covariates_target @ beta + self.model.gene_bias
+                    )
                     if self.model.include_size_factor:
                         log_rate = log_rate + log_sf_target.unsqueeze(-1)
                     lam_target_sum += torch.exp(
