@@ -12,7 +12,7 @@ from patsy import dmatrix
 from patsy.design_info import DesignMatrix
 from scipy.sparse import csr_matrix
 from spatialdata import SpatialData
-from torch.distributions import Beta, NegativeBinomial, kl_divergence
+from torch.distributions import Beta, kl_divergence
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.nn import GCNConv
@@ -143,10 +143,12 @@ class SegregVAE(nn.Module):
 
     def reparameterize(self, mu, logstd):
         if self.training:
-            std = torch.exp(logstd)
+            # Clamp to prevent bfloat16 overflow: large mu/logstd → Inf → mixed-sign
+            # Inf in downstream linear layers → Inf + (-Inf) = NaN.
+            std = torch.exp(logstd.clamp(max=10.0))
             eps = torch.randn_like(std)
-            return mu + eps * std
-        return mu
+            return (mu + eps * std).clamp(-50.0, 50.0)
+        return mu.clamp(-50.0, 50.0)
 
     def forward(
         self, x, covariates, edge_index, prior_alpha=None, log_size_factor=None
@@ -160,7 +162,8 @@ class SegregVAE(nn.Module):
 
         # 2.5 Sample global regression coefficients
         if self.training:
-            beta_std = torch.exp(self.beta_logstd)
+            # Clamp logstd before exp to prevent bfloat16 overflow → Inf in beta_std
+            beta_std = torch.exp(self.beta_logstd.clamp(max=4.0))
             eps = torch.randn_like(beta_std)
             beta = self.beta_mu + eps * beta_std
         else:
@@ -181,11 +184,17 @@ class SegregVAE(nn.Module):
             z_src, z_dst = z[src], z[dst]
             a, b = self.edge_decoder(z_src, z_dst, prior_alpha)
 
-            # Sample alpha during training, use mean during evaluation
+            # Sample alpha during training, use mean during evaluation.
+            # Cast to float32 before sampling: Beta.rsample() via Gamma can produce
+            # NaN in bfloat16 for some parameter combinations.
             if self.training:
                 if a.numel() > 0:
-                    alpha_dist = Beta(a, b)
-                    alpha = alpha_dist.rsample()
+                    # Clamp to avoid numerically unstable Gamma sampler for very
+                    # large concentrations (can produce Inf → NaN via Inf/Inf).
+                    a_f = a.float().clamp(min=1e-3, max=1e4)
+                    b_f = b.float().clamp(min=1e-3, max=1e4)
+                    alpha_dist = Beta(a_f, b_f)
+                    alpha = alpha_dist.rsample().to(a.dtype)
                 else:
                     alpha = torch.empty_like(a)
             else:
@@ -380,6 +389,29 @@ class RegressionModel:
         print("Done.")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Pre-densify X and state_transitions_t to GPU tensors to eliminate
+        # per-batch CPU sparse operations (the dominant training bottleneck).
+        # Memory budget: skip if either tensor would exceed 4 GB total.
+        x_bytes = m * n * 4
+        st_bytes = len(self.unique_edge_indices) * n * 4
+        mem_budget = 4 * 1024 ** 3
+        # Always keep unique_edge_indices on GPU for fast searchsorted lookups.
+        self.unique_edge_indices_t = torch.tensor(
+            self.unique_edge_indices, dtype=torch.long
+        ).to(self.device)
+
+        if x_bytes + st_bytes <= mem_budget:
+            self.x_dense = torch.tensor(
+                self.X.toarray(), dtype=torch.float32
+            ).to(self.device)
+            self.st_dense = torch.tensor(
+                self.state_transitions_t.toarray(), dtype=torch.float32
+            ).to(self.device)
+        else:
+            self.x_dense = None
+            self.st_dense = None
+
         self.model = SegregVAE(
             n_genes,
             n_covariates,
@@ -421,6 +453,10 @@ class RegressionModel:
 
         self.model.train()
 
+        use_amp = self.device.type == "cuda"
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        scaler = torch.amp.GradScaler(enabled=use_amp)
+
         for epoch in range(nepochs):
             total_loss = 0.0
 
@@ -428,52 +464,43 @@ class RegressionModel:
                 optimizer.zero_grad()
                 batch = batch.to(self.device)
 
-                # Fetch sparse counts for the sampled nodes and convert to dense tensor for the model
-                node_idx = batch.n_id.cpu().numpy()
-                x_sub = self.X[node_idx].toarray()
-                x_sub_tensor = torch.tensor(
-                    x_sub, dtype=torch.float32, device=self.device
-                )
+                # Fetch dense counts for the sampled nodes.
+                node_idx = batch.n_id
+                if self.x_dense is not None:
+                    x_sub_tensor = self.x_dense[node_idx]
+                else:
+                    x_sub = self.X[node_idx.cpu().numpy()].toarray().astype(np.float32)
+                    x_sub_tensor = torch.from_numpy(x_sub).to(self.device)
 
                 if self.model.include_diffusion:
-                    # Fetch edge transition weights
+                    # Fetch edge transition weights.
                     global_src = batch.n_id[batch.edge_index[0, :]]
                     global_dst = batch.n_id[batch.edge_index[1, :]]
-                    encoded_edge_index = (
-                        (global_src + global_dst * self.m).cpu().numpy()
-                    )
+                    encoded = global_src + global_dst * self.m  # (E,) on GPU
 
-                    # Map to the compressed index
-                    mapped_edge_index = np.searchsorted(
-                        self.unique_edge_indices, encoded_edge_index
-                    )
-                    invalid = (mapped_edge_index >= len(self.unique_edge_indices)) | (
-                        self.unique_edge_indices[
-                            np.minimum(
-                                mapped_edge_index, len(self.unique_edge_indices) - 1
-                            )
-                        ]
-                        != encoded_edge_index
-                    )
+                    mapped_edge_index = torch.searchsorted(self.unique_edge_indices_t, encoded)
+                    n_ue = len(self.unique_edge_indices_t)
+                    clamped = mapped_edge_index.clamp(max=n_ue - 1)
+                    invalid = (mapped_edge_index >= n_ue) | (self.unique_edge_indices_t[clamped] != encoded)
                     if invalid.any():
                         raise RuntimeError(
-                            f"Found {invalid.sum()} edges out of {len(encoded_edge_index)} that are not in unique_edge_indices!"
+                            f"Found {invalid.sum()} edges out of {len(encoded)} that are not in unique_edge_indices!"
                         )
 
-                    prior_alpha = torch.tensor(
-                        self.state_transitions_t[mapped_edge_index, :].todense(),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
+                    if self.st_dense is not None:
+                        prior_alpha = self.st_dense[mapped_edge_index]
+                    else:
+                        mapped_np = mapped_edge_index.cpu().numpy()
+                        arr = self.state_transitions_t[mapped_np, :].toarray().astype(np.float32)
+                        prior_alpha = torch.from_numpy(arr).to(self.device)
                 else:
                     prior_alpha = None
 
-                # Prepare Encoder Input.
-                # When using a size factor:
-                #   - Normalize counts to a common total so the latent space is size-independent.
-                #   - Exclude the design matrix so the encoder cannot absorb systematic covariate
-                #     effects (e.g. tumor adjacency) into rho, leaving those effects solely to beta.
-                # Without a size factor, include both log-counts and covariates as before.
+                # Prepare encoder input and run the model forward pass under AMP.
+                # Autocast is scoped tightly to the forward pass so that the GCN /
+                # linear-layer matmuls run in bfloat16 for speed, while the loss
+                # computation (lgamma, Beta KL) is kept in float32 to avoid NaN from
+                # catastrophic cancellation in low-precision arithmetic.
                 if self.model.include_size_factor:
                     log_sf = self.log_sf_embed(batch.n_id).squeeze(-1)
                     size_factor = torch.exp(log_sf).unsqueeze(-1)
@@ -483,33 +510,47 @@ class RegressionModel:
                     log_sf = None
                     encoder_in = torch.cat([torch.log1p(x_sub_tensor), batch.x], dim=-1)
 
-                # Forward Pass
-                x_hat, mu, logstd, a, b, alpha = self.model(
-                    encoder_in,
-                    batch.x,
-                    batch.edge_index,
-                    prior_alpha,
-                    log_size_factor=log_sf,
-                )
+                with torch.autocast(device_type=self.device.type, dtype=amp_dtype, enabled=use_amp):
+                    x_hat, mu, logstd, a, b, alpha = self.model(
+                        encoder_in,
+                        batch.x,
+                        batch.edge_index,
+                        prior_alpha,
+                        log_size_factor=log_sf,
+                    )
 
+                # ── Loss computation in float32 ──────────────────────────────────────
                 # Masking: We only calculate loss for the "target" nodes in the center of the sampled subgraph.
                 # PyG places these first in the batch up to `batch.batch_size`
                 target_mask = torch.arange(batch.batch_size, device=self.device)
                 x_target = x_sub_tensor[target_mask]
-                x_hat_target = x_hat[target_mask]
+                # Sanitize rare NaN/Inf from bfloat16 forward (e.g. beta_std overflow
+                # producing Inf in log_rate → NaN via Inf + (-Inf) in mixed-sign paths).
+                x_hat_target = x_hat[target_mask].float()
 
-                # 1. Reconstruction Loss (Negative Log-Likelihood of Negative Binomial)
-                # NB variance = mu + mu^2/r; reduces to Poisson as r -> inf.
-                r = F.softplus(self.model.log_r)  # (n_genes,)
-                nb = NegativeBinomial(
-                    total_count=r,
-                    probs=x_hat_target / (x_hat_target + r + 1e-8),
-                )
-                loss_recon = -nb.log_prob(x_target).sum(dim=-1).mean()
+                # 1. Reconstruction Loss (Negative Binomial NLL, inline to avoid
+                # Python distribution-object overhead).
+                # log P(x | mu, r) = lgamma(x+r) - lgamma(r) - lgamma(x+1)
+                #                    + r*log(r/(r+mu)) + x*log(mu/(r+mu))
+                # Numerically stable: clamp r away from 0 (prevents 0*log(0)=NaN when
+                # r→0) and add eps to mu numerator (prevents x*log(0)=0*(-Inf)=NaN
+                # for zero-count genes in cells with zero predicted expression).
+                r = F.softplus(self.model.log_r).clamp(min=1e-3)  # (n_genes,)
+                mu_nb = x_hat_target
+                eps = 1e-8
+                log_r_over_r_plus_mu = torch.log(r / (r + mu_nb + eps))
+                log_mu_over_r_plus_mu = torch.log((mu_nb + eps) / (r + mu_nb + eps))
+                loss_recon = -(
+                    torch.lgamma(x_target + r)
+                    - torch.lgamma(r)
+                    - torch.lgamma(x_target + 1)
+                    + r * log_r_over_r_plus_mu
+                    + x_target * log_mu_over_r_plus_mu
+                ).sum(dim=-1).mean()
 
                 # 2. Node KL Divergence (Standard Normal Prior)
-                mu_target = mu[target_mask]
-                logstd_target = logstd[target_mask]
+                mu_target = mu[target_mask].float()
+                logstd_target = logstd[target_mask].float()
                 kl_z = (
                     -0.5
                     * torch.sum(
@@ -527,8 +568,8 @@ class RegressionModel:
                     edge_mask = dst < batch.batch_size
 
                     if edge_mask.sum() > 0:
-                        a_target = a[edge_mask]
-                        b_target = b[edge_mask]
+                        a_target = a[edge_mask].float()
+                        b_target = b[edge_mask].float()
                         prior_alpha_target = prior_alpha[edge_mask]
 
                         # Clamp prior to avoid 0 or 1 edge cases for the Beta distribution
@@ -577,10 +618,16 @@ class RegressionModel:
                     loss_sf = torch.tensor(0.0, device=self.device)
 
                 loss = loss_recon + beta_kl * (kl_z + kl_alpha + kl_beta) + loss_sf
-                loss.backward()
-                optimizer.step()
 
-                total_loss += loss.item()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+
+                loss_val = loss.item()
+                if loss_val == loss_val:  # skip NaN batches
+                    total_loss += loss_val
 
             if self.model.include_diffusion:
                 kappa_val = self.model.kappa.item()
