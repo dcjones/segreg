@@ -1,4 +1,5 @@
 # Experimenting with writing this is pytorch instead to see how that would look.
+import math
 from typing import cast
 
 import numpy as np
@@ -228,7 +229,7 @@ class SegregVAE(nn.Module):
             x_hat = lam
             a = b = alpha = None
 
-        return x_hat, mu, logstd, a, b, alpha
+        return x_hat, mu, logstd, a, b, alpha, beta
 
 
 class RegressionModel:
@@ -252,6 +253,7 @@ class RegressionModel:
         hidden_channels: int = 64,
         latent_dim: int = 32,
         kappa: float = 10.0,
+        beta_prior_scale: float = 1.0,
     ):
         if isinstance(data, AnnData):
             adata = data
@@ -369,7 +371,7 @@ class RegressionModel:
         else:
             log_mean_expr = torch.log(mean_expr + 1e-4)
 
-        # OLS initialization for beta_mu: solve log(x/sf + 1e-4) ≈ gene_bias + design @ beta
+        # OLS initialization for beta_mu: solve log(x/sf + pseudocount) ≈ gene_bias + design @ beta
         # One QR factorization of the (m × n_cov) design matrix solves all genes at once.
         # This gives beta a near-correct starting point so training converges much faster.
         n_genes = self.X.shape[1]
@@ -377,9 +379,20 @@ class RegressionModel:
         print("Computing OLS initialization for beta...")
         X_dense = self.X.toarray().astype(np.float32)  # (m, n_genes)
         sf_col = np.exp(log_size_factors).reshape(-1, 1)  # (m, 1)
-        y_log = np.log(
-            (X_dense + 0.5) / sf_col
-        )  # (m, n_genes); 0.5 half-count pseudocount
+        # Use a per-gene pseudocount of 0.5 * mean_rate in rate space.
+        # This ensures zero-count cells always get y_resid ≈ log(0.5) ≈ -0.7 regardless
+        # of the gene's mean expression level, avoiding the extreme negative residuals
+        # that a tiny fixed pseudocount (1e-8) causes for lowly-expressed genes (which
+        # drove the OLS to initialize with large negative betas / spurious downregulation).
+        # Being in rate space (not count space) also means the pseudocount is independent
+        # of cell size, preventing the sf-correlated bias that additive count pseudocounts
+        # introduce when cell size correlates with covariates.
+        mean_rate = (  # (1, n_genes) mean expression rate across cells
+            np.asarray(self.X.mean(axis=0)).squeeze().astype(np.float32).reshape(1, -1)
+            / float(sf_col.mean())
+        )
+        gene_pseudocount = 0.5 * np.maximum(mean_rate, 2e-8)  # (1, n_genes)
+        y_log = np.log(X_dense / sf_col + gene_pseudocount)  # (m, n_genes)
         y_resid = y_log - log_mean_expr.numpy()  # subtract gene_bias
         design_np = np.asarray(design_df, dtype=np.float64)  # (m, n_cov)
         beta_init_np, _, _, _ = np.linalg.lstsq(
@@ -390,21 +403,54 @@ class RegressionModel:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Cauchy prior scale for regression coefficients.
+        # The intercept gets a wide scale (10.0) so it is essentially unconstrained;
+        # all other covariates get beta_prior_scale (γ) to encourage shrinkage toward zero
+        # while the heavy Cauchy tails still allow genuinely large fold changes.
+        #
+        # Gene-specific scaling: gamma_g ∝ sqrt(mean_rate_g / median_rate).
+        # Motivation: the NB reconstruction gradient w.r.t. beta[k, g] scales with
+        # mean_rate_g, so any systematic effect (real biology or sf artifact) survives
+        # Cauchy shrinkage preferentially for highly expressed genes, producing a spurious
+        # positive correlation between baseline expression and estimated fold changes.
+        # Scaling gamma by sqrt(mean_rate_g / median_rate) matches the typical statistical
+        # uncertainty in estimating a log fold change (∝ 1/sqrt(n * mean_rate_g)), so the
+        # effective prior-to-signal ratio is equalized across the expression range.
+        covariate_names = list(self.design.design_info.column_names)
+        scale_per_cov = np.array(
+            [
+                10.0 if name == "Intercept" else beta_prior_scale
+                for name in covariate_names
+            ],
+            dtype=np.float32,
+        )
+        mean_rate_1d = mean_rate.squeeze()  # (n_genes,)
+        expressed_rates = mean_rate_1d[mean_rate_1d > 1e-6]
+        median_rate = float(np.median(expressed_rates)) if len(expressed_rates) > 0 else 1e-4
+        gene_scale = np.sqrt(
+            np.maximum(mean_rate_1d, 1e-8) / median_rate
+        ).clip(0.1, 10.0).astype(np.float32)  # (n_genes,); clipped to [0.1, 10]
+        # (n_cov, n_genes): per-covariate base scale * per-gene expression scale
+        beta_prior_scale_matrix = scale_per_cov[:, None] * gene_scale[None, :]
+        self.beta_prior_scale_t = torch.tensor(
+            beta_prior_scale_matrix, dtype=torch.float32
+        ).to(self.device)
+
         # Pre-densify X and state_transitions_t to GPU tensors to eliminate
         # per-batch CPU sparse operations (the dominant training bottleneck).
         # Memory budget: skip if either tensor would exceed 4 GB total.
         x_bytes = m * n * 4
         st_bytes = len(self.unique_edge_indices) * n * 4
-        mem_budget = 4 * 1024 ** 3
+        mem_budget = 4 * 1024**3
         # Always keep unique_edge_indices on GPU for fast searchsorted lookups.
         self.unique_edge_indices_t = torch.tensor(
             self.unique_edge_indices, dtype=torch.long
         ).to(self.device)
 
         if x_bytes + st_bytes <= mem_budget:
-            self.x_dense = torch.tensor(
-                self.X.toarray(), dtype=torch.float32
-            ).to(self.device)
+            self.x_dense = torch.tensor(self.X.toarray(), dtype=torch.float32).to(
+                self.device
+            )
             self.st_dense = torch.tensor(
                 self.state_transitions_t.toarray(), dtype=torch.float32
             ).to(self.device)
@@ -478,10 +524,14 @@ class RegressionModel:
                     global_dst = batch.n_id[batch.edge_index[1, :]]
                     encoded = global_src + global_dst * self.m  # (E,) on GPU
 
-                    mapped_edge_index = torch.searchsorted(self.unique_edge_indices_t, encoded)
+                    mapped_edge_index = torch.searchsorted(
+                        self.unique_edge_indices_t, encoded
+                    )
                     n_ue = len(self.unique_edge_indices_t)
                     clamped = mapped_edge_index.clamp(max=n_ue - 1)
-                    invalid = (mapped_edge_index >= n_ue) | (self.unique_edge_indices_t[clamped] != encoded)
+                    invalid = (mapped_edge_index >= n_ue) | (
+                        self.unique_edge_indices_t[clamped] != encoded
+                    )
                     if invalid.any():
                         raise RuntimeError(
                             f"Found {invalid.sum()} edges out of {len(encoded)} that are not in unique_edge_indices!"
@@ -491,7 +541,11 @@ class RegressionModel:
                         prior_alpha = self.st_dense[mapped_edge_index]
                     else:
                         mapped_np = mapped_edge_index.cpu().numpy()
-                        arr = self.state_transitions_t[mapped_np, :].toarray().astype(np.float32)
+                        arr = (
+                            self.state_transitions_t[mapped_np, :]
+                            .toarray()
+                            .astype(np.float32)
+                        )
                         prior_alpha = torch.from_numpy(arr).to(self.device)
                 else:
                     prior_alpha = None
@@ -510,8 +564,10 @@ class RegressionModel:
                     log_sf = None
                     encoder_in = torch.cat([torch.log1p(x_sub_tensor), batch.x], dim=-1)
 
-                with torch.autocast(device_type=self.device.type, dtype=amp_dtype, enabled=use_amp):
-                    x_hat, mu, logstd, a, b, alpha = self.model(
+                with torch.autocast(
+                    device_type=self.device.type, dtype=amp_dtype, enabled=use_amp
+                ):
+                    x_hat, mu, logstd, a, b, alpha, beta = self.model(
                         encoder_in,
                         batch.x,
                         batch.edge_index,
@@ -540,13 +596,17 @@ class RegressionModel:
                 eps = 1e-8
                 log_r_over_r_plus_mu = torch.log(r / (r + mu_nb + eps))
                 log_mu_over_r_plus_mu = torch.log((mu_nb + eps) / (r + mu_nb + eps))
-                loss_recon = -(
-                    torch.lgamma(x_target + r)
-                    - torch.lgamma(r)
-                    - torch.lgamma(x_target + 1)
-                    + r * log_r_over_r_plus_mu
-                    + x_target * log_mu_over_r_plus_mu
-                ).sum(dim=-1).mean()
+                loss_recon = (
+                    -(
+                        torch.lgamma(x_target + r)
+                        - torch.lgamma(r)
+                        - torch.lgamma(x_target + 1)
+                        + r * log_r_over_r_plus_mu
+                        + x_target * log_mu_over_r_plus_mu
+                    )
+                    .sum(dim=-1)
+                    .mean()
+                )
 
                 # 2. Node KL Divergence (Standard Normal Prior)
                 mu_target = mu[target_mask].float()
@@ -596,16 +656,31 @@ class RegressionModel:
                 else:
                     kl_alpha = torch.tensor(0.0, device=self.device)
 
-                # 4. Global Regression Parameters KL Divergence (Standard Normal Prior)
-                kl_beta = (
+                # 4. Global Regression Parameters KL Divergence — Cauchy prior
+                # KL(q || p) where q = N(beta_mu, beta_std²) and p = Cauchy(0, γ).
+                # No closed form exists, so we use a single-sample BBVI estimate:
+                #   KL ≈ log q(beta_sample) − log p_Cauchy(beta_sample)
+                # with beta_sample drawn via reparameterization inside forward().
+                # γ is wide (10.0) for the intercept and beta_prior_scale for all
+                # other covariates, giving Cauchy shrinkage with heavy-tailed allowance
+                # for genuinely large fold changes.
+                beta_f = beta.float()  # (n_cov, n_genes)
+                gamma = self.beta_prior_scale_t  # (n_cov, 1), broadcasts over n_genes
+                log_q = (
                     -0.5
-                    * torch.sum(
-                        1
-                        + 2 * self.model.beta_logstd
-                        - self.model.beta_mu.pow(2)
-                        - torch.exp(2 * self.model.beta_logstd)
-                    )
-                ) / self.m
+                    * (
+                        (beta_f - self.model.beta_mu)
+                        / torch.exp(self.model.beta_logstd)
+                    ).pow(2)
+                    - self.model.beta_logstd
+                    - 0.5 * math.log(2.0 * math.pi)
+                )
+                log_p = (
+                    -math.log(math.pi)
+                    - torch.log(gamma)
+                    - torch.log1p((beta_f / gamma).pow(2))
+                )
+                kl_beta = (log_q - log_p).sum() / self.m
 
                 # 5. Size Factor Regularization (Gaussian prior: log_sf ~ N(log_volume, sf_sigma^2))
                 if self.model.include_size_factor:
@@ -617,7 +692,7 @@ class RegressionModel:
                 else:
                     loss_sf = torch.tensor(0.0, device=self.device)
 
-                loss = loss_recon + beta_kl * (kl_z + kl_alpha + kl_beta) + loss_sf
+                loss = loss_recon + beta_kl * (kl_z + kl_alpha) + kl_beta + loss_sf
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
