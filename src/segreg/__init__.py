@@ -97,6 +97,7 @@ class SegregVAE(nn.Module):
         include_size_factor: bool = True,
         log_mean_expr: torch.Tensor | None = None,
         beta_init: torch.Tensor | None = None,
+        beta_logstd_init: torch.Tensor | None = None,
     ):
         super().__init__()
         self.include_diffusion = include_diffusion
@@ -133,8 +134,12 @@ class SegregVAE(nn.Module):
             self.beta_mu = nn.Parameter(beta_init.clone())
         else:
             self.beta_mu = nn.Parameter(torch.zeros(n_covariates, n_genes))
-        # Initialize logstd to a small value so that initial samples are close to the mean
-        self.beta_logstd = nn.Parameter(torch.full((n_covariates, n_genes), -3.0))
+        # Initialize logstd from Fisher-info-based posterior variance when available;
+        # otherwise fall back to a small fixed value.
+        if beta_logstd_init is not None:
+            self.beta_logstd = nn.Parameter(beta_logstd_init.clone())
+        else:
+            self.beta_logstd = nn.Parameter(torch.full((n_covariates, n_genes), -3.0))
 
     @property
     def kappa(self):
@@ -398,7 +403,7 @@ class RegressionModel:
         beta_init_np, _, _, _ = np.linalg.lstsq(
             design_np, y_resid.astype(np.float64), rcond=None
         )
-        beta_init = torch.tensor(beta_init_np, dtype=torch.float32)
+        beta_init_np = beta_init_np.astype(np.float32)
         print("Done.")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -436,6 +441,48 @@ class RegressionModel:
             beta_prior_scale_matrix, dtype=torch.float32
         ).to(self.device)
 
+        # Fisher-information-based initialization for beta_mu and beta_logstd.
+        #
+        # For each (covariate k, gene g), the Fisher information of the NB
+        # likelihood w.r.t. beta[k,g] is approximately:
+        #   I[k,g] = m * mean(design[:,k]^2) * r_init * mean_rate_g / (r_init + mean_rate_g)
+        #
+        # This drives two calibrated initializations:
+        #
+        # 1. Shrink beta_mu toward 0 (posterior mean under Gaussian-prior approximation):
+        #      beta_init[k,g] = beta_ols[k,g] * gamma[k,g]^2 / (gamma[k,g]^2 + 1/I[k,g])
+        #    For near-zero genes (I≈0), the full OLS estimate is noise and gets shrunk
+        #    to ~0. For well-expressed genes (I large), shrinkage is negligible.
+        #
+        # 2. Initialize beta_logstd to the posterior standard deviation:
+        #      sigma_post[k,g] = sqrt(gamma[k,g]^2 / (1 + gamma[k,g]^2 * I[k,g]))
+        #    For near-zero genes: sigma_post ≈ gamma (falls back to prior width).
+        #    For well-expressed genes: sigma_post ≈ 1/sqrt(I) (data-driven precision).
+        #
+        # Because I scales with m and mean_rate_g this self-calibrates across
+        # datasets and expression levels without any arbitrary tuning constants.
+        r_init = float(np.log1p(np.exp(9.3)))  # initial NB dispersion ≈ 10
+        fisher_per_cell_g = (
+            r_init * mean_rate_1d / (r_init + mean_rate_1d + 1e-10)
+        )  # (n_genes,)
+        design_cov_var = np.mean(design_np**2, axis=0).astype(np.float32)  # (n_cov,)
+        fisher_info = np.outer(
+            m * design_cov_var, fisher_per_cell_g
+        )  # (n_cov, n_genes)
+        gamma_sq = beta_prior_scale_matrix**2  # (n_cov, n_genes)
+        sigma_ols_sq = 1.0 / np.maximum(fisher_info, 1e-6)  # (n_cov, n_genes)
+        # Posterior mean: shrink OLS toward 0 proportional to data uncertainty
+        shrink = gamma_sq / (gamma_sq + sigma_ols_sq)  # in [0, 1]
+        beta_init_np = beta_init_np * shrink
+        # Posterior variance: harmonic mean of prior and OLS variances
+        post_var = sigma_ols_sq * gamma_sq / (sigma_ols_sq + gamma_sq + 1e-10)
+        beta_logstd_init = np.clip(
+            0.5 * np.log(post_var + 1e-10), -5.0, 2.0
+        ).astype(np.float32)  # (n_cov, n_genes)
+
+        beta_init = torch.tensor(beta_init_np, dtype=torch.float32)
+        beta_logstd_init_t = torch.tensor(beta_logstd_init, dtype=torch.float32)
+
         # Pre-densify X and state_transitions_t to GPU tensors to eliminate
         # per-batch CPU sparse operations (the dominant training bottleneck).
         # Memory budget: skip if either tensor would exceed 4 GB total.
@@ -468,6 +515,7 @@ class RegressionModel:
             include_size_factor=include_size_factor,
             log_mean_expr=log_mean_expr,
             beta_init=beta_init,
+            beta_logstd_init=beta_logstd_init_t,
         ).to(self.device)
         self.m = m
         self.n = n
@@ -759,6 +807,16 @@ class RegressionModel:
             df["Lower"] = lower["Lower"]
             df["Upper"] = upper["Upper"]
 
+            # The "minimum credible fold change" is the point in the [Lower, Upper] interval nearest to 0.
+            # If the interval contains 0, it is 0.
+            # If the interval is entirely positive, it is Lower.
+            # If the interval is entirely negative, it is Upper.
+            df["MinimumCredible"] = np.where(
+                df["Lower"] > 0,
+                df["Lower"],
+                np.where(df["Upper"] < 0, df["Upper"], 0.0),
+            )
+
         return df
 
     def get_corrected_expression(
@@ -867,3 +925,54 @@ class RegressionModel:
             data = np.array([], dtype=float)
 
         return csr_matrix((data, (rows, cols)), shape=(self.m, self.n))
+
+    def get_latent_representation(
+        self,
+        batch_size: int = 4096,
+        nneighbors: int = 10,
+    ) -> np.ndarray:
+        """
+        Returns the posterior mean (mu) for each cell in the latent space.
+        """
+        self.model.eval()
+
+        loader = NeighborLoader(
+            self.data,
+            num_neighbors=[nneighbors, nneighbors],
+            batch_size=batch_size,
+            input_nodes=None,
+            shuffle=False,
+        )
+
+        all_mu = []
+
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to(self.device)
+
+                # Fetch sparse counts for the sampled nodes and convert to dense tensor
+                node_idx = batch.n_id.cpu().numpy()
+                x_sub = self.X[node_idx].toarray()
+                x_sub_tensor = torch.tensor(
+                    x_sub, dtype=torch.float32, device=self.device
+                )
+
+                if self.model.include_size_factor:
+                    log_sf = self.log_sf_embed(batch.n_id).squeeze(-1)
+                    size_factor = torch.exp(log_sf).unsqueeze(-1)
+                    x_norm = x_sub_tensor / (size_factor + 1e-8) * 1000.0
+                    encoder_in = torch.log1p(x_norm)
+                else:
+                    log_sf = None
+                    encoder_in = torch.cat([torch.log1p(x_sub_tensor), batch.x], dim=-1)
+
+                # Forward pass through encoder
+                mu, _ = self.model.encoder(encoder_in, batch.edge_index)
+
+                # PyG places the target nodes first in the batch up to `batch.batch_size`
+                target_mask = slice(0, batch.batch_size)
+                mu_target = mu[target_mask]
+
+                all_mu.append(mu_target.cpu().numpy())
+
+        return np.concatenate(all_mu, axis=0)
