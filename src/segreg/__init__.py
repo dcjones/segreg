@@ -17,48 +17,70 @@ from torch.distributions import Beta, kl_divergence
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.nn import GCNConv
+from tqdm import tqdm
 
 
 class Encoder(nn.Module):
     """
-    Node-based GNN Encoder.
+    Node-based GNN Encoder with skip connections and LayerNorm.
     Takes gene counts and design covariates, aggregates neighborhood,
     and outputs parameters for the latent normal distribution (mu, logstd).
     """
 
     def __init__(
-        self, in_channels: int, hidden_channels: int = 64, latent_dim: int = 32
+        self, in_channels: int, hidden_channels: int = 128, latent_dim: int = 64
     ):
         super().__init__()
-        self.lin_in = nn.Linear(in_channels, hidden_channels)
-        self.conv1 = GCNConv(hidden_channels, hidden_channels)
+        # Initial transformation to latent-like space, using 2 layers for more capacity
+        self.lin_in = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.ReLU(),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.ReLU(),
+        )
+        # GCN to capture neighborhood context
+        self.conv = GCNConv(hidden_channels, hidden_channels)
 
-        # Heads for variational parameters
-        self.conv_mu = GCNConv(hidden_channels, latent_dim)
-        self.conv_logstd = GCNConv(hidden_channels, latent_dim)
+        # Separate heads for mu and logstd, using both local and spatial features
+        # (Concatenation provides a clear path for the model to preserve cell-specific features)
+        self.mu_head = nn.Linear(hidden_channels * 2, latent_dim)
+        self.logstd_head = nn.Linear(hidden_channels * 2, latent_dim)
 
     def forward(self, x, edge_index):
-        x = F.relu(self.lin_in(x))
-        x = F.relu(self.conv1(x, edge_index))
-        mu = self.conv_mu(x, edge_index)
-        logstd = self.conv_logstd(x, edge_index)
+        h = self.lin_in(x)
+        h_spatial = F.relu(self.conv(h, edge_index))
+
+        # Combine local and spatial features
+        h_combined = torch.cat([h, h_spatial], dim=-1)
+
+        mu = self.mu_head(h_combined)
+        logstd = self.logstd_head(h_combined)
         return mu, logstd
 
 
 class NodeDecoder(nn.Module):
     """
     Decodes the node latent representation back into unconstrained expression rates (rho).
+    Increased capacity with LayerNorm and more layers.
     """
 
     def __init__(self, latent_dim: int, hidden_channels: int, out_channels: int):
         super().__init__()
-        self.lin1 = nn.Linear(latent_dim, hidden_channels)
-        self.lin2 = nn.Linear(hidden_channels, out_channels, bias=False)
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.ReLU(),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.ReLU(),
+            nn.Linear(hidden_channels, out_channels, bias=False),
+        )
 
     def forward(self, z):
-        h = F.relu(self.lin1(z))
         # Return unconstrained values to be added to the regression term
-        return self.lin2(h)
+        return self.net(z)
 
 
 class EdgeDecoder(nn.Module):
@@ -255,8 +277,8 @@ class RegressionModel:
         include_diffusion: bool = True,
         include_size_factor: bool = True,
         sf_sigma: float = 0.5,
-        hidden_channels: int = 64,
-        latent_dim: int = 32,
+        hidden_channels: int = 128,
+        latent_dim: int = 64,
         kappa: float = 10.0,
         beta_prior_scale: float = 1.0,
     ):
@@ -527,6 +549,7 @@ class RegressionModel:
         batch_size: int = 1024,
         lr: float = 1e-3,
         beta_kl: float = 0.01,
+        kl_annealing: bool = True,
     ):
         if self.include_size_factor:
             self.log_sf_embed = self.log_sf_embed.to(self.device)
@@ -551,7 +574,14 @@ class RegressionModel:
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         scaler = torch.amp.GradScaler(enabled=use_amp)
 
-        for epoch in range(nepochs):
+        pbar = tqdm(range(nepochs), desc="Training Segreg")
+        for epoch in pbar:
+            # Linear KL annealing: beta_kl increases linearly from 0 up to 50% of nepochs
+            if kl_annealing and nepochs > 1:
+                current_beta_kl = min(beta_kl, beta_kl * (epoch + 1) / (nepochs // 2))
+            else:
+                current_beta_kl = beta_kl
+
             total_loss = 0.0
 
             for batch in loader:
@@ -599,10 +629,6 @@ class RegressionModel:
                     prior_alpha = None
 
                 # Prepare encoder input and run the model forward pass under AMP.
-                # Autocast is scoped tightly to the forward pass so that the GCN /
-                # linear-layer matmuls run in bfloat16 for speed, while the loss
-                # computation (lgamma, Beta KL) is kept in float32 to avoid NaN from
-                # catastrophic cancellation in low-precision arithmetic.
                 if self.model.include_size_factor:
                     log_sf = self.log_sf_embed(batch.n_id).squeeze(-1)
                     size_factor = torch.exp(log_sf).unsqueeze(-1)
@@ -624,22 +650,12 @@ class RegressionModel:
                     )
 
                 # ── Loss computation in float32 ──────────────────────────────────────
-                # Masking: We only calculate loss for the "target" nodes in the center of the sampled subgraph.
-                # PyG places these first in the batch up to `batch.batch_size`
                 target_mask = torch.arange(batch.batch_size, device=self.device)
                 x_target = x_sub_tensor[target_mask]
-                # Sanitize rare NaN/Inf from bfloat16 forward (e.g. beta_std overflow
-                # producing Inf in log_rate → NaN via Inf + (-Inf) in mixed-sign paths).
                 x_hat_target = x_hat[target_mask].float()
 
-                # 1. Reconstruction Loss (Negative Binomial NLL, inline to avoid
-                # Python distribution-object overhead).
-                # log P(x | mu, r) = lgamma(x+r) - lgamma(r) - lgamma(x+1)
-                #                    + r*log(r/(r+mu)) + x*log(mu/(r+mu))
-                # Numerically stable: clamp r away from 0 (prevents 0*log(0)=NaN when
-                # r→0) and add eps to mu numerator (prevents x*log(0)=0*(-Inf)=NaN
-                # for zero-count genes in cells with zero predicted expression).
-                r = F.softplus(self.model.log_r).clamp(min=1e-3)  # (n_genes,)
+                # 1. Reconstruction Loss
+                r = F.softplus(self.model.log_r).clamp(min=1e-3)
                 mu_nb = x_hat_target
                 eps = 1e-8
                 log_r_over_r_plus_mu = torch.log(r / (r + mu_nb + eps))
@@ -656,7 +672,7 @@ class RegressionModel:
                     .mean()
                 )
 
-                # 2. Node KL Divergence (Standard Normal Prior)
+                # 2. Node KL Divergence
                 mu_target = mu[target_mask].float()
                 logstd_target = logstd[target_mask].float()
                 kl_z = (
@@ -670,7 +686,7 @@ class RegressionModel:
                     ).mean()
                 )
 
-                # 3. Edge KL Divergence (Beta Prior from Proseg)
+                # 3. Edge KL Divergence
                 if self.model.include_diffusion:
                     dst = batch.edge_index[1]
                     edge_mask = dst < batch.batch_size
@@ -679,23 +695,15 @@ class RegressionModel:
                         a_target = a[edge_mask].float()
                         b_target = b[edge_mask].float()
                         prior_alpha_target = prior_alpha[edge_mask]
-
-                        # Clamp prior to avoid 0 or 1 edge cases for the Beta distribution
                         prior_alpha_target = torch.clamp(
                             prior_alpha_target, 1e-4, 1.0 - 1e-4
                         )
-
-                        # Use the inferred kappa concentration parameter
                         kappa = self.model.kappa
-
-                        # Prior distribution parameterized using kappa (concentration) and prior_alpha (mean)
-                        # We add 1.0 to ensure the prior never has an asymptote at 0 or 1
                         prior_a = 1.0 + kappa * prior_alpha_target
                         prior_b = 1.0 + kappa * (1.0 - prior_alpha_target)
 
                         q_alpha = Beta(a_target, b_target)
                         p_alpha = Beta(prior_a, prior_b)
-                        # Normalize by batch size to keep loss scale invariant
                         kl_alpha = (
                             kl_divergence(q_alpha, p_alpha).sum() / batch.batch_size
                         )
@@ -705,15 +713,8 @@ class RegressionModel:
                     kl_alpha = torch.tensor(0.0, device=self.device)
 
                 # 4. Global Regression Parameters KL Divergence — Cauchy prior
-                # KL(q || p) where q = N(beta_mu, beta_std²) and p = Cauchy(0, γ).
-                # No closed form exists, so we use a single-sample BBVI estimate:
-                #   KL ≈ log q(beta_sample) − log p_Cauchy(beta_sample)
-                # with beta_sample drawn via reparameterization inside forward().
-                # γ is wide (10.0) for the intercept and beta_prior_scale for all
-                # other covariates, giving Cauchy shrinkage with heavy-tailed allowance
-                # for genuinely large fold changes.
-                beta_f = beta.float()  # (n_cov, n_genes)
-                gamma = self.beta_prior_scale_t  # (n_cov, 1), broadcasts over n_genes
+                beta_f = beta.float()
+                gamma = self.beta_prior_scale_t
                 log_q = (
                     -0.5
                     * (
@@ -730,7 +731,7 @@ class RegressionModel:
                 )
                 kl_beta = (log_q - log_p).sum() / self.m
 
-                # 5. Size Factor Regularization (Gaussian prior: log_sf ~ N(log_volume, sf_sigma^2))
+                # 5. Size Factor Regularization
                 if self.model.include_size_factor:
                     log_sf_target = log_sf[: batch.batch_size]
                     log_sf_prior_target = batch.log_sf_prior[: batch.batch_size]
@@ -740,7 +741,7 @@ class RegressionModel:
                 else:
                     loss_sf = torch.tensor(0.0, device=self.device)
 
-                loss = loss_recon + beta_kl * (kl_z + kl_alpha) + kl_beta + loss_sf
+                loss = loss_recon + current_beta_kl * (kl_z + kl_alpha) + kl_beta + loss_sf
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -749,7 +750,7 @@ class RegressionModel:
                 scaler.update()
 
                 loss_val = loss.item()
-                if loss_val == loss_val:  # skip NaN batches
+                if loss_val == loss_val:
                     total_loss += loss_val
 
             if self.model.include_diffusion:
@@ -758,11 +759,10 @@ class RegressionModel:
             else:
                 kappa_str = ""
 
-            print(
-                f"Epoch {epoch} | Loss: {total_loss / len(loader):.4f} "
+            pbar.set_postfix_str(
+                f"Loss: {total_loss / len(loader):.4f} "
                 f"(Recon: {loss_recon.item():.4f}, KL_z: {kl_z.item():.4f}, "
-                f"KL_alpha: {kl_alpha.item():.4f}, KL_beta: {kl_beta.item():.4f}, "
-                f"SF_reg: {loss_sf.item():.4f}{kappa_str})"
+                f"KL_b: {kl_beta.item():.4f}{kappa_str})"
             )
 
     def get_regression_coefficients(
