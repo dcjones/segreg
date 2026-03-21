@@ -63,47 +63,81 @@ class Encoder(nn.Module):
 class NodeDecoder(nn.Module):
     """
     Decodes the node latent representation back into unconstrained expression rates (rho).
-    Increased capacity with LayerNorm and more layers.
+    Uses a simple linear transformation to capture residual biological variation
+    as linear gene modules. This restricts the VAE's capacity, forcing the model
+    to use the regression and diffusion terms to explain more complex systematic variation.
     """
 
     def __init__(self, latent_dim: int, hidden_channels: int, out_channels: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_channels),
-            nn.LayerNorm(hidden_channels),
-            nn.ReLU(),
-            nn.Linear(hidden_channels, hidden_channels),
-            nn.LayerNorm(hidden_channels),
-            nn.ReLU(),
-            nn.Linear(hidden_channels, out_channels, bias=False),
-        )
+        # Use a single linear layer to force the model to prioritize regression/diffusion
+        self.lin = nn.Linear(latent_dim, out_channels, bias=False)
 
     def forward(self, z):
         # Return unconstrained values to be added to the regression term
-        return self.net(z)
+        return self.lin(z)
 
 
 class EdgeDecoder(nn.Module):
     """
     Decodes pairs of latent node representations + prior into parameters
     for the posterior Beta distribution of diffusion coefficients (alpha).
+
+    Parameterization: output a small logit-space correction around prior_alpha
+    (the per-gene proseg estimate) so the posterior mean starts at the proseg
+    estimate and only deviates when the data demands it.  This makes the
+    diffusion correction gene-selective: genes with high prior_alpha on a given
+    edge (e.g. tumor→macrophage for a tumor-specific gene) naturally get high
+    alpha, while non-diffusing genes stay near zero.
     """
 
     def __init__(self, latent_dim: int, hidden_channels: int, n_genes: int):
         super().__init__()
-        # Input: z_i, z_j, prior_alpha
-        self.lin1 = nn.Linear(latent_dim * 2 + n_genes, hidden_channels)
-        self.lin_a = nn.Linear(hidden_channels, 1)
-        self.lin_b = nn.Linear(hidden_channels, 1)
+        self.lin1 = nn.Linear(latent_dim * 2, hidden_channels)
+        # Per-gene logit-space correction to prior_alpha (cell-type context)
+        self.lin_correction = nn.Linear(hidden_channels, n_genes)
+        # Scalar concentration parameter (shared across genes per edge)
+        self.lin_concentration = nn.Linear(hidden_channels, 1)
+        # Per-gene scale for expression-ratio correction: when lam_src[g] > lam_dst[g]
+        # (source expresses gene g more than destination), alpha should increase.
+        # Initialised to zero (exp(0) = 1) so the model starts with a strong
+        # prior that expression gradients drive diffusion.
+        self.log_lam_ratio_scale = nn.Parameter(torch.zeros(n_genes))
+        # Initialise cell-context correction to zero -> posterior starts at prior
+        nn.init.zeros_(self.lin_correction.weight)
+        nn.init.zeros_(self.lin_correction.bias)
 
-    def forward(self, z_src, z_dst, prior_alpha):
-        h = torch.cat([z_src, z_dst, prior_alpha], dim=-1)
-        h = F.relu(self.lin1(h))
+    def forward(self, z_src, z_dst, prior_alpha, kappa, lam_ratio=None):
+        h = F.relu(self.lin1(torch.cat([z_src, z_dst], dim=-1)))
 
-        # Beta distribution parameters a and b must be strictly positive
-        # We add 1.0 to ensure they never create an asymptote at 0 or 1
-        a = F.softplus(self.lin_a(h)) + 1.0
-        b = F.softplus(self.lin_b(h)) + 1.0
+        # Cell-context correction (shared for all genes on this edge)
+        logit_correction = self.lin_correction(h)  # (E, n_genes)
+
+        # Gene-specific correction from the expression ratio: if lam_src[g] >> lam_dst[g],
+        # increase alpha for gene g on this edge (source "owns" more of this gene's signal).
+        # Detach lam_ratio to prevent circular gradients through beta.
+        if lam_ratio is not None:
+            # Cast scale to match lam_ratio's dtype (e.g. bfloat16 under AMP)
+            # to avoid an implicit float32 upcast that doubles peak memory.
+            scale = torch.exp(self.log_lam_ratio_scale).to(lam_ratio.dtype)
+            logit_correction = logit_correction + scale * lam_ratio
+
+        # Posterior mean anchored to the proseg prior distribution's mean:
+        # E[alpha] = (1 + kappa * prior_alpha) / (2 + kappa)
+        prior_mean = (1.0 + kappa * prior_alpha) / (2.0 + kappa)
+        prior_logit = torch.logit(prior_mean.clamp(1e-4, 1.0 - 1e-4))
+        alpha_mean = torch.sigmoid(prior_logit + logit_correction)  # (E, n_genes)
+
+        # Concentration: how tightly the Beta is peaked around alpha_mean.
+        # Adding 2 ensures the Beta is unimodal (a, b ≥ 1 when mean ∈ (0,1)).
+        # Clamp to 1000 to prevent numerical instability in Beta/Dirichlet distribution.
+        concentration = (F.softplus(self.lin_concentration(h)) + 2.0).clamp(max=1000.0)  # (E, 1)
+
+        # Clamp alpha_mean away from {0, 1} before multiplying so that a and b
+        # are never exactly zero (which can happen in bfloat16 AMP).
+        alpha_mean = alpha_mean.clamp(1e-4, 1.0 - 1e-4)
+        a = (alpha_mean * concentration).clamp(min=1e-3)  # (E, n_genes)
+        b = ((1.0 - alpha_mean) * concentration).clamp(min=1e-3)
         return a, b
 
 
@@ -133,11 +167,13 @@ class SegregVAE(nn.Module):
 
         if self.include_diffusion:
             self.edge_decoder = EdgeDecoder(latent_dim, hidden_channels, n_genes)
-
-            # Global concentration parameter for Beta prior (kappa).
-            # We model it as a point estimate (MLE) to be inferred during training.
-            # Use softplus to ensure it stays positive.
-            self.kappa_unconstrained = nn.Parameter(torch.tensor(kappa))
+            # Use softplus_inv for small kappa, or just kappa for large values to avoid overflow
+            if kappa < 20.0:
+                self.kappa_unconstrained = nn.Parameter(
+                    torch.tensor(math.log(math.exp(kappa) - 1.0))
+                )
+            else:
+                self.kappa_unconstrained = nn.Parameter(torch.tensor(float(kappa)))
 
         # Empirical gene baseline to help the model start at the correct scale
         if log_mean_expr is not None:
@@ -171,12 +207,12 @@ class SegregVAE(nn.Module):
 
     def reparameterize(self, mu, logstd):
         if self.training:
-            # Clamp to prevent bfloat16 overflow: large mu/logstd → Inf → mixed-sign
-            # Inf in downstream linear layers → Inf + (-Inf) = NaN.
-            std = torch.exp(logstd.clamp(max=10.0))
+            # Clamp to prevent bfloat16 overflow: large mu/logstd -> Inf -> mixed-sign
+            # Inf in downstream linear layers -> Inf + (-Inf) = NaN.
+            std = torch.exp(logstd.clamp(max=8.0))
             eps = torch.randn_like(std)
-            return (mu + eps * std).clamp(-50.0, 50.0)
-        return mu.clamp(-50.0, 50.0)
+            return (mu + eps * std).clamp(-40.0, 40.0)
+        return mu.clamp(-40.0, 40.0)
 
     def forward(
         self, x, covariates, edge_index, prior_alpha=None, log_size_factor=None
@@ -210,7 +246,12 @@ class SegregVAE(nn.Module):
             # edge_index is shape [2, E]. We assume edge_index[0] is source, edge_index[1] is target
             src, dst = edge_index
             z_src, z_dst = z[src], z[dst]
-            a, b = self.edge_decoder(z_src, z_dst, prior_alpha)
+            # Per-gene expression ratio (detached): positive means source expresses the gene
+            # more than destination, which is direct evidence for diffusion of that gene.
+            lam_ratio = (
+                torch.log(lam[src] + 1e-8) - torch.log(lam[dst] + 1e-8)
+            ).detach()
+            a, b = self.edge_decoder(z_src, z_dst, prior_alpha, self.kappa, lam_ratio)
 
             # Sample alpha during training, use mean during evaluation.
             # Cast to float32 before sampling: Beta.rsample() via Gamma can produce
@@ -228,12 +269,16 @@ class SegregVAE(nn.Module):
             else:
                 alpha = a / (a + b)
 
-            alpha = alpha.squeeze(-1)
-
             # Enforce physical conservation of mass: a cell cannot diffuse more than 100% of its transcripts.
-            # Sum the inferred alpha values over all outgoing edges from each source node.
-            total_alpha = torch.zeros(lam.size(0), device=lam.device)
-            total_alpha.scatter_add_(0, src, alpha)
+            # Sum the inferred alpha values over all outgoing edges from each source node, for each gene.
+            total_alpha = torch.zeros_like(lam)
+            # alpha is (E, n_genes), src is (E,)
+            # We want to add alpha[e, g] to total_alpha[src[e], g]
+            total_alpha.scatter_add_(
+                0,
+                src.unsqueeze(-1).expand(-1, alpha.size(1)),
+                alpha.to(total_alpha.dtype),
+            )
 
             # If total_alpha > 1.0, we normalize the outgoing alphas down.
             # If < 1.0, we leave them (allowing loss to background).
@@ -244,11 +289,13 @@ class SegregVAE(nn.Module):
             # The edge_index and alpha values include self-loops (i->i).
             # Therefore, the total transcripts ending up in cell i is just the sum of messages.
             # x_hat_i = \sum_{j} \alpha_{ji} \lambda_j
-            messages = alpha_normalized.unsqueeze(-1) * lam[src]
+            messages = alpha_normalized * lam[src]
 
             diffused = torch.zeros_like(lam)
             diffused.scatter_add_(
-                0, dst.unsqueeze(-1).expand(-1, lam.size(1)), messages
+                0,
+                dst.unsqueeze(-1).expand(-1, lam.size(1)),
+                messages.to(diffused.dtype),
             )
 
             x_hat = diffused
@@ -279,7 +326,7 @@ class RegressionModel:
         sf_sigma: float = 0.5,
         hidden_channels: int = 128,
         latent_dim: int = 64,
-        kappa: float = 10.0,
+        kappa: float = 1000.0,
         beta_prior_scale: float = 1.0,
     ):
         if isinstance(data, AnnData):
@@ -446,17 +493,21 @@ class RegressionModel:
         covariate_names = list(self.design.design_info.column_names)
         scale_per_cov = np.array(
             [
-                10.0 if name == "Intercept" else beta_prior_scale
+                10.0 if name == "Intercept" else (beta_prior_scale * 0.005 if ":" in name else beta_prior_scale)
                 for name in covariate_names
             ],
             dtype=np.float32,
         )
         mean_rate_1d = mean_rate.squeeze()  # (n_genes,)
         expressed_rates = mean_rate_1d[mean_rate_1d > 1e-6]
-        median_rate = float(np.median(expressed_rates)) if len(expressed_rates) > 0 else 1e-4
-        gene_scale = np.sqrt(
-            np.maximum(mean_rate_1d, 1e-8) / median_rate
-        ).clip(0.1, 10.0).astype(np.float32)  # (n_genes,); clipped to [0.1, 10]
+        median_rate = (
+            float(np.median(expressed_rates)) if len(expressed_rates) > 0 else 1e-4
+        )
+        gene_scale = (
+            np.sqrt(np.maximum(mean_rate_1d, 1e-8) / median_rate)
+            .clip(0.1, 10.0)
+            .astype(np.float32)
+        )  # (n_genes,); clipped to [0.1, 10]
         # (n_cov, n_genes): per-covariate base scale * per-gene expression scale
         beta_prior_scale_matrix = scale_per_cov[:, None] * gene_scale[None, :]
         self.beta_prior_scale_t = torch.tensor(
@@ -496,11 +547,25 @@ class RegressionModel:
         # Posterior mean: shrink OLS toward 0 proportional to data uncertainty
         shrink = gamma_sq / (gamma_sq + sigma_ols_sq)  # in [0, 1]
         beta_init_np = beta_init_np * shrink
+
+        # Identify interaction terms (those containing ':') and initialize them to zero.
+        # This gives the diffusion model 'first dibs' at explaining spatially-correlated variation.
+        covariate_names = list(self.design.design_info.column_names)
+        for i, name in enumerate(covariate_names):
+            if ":" in name:
+                beta_init_np[i, :] = 0.0
+
         # Posterior variance: harmonic mean of prior and OLS variances
         post_var = sigma_ols_sq * gamma_sq / (sigma_ols_sq + gamma_sq + 1e-10)
-        beta_logstd_init = np.clip(
-            0.5 * np.log(post_var + 1e-10), -5.0, 2.0
-        ).astype(np.float32)  # (n_cov, n_genes)
+        # Increase initial uncertainty for interaction terms to let them move if necessary,
+        # but the tighter prior and zero-init will still prefer zero.
+        for i, name in enumerate(covariate_names):
+            if ":" in name:
+                post_var[i, :] = np.maximum(post_var[i, :], 0.5)
+
+        beta_logstd_init = np.clip(0.5 * np.log(post_var + 1e-10), -5.0, 2.0).astype(
+            np.float32
+        )  # (n_cov, n_genes)
 
         beta_init = torch.tensor(beta_init_np, dtype=torch.float32)
         beta_logstd_init_t = torch.tensor(beta_logstd_init, dtype=torch.float32)
@@ -548,9 +613,16 @@ class RegressionModel:
         nneighbors: int = 10,
         batch_size: int = 1024,
         lr: float = 1e-3,
-        beta_kl: float = 0.01,
+        # beta_kl: float = 0.1,
+        beta_kl: float = 1.0,
+        alpha_kl: float = 1.0,
         kl_annealing: bool = True,
+        seed: int | None = 42,
     ):
+        if seed is not None:
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            np.random.seed(seed)
         if self.include_size_factor:
             self.log_sf_embed = self.log_sf_embed.to(self.device)
             params = list(self.model.parameters()) + list(
@@ -578,9 +650,12 @@ class RegressionModel:
         for epoch in pbar:
             # Linear KL annealing: beta_kl increases linearly from 0 up to 50% of nepochs
             if kl_annealing and nepochs > 1:
-                current_beta_kl = min(beta_kl, beta_kl * (epoch + 1) / (nepochs // 2))
+                progress = min(1.0, (epoch + 1) / (nepochs // 2))
+                current_beta_kl = beta_kl * progress
             else:
                 current_beta_kl = beta_kl
+
+            current_alpha_kl = alpha_kl
 
             total_loss = 0.0
 
@@ -741,7 +816,13 @@ class RegressionModel:
                 else:
                     loss_sf = torch.tensor(0.0, device=self.device)
 
-                loss = loss_recon + current_beta_kl * (kl_z + kl_alpha) + kl_beta + loss_sf
+                loss = (
+                    loss_recon
+                    + (current_beta_kl * kl_z)
+                    + (current_alpha_kl * kl_alpha)
+                    + kl_beta
+                    + loss_sf
+                )
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -762,7 +843,7 @@ class RegressionModel:
             pbar.set_postfix_str(
                 f"Loss: {total_loss / len(loader):.4f} "
                 f"(Recon: {loss_recon.item():.4f}, KL_z: {kl_z.item():.4f}, "
-                f"KL_b: {kl_beta.item():.4f}{kappa_str})"
+                f"KL_a: {kl_alpha.item():.4f}, KL_b: {kl_beta.item():.4f}{kappa_str})"
             )
 
     def get_regression_coefficients(
