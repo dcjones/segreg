@@ -1,4 +1,4 @@
-# Experimenting with writing this is pytorch instead to see how that would look.
+# Radically simplified diffusion model based on cell-purity priors.
 import math
 from typing import cast
 
@@ -15,15 +15,13 @@ from scipy.sparse import csr_matrix
 from spatialdata import SpatialData
 from torch.distributions import Beta, kl_divergence
 from torch_geometric.data import Data
-from torch_geometric.loader import NeighborLoader
-from torch_geometric.nn import GCNConv
 from tqdm import tqdm
 
 
 class Encoder(nn.Module):
     """
-    Node-based GNN Encoder with skip connections and LayerNorm.
-    Takes gene counts and design covariates, aggregates neighborhood,
+    Node-based Encoder with LayerNorm.
+    Takes gene counts and design covariates,
     and outputs parameters for the latent normal distribution (mu, logstd).
     """
 
@@ -32,7 +30,7 @@ class Encoder(nn.Module):
     ):
         super().__init__()
         # Initial transformation to latent-like space, using 2 layers for more capacity
-        self.lin_in = nn.Sequential(
+        self.lin = nn.Sequential(
             nn.Linear(in_channels, hidden_channels),
             nn.LayerNorm(hidden_channels),
             nn.ReLU(),
@@ -40,23 +38,15 @@ class Encoder(nn.Module):
             nn.LayerNorm(hidden_channels),
             nn.ReLU(),
         )
-        # GCN to capture neighborhood context
-        self.conv = GCNConv(hidden_channels, hidden_channels)
 
-        # Separate heads for mu and logstd, using both local and spatial features
-        # (Concatenation provides a clear path for the model to preserve cell-specific features)
-        self.mu_head = nn.Linear(hidden_channels * 2, latent_dim)
-        self.logstd_head = nn.Linear(hidden_channels * 2, latent_dim)
+        # Separate heads for mu and logstd
+        self.mu_head = nn.Linear(hidden_channels, latent_dim)
+        self.logstd_head = nn.Linear(hidden_channels, latent_dim)
 
-    def forward(self, x, edge_index):
-        h = self.lin_in(x)
-        h_spatial = F.relu(self.conv(h, edge_index))
-
-        # Combine local and spatial features
-        h_combined = torch.cat([h, h_spatial], dim=-1)
-
-        mu = self.mu_head(h_combined)
-        logstd = self.logstd_head(h_combined)
+    def forward(self, x):
+        h = self.lin(x)
+        mu = self.mu_head(h)
+        logstd = self.logstd_head(h)
         return mu, logstd
 
 
@@ -64,97 +54,52 @@ class NodeDecoder(nn.Module):
     """
     Decodes the node latent representation back into unconstrained expression rates (rho).
     Uses a simple linear transformation to capture residual biological variation
-    as linear gene modules. This restricts the VAE's capacity, forcing the model
-    to use the regression and diffusion terms to explain more complex systematic variation.
+    as linear gene modules.
     """
 
     def __init__(self, latent_dim: int, hidden_channels: int, out_channels: int):
         super().__init__()
-        # Use a single linear layer to force the model to prioritize regression/diffusion
         self.lin = nn.Linear(latent_dim, out_channels, bias=False)
 
     def forward(self, z):
-        # Return unconstrained values to be added to the regression term
         return self.lin(z)
 
 
-class EdgeDecoder(nn.Module):
+class PurityDecoder(nn.Module):
     """
-    Decodes pairs of latent node representations + prior into parameters
-    for the posterior Beta distribution of diffusion coefficients (alpha).
-
-    Parameterization: output a small logit-space correction around prior_alpha
-    (the per-gene proseg estimate) so the posterior mean starts at the proseg
-    estimate and only deviates when the data demands it.  This makes the
-    diffusion correction gene-selective: genes with high prior_alpha on a given
-    edge (e.g. tumor→macrophage for a tumor-specific gene) naturally get high
-    alpha, while non-diffusing genes stay near zero.
+    Decodes node latents into parameters for the posterior Beta distribution 
+    of cell-gene purity (pi), representing the proportion of transcripts in 
+    a cell that actually belong to it.
     """
 
     def __init__(self, latent_dim: int, hidden_channels: int, n_genes: int):
         super().__init__()
-        self.lin1 = nn.Linear(latent_dim * 2, hidden_channels)
-        # Per-gene logit-space correction to prior_alpha (cell-type context)
+        self.lin1 = nn.Linear(latent_dim, hidden_channels)
         self.lin_correction = nn.Linear(hidden_channels, n_genes)
-        # Scalar concentration parameter (shared across genes per edge)
         self.lin_concentration = nn.Linear(hidden_channels, 1)
-        # Per-gene scale for expression-ratio correction: when lam_src[g] > lam_dst[g]
-        # (source expresses gene g more than destination), alpha should increase.
-        # Initialised to 2.0 (exp(2) ≈ 7.4) to ensure the model responds very
-        # aggressively to expression gradients from the start of training.
-        self.log_lam_ratio_scale = nn.Parameter(torch.full((n_genes,), 2.0))
-        # Initialise cell-context correction to zero -> posterior starts at prior
         nn.init.zeros_(self.lin_correction.weight)
         nn.init.zeros_(self.lin_correction.bias)
 
-    def forward(self, z_src, z_dst, prior_alpha, kappa, lam_ratio=None, suspect_score=None):
-        h = F.relu(self.lin1(torch.cat([z_src, z_dst], dim=-1)))
+    def forward(self, z, pi_prior, kappa):
+        h = F.relu(self.lin1(z))
+        logit_correction = self.lin_correction(h)
 
-        # Cell-context correction (shared for all genes on this edge)
-        logit_correction = self.lin_correction(h)  # (E, n_genes)
-
-        # Gene-specific correction from the expression ratio: if lam_src[g] >> lam_dst[g],
-        # increase alpha for gene g on this edge (source "owns" more of this gene's signal).
-        # Detach lam_ratio to prevent circular gradients through beta.
-        if lam_ratio is not None:
-            # Cast scale to match lam_ratio's dtype (e.g. bfloat16 under AMP)
-            # to avoid an implicit float32 upcast that doubles peak memory.
-            scale = torch.exp(self.log_lam_ratio_scale).to(lam_ratio.dtype)
-            logit_correction = logit_correction + scale * lam_ratio
-
-        # Posterior mean anchored to the proseg prior distribution's mean:
-        # E[alpha] = (1 + kappa * prior_alpha) / (2 + kappa)
-        prior_mean = (1.0 + kappa * prior_alpha) / (2.0 + kappa)
+        # Posterior mean anchored to the proseg purity prior (self-transition)
+        prior_mean = (1.0 + kappa * pi_prior) / (2.0 + kappa)
         prior_logit = torch.logit(prior_mean.clamp(1e-4, 1.0 - 1e-4))
-        alpha_mean = torch.sigmoid(prior_logit + logit_correction)  # (E, n_genes)
+        pi_mean = torch.sigmoid(prior_logit + logit_correction)
 
-        # Strict Prior Mode: if a gene has high suspect potential, we strictly
-        # clamp alpha_mean to NOT exceed the prior_mean. This prevents the
-        # reconstruction loss from overriding the spatial prior for contaminated genes.
-        if suspect_score is not None:
-            # Strength of enforcement s in [0, 1]
-            s = torch.clamp(10.0 * suspect_score.to(alpha_mean.dtype), max=1.0)
-            # Differentiable soft-min to enforce alpha_mean <= prior_mean for suspect genes
-            # When s=1, alpha_mean = min(alpha_mean, prior_mean)
-            alpha_mean = (1.0 - s) * alpha_mean + s * torch.minimum(alpha_mean, prior_mean)
-
-
-        # Concentration: how tightly the Beta is peaked around alpha_mean.
-        # Adding 2 ensures the Beta is unimodal (a, b ≥ 1 when mean ∈ (0,1)).
-        # Clamp to 1000 to prevent numerical instability in Beta/Dirichlet distribution.
-        concentration = (F.softplus(self.lin_concentration(h)) + 2.0).clamp(max=1000.0)  # (E, 1)
-
-        # Clamp alpha_mean away from {0, 1} before multiplying so that a and b
-        # are never exactly zero (which can happen in bfloat16 AMP).
-        alpha_mean = alpha_mean.clamp(1e-4, 1.0 - 1e-4)
-        a = (alpha_mean * concentration).clamp(min=1e-3)  # (E, n_genes)
-        b = ((1.0 - alpha_mean) * concentration).clamp(min=1e-3)
+        concentration = (F.softplus(self.lin_concentration(h)) + 2.0).clamp(max=1000.0)
+        pi_mean = pi_mean.clamp(1e-4, 1.0 - 1e-4)
+        a = (pi_mean * concentration).clamp(min=1e-3)
+        b = ((1.0 - pi_mean) * concentration).clamp(min=1e-3)
         return a, b
 
 
 class SegregVAE(nn.Module):
     def __init__(
         self,
+        n_cells: int,
         n_genes: int,
         n_covariates: int,
         hidden_channels: int = 64,
@@ -163,158 +108,70 @@ class SegregVAE(nn.Module):
         include_diffusion: bool = True,
         include_size_factor: bool = True,
         log_mean_expr: torch.Tensor | None = None,
+        log_sf_prior: torch.Tensor | None = None,
         beta_init: torch.Tensor | None = None,
         beta_logstd_init: torch.Tensor | None = None,
     ):
         super().__init__()
         self.include_diffusion = include_diffusion
         self.include_size_factor = include_size_factor
-        # When using a size factor the encoder receives only expression data (not covariates),
-        # so the latent variable cannot absorb systematic covariate effects (e.g. tumor adjacency)
-        # and the regression coefficients remain the sole owner of those effects.
         in_channels = n_genes if include_size_factor else n_genes + n_covariates
         self.encoder = Encoder(in_channels, hidden_channels, latent_dim)
         self.node_decoder = NodeDecoder(latent_dim, hidden_channels, n_genes)
 
-        if self.include_diffusion:
-            self.edge_decoder = EdgeDecoder(latent_dim, hidden_channels, n_genes)
-            # Use softplus_inv for small kappa, or just kappa for large values to avoid overflow
-            if kappa < 20.0:
-                self.kappa_unconstrained = nn.Parameter(
-                    torch.tensor(math.log(math.exp(kappa) - 1.0))
-                )
-            else:
-                self.kappa_unconstrained = nn.Parameter(torch.tensor(float(kappa)))
+        if self.include_size_factor:
+            self.log_sf_embed = nn.Embedding(n_cells, 1)
+            if log_sf_prior is not None:
+                self.log_sf_embed.weight.data = log_sf_prior.clone().unsqueeze(-1)
 
-        # Empirical gene baseline to help the model start at the correct scale
         if log_mean_expr is not None:
             self.gene_bias = nn.Parameter(log_mean_expr.clone())
         else:
             self.gene_bias = nn.Parameter(torch.zeros(n_genes))
 
-        # Per-gene negative binomial dispersion: r = softplus(log_r).
-        # NB variance = mu + mu^2/r; as r -> inf this reduces to Poisson.
-        # Initialize to softplus_inv(10) ≈ 9.3 so training starts near-Poisson
-        # and learns overdispersion where the data supports it.
         self.log_r = nn.Parameter(torch.full((n_genes,), 9.3))
 
-        # Global regression parameters (Surrogate model for Variational Inference)
         if beta_init is not None:
             self.beta_mu = nn.Parameter(beta_init.clone())
         else:
             self.beta_mu = nn.Parameter(torch.zeros(n_covariates, n_genes))
-        # Initialize logstd from Fisher-info-based posterior variance when available;
-        # otherwise fall back to a small fixed value.
         if beta_logstd_init is not None:
             self.beta_logstd = nn.Parameter(beta_logstd_init.clone())
         else:
             self.beta_logstd = nn.Parameter(torch.full((n_covariates, n_genes), -3.0))
 
-    @property
-    def kappa(self):
-        if not self.include_diffusion:
-            return None
-        return F.softplus(self.kappa_unconstrained)
-
     def reparameterize(self, mu, logstd):
         if self.training:
-            # Clamp to prevent bfloat16 overflow: large mu/logstd -> Inf -> mixed-sign
-            # Inf in downstream linear layers -> Inf + (-Inf) = NaN.
             std = torch.exp(logstd.clamp(max=8.0))
             eps = torch.randn_like(std)
             return (mu + eps * std).clamp(-40.0, 40.0)
         return mu.clamp(-40.0, 40.0)
 
     def forward(
-        self, x, covariates, edge_index, prior_alpha=None, log_size_factor=None, suspect_score=None
+        self, x, covariates, pi_prior=None, inflow=None, log_size_factor=None
     ):
-        # 1. Encode into node latents
-        mu, logstd = self.encoder(x, edge_index)
+        mu, logstd = self.encoder(x)
         z = self.reparameterize(mu, logstd)
-
-        # 2. Decode unconstrained expression rates per cell
         rho = self.node_decoder(z)
 
-        # 2.5 Sample global regression coefficients
         if self.training:
-            # Clamp logstd before exp to prevent bfloat16 overflow → Inf in beta_std
             beta_std = torch.exp(self.beta_logstd.clamp(max=4.0))
-            eps = torch.randn_like(beta_std)
-            beta = self.beta_mu + eps * beta_std
+            beta = self.beta_mu + torch.randn_like(beta_std) * beta_std
         else:
             beta = self.beta_mu
 
-        # Compute predicted expression rates (lambda).
-        # When include_size_factor is True, log_size_factor is added as a fixed offset
-        # so that beta captures rates per unit of total expression, not raw counts.
         log_rate = rho + covariates @ beta + self.gene_bias
         if self.include_size_factor and log_size_factor is not None:
             log_rate = log_rate + log_size_factor.unsqueeze(-1)
         lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
 
-        if self.include_diffusion and prior_alpha is not None:
-            # 3. Decode edge diffusion parameters
-            # edge_index is shape [2, E]. We assume edge_index[0] is source, edge_index[1] is target
-            src, dst = edge_index
-            z_src, z_dst = z[src], z[dst]
-            # Per-gene expression ratio (detached): positive means source expresses the gene
-            # more than destination, which is direct evidence for diffusion of that gene.
-            lam_ratio = (
-                torch.log(lam[src] + 1e-8) - torch.log(lam[dst] + 1e-8)
-            ).detach()
-            a, b = self.edge_decoder(z_src, z_dst, prior_alpha, self.kappa, lam_ratio, suspect_score)
-
-            # Sample alpha during training, use mean during evaluation.
-            # Cast to float32 before sampling: Beta.rsample() via Gamma can produce
-            # NaN in bfloat16 for some parameter combinations.
-            if self.training:
-                if a.numel() > 0:
-                    # Clamp to avoid numerically unstable Gamma sampler for very
-                    # large concentrations (can produce Inf → NaN via Inf/Inf).
-                    a_f = a.float().clamp(min=1e-3, max=1e4)
-                    b_f = b.float().clamp(min=1e-3, max=1e4)
-                    alpha_dist = Beta(a_f, b_f)
-                    alpha = alpha_dist.rsample().to(a.dtype)
-                else:
-                    alpha = torch.empty_like(a)
-            else:
-                alpha = a / (a + b)
-
-            # Enforce physical conservation of mass: a cell cannot diffuse more than 100% of its transcripts.
-            # Sum the inferred alpha values over all outgoing edges from each source node, for each gene.
-            total_alpha = torch.zeros_like(lam)
-            # alpha is (E, n_genes), src is (E,)
-            # We want to add alpha[e, g] to total_alpha[src[e], g]
-            total_alpha.scatter_add_(
-                0,
-                src.unsqueeze(-1).expand(-1, alpha.size(1)),
-                alpha.to(total_alpha.dtype),
-            )
-
-            # If total_alpha > 1.0, we normalize the outgoing alphas down.
-            # If < 1.0, we leave them (allowing loss to background).
-            normalization = torch.clamp(total_alpha, min=1.0)
-            alpha_normalized = alpha / normalization[src]
-
-            # 4. Forward Generative Model (Reconstruction)
-            # The edge_index and alpha values include self-loops (i->i).
-            # Therefore, the total transcripts ending up in cell i is just the sum of messages.
-            # x_hat_i = \sum_{j} \alpha_{ji} \lambda_j
-            messages = alpha_normalized * lam[src]
-
-            diffused = torch.zeros_like(lam)
-            diffused.scatter_add_(
-                0,
-                dst.unsqueeze(-1).expand(-1, lam.size(1)),
-                messages.to(diffused.dtype),
-            )
-
-            x_hat = diffused
+        if self.include_diffusion and pi_prior is not None:
+            # Deterministic Simplified Diffusion: fix pi to the prior
+            x_hat = pi_prior * lam + inflow
         else:
             x_hat = lam
-            a = b = alpha = None
 
-        return x_hat, mu, logstd, a, b, alpha, beta
+        return x_hat, mu, logstd, beta
 
 
 class RegressionModel:
@@ -323,7 +180,6 @@ class RegressionModel:
     design: DesignMatrix
     device: torch.device
     model: SegregVAE
-    state_transitions_t: csr_matrix
     m: int
     n: int
 
@@ -337,7 +193,7 @@ class RegressionModel:
         sf_sigma: float = 0.5,
         hidden_channels: int = 128,
         latent_dim: int = 64,
-        kappa: float = 20.0,
+        kappa: float = 1000.0,
         beta_prior_scale: float = 1.0,
     ):
         if isinstance(data, AnnData):
@@ -350,26 +206,26 @@ class RegressionModel:
         if "proseg_run" not in adata.uns:
             raise ValueError("This is not a proseg spatialdata file")
 
-        m, n = adata.shape
-
+        self.m, self.n = adata.shape
         self.var_names = adata.var_names
         self.obs_names = adata.obs_names
 
         design_df = dmatrix(formula, adata.obs, return_type="dataframe")
         self.design = cast(DesignMatrix, design_df)
 
-        # dmatrix drops rows with NaN by default; expand back to m rows with zeros
-        # so that Data.x aligns with n_id (which covers all m cells).
-        if design_df.shape[0] < m:
+        if design_df.shape[0] < self.m:
             design_df = design_df.reindex(adata.obs.index, fill_value=0.0)
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.X = adata.X.tocsr() if not isinstance(adata.X, csr_matrix) else adata.X
+        X_dense = self.X.toarray().astype(np.float32)
 
         # This is a flattened 3d array giving per-gene state transition probabilities
         state_transitions = adata.varm["state_transitions"]
 
         # SciPy/AnnData zarr loaders sometimes use int32 for indices, which overflows if m*m > 2.14 billion.
         # CSR row indices must be monotonically increasing, so we can detect and fix negative wraps.
-        if state_transitions.indices.dtype == np.int32 and m * m > 2147483647:
-            print("HERE")
+        if state_transitions.indices.dtype == np.int32 and self.m * self.m > 2147483647:
             indices_64 = state_transitions.indices.astype(np.int64)
             for i in range(len(state_transitions.indptr) - 1):
                 start, end = (
@@ -388,47 +244,31 @@ class RegressionModel:
 
             state_transitions = csr_matrix(
                 (state_transitions.data, indices_64, state_transitions.indptr),
-                shape=(n, m * m),
+                shape=(self.n, self.m * self.m),
             )
 
-        assert state_transitions.shape == (n, m * m)
-        assert isinstance(state_transitions, csr_matrix)
+        # Simplified Diffusion Pre-calculations:
+        print("Pre-calculating simplified diffusion terms...")
+        # We use a Direct Difference model:
+        # ExpectedObserved = lambda + Contamination
+        # where Contamination = max(0, Observed - ExpectedTrue)
+        # This forces lambda to fit the 'cleaned' counts (ExpectedTrue).
+        
+        inflow = np.zeros((self.m, self.n), dtype=np.float32)
+        
+        for g in range(self.n):
+            st_g = state_transitions[g, :].toarray().reshape(self.m, self.m) # [dst_obs, src_true]
+            counts_g = X_dense[:, g]
+            # Expected true counts: sum over dst_obs
+            expected_true_g = st_g.T @ counts_g 
+            
+            inflow[:, g] = np.maximum(0.0, counts_g - expected_true_g)
+            
+        self.inflow_t = torch.tensor(inflow, dtype=torch.float32).to(self.device)
+        # pi is fixed to 1.0 in this model
+        self.pi_prior_t = torch.ones((self.m, self.n), dtype=torch.float32).to(self.device)
+        print("Done.")
 
-        # define a graph where there is an edge if there were any transcript transitions between cells
-        self.unique_edge_indices = np.unique(state_transitions.indices)
-
-        # Ensure self-loops are included so mass is conserved (cell i -> cell i)
-        col = self.unique_edge_indices % m
-        row = self.unique_edge_indices // m
-        has_self_loops = (col == row).any()
-        if not has_self_loops:
-            print("Adding self-loops to the graph for mass conservation...")
-            self.unique_edge_indices = np.unique(
-                np.concatenate([self.unique_edge_indices, np.arange(m) * (m + 1)])
-            )
-            col = self.unique_edge_indices % m
-            row = self.unique_edge_indices // m
-
-        edge_index = np.stack([col, row], axis=0)
-
-        # Compress state transitions to only include columns with any non-zero entries
-        new_indices = np.searchsorted(
-            self.unique_edge_indices, state_transitions.indices
-        )
-        compressed_state_transitions = csr_matrix(
-            (state_transitions.data, new_indices, state_transitions.indptr),
-            shape=(n, len(self.unique_edge_indices)),
-        )
-        self.state_transitions_t = compressed_state_transitions.transpose().tocsr()
-
-        self.X = adata.X
-        # cast to csr_matrix if we aren't already
-        if not isinstance(self.X, csr_matrix):
-            self.X = self.X.tocsr()
-
-        # Per-cell log size factor: use cell volume from proseg if available,
-        # otherwise fall back to total transcript count. Volume is the geometrically
-        # correct size measurement; counts/volume is flat across cell groups.
         if include_size_factor and "volume" in adata.obs.columns:
             cell_size = np.asarray(adata.obs["volume"]).squeeze().astype(np.float64)
         else:
@@ -436,260 +276,69 @@ class RegressionModel:
         log_size_factors = np.log(cell_size + 1e-8).astype(np.float32)
 
         self.data = Data(
-            edge_index=torch.tensor(edge_index, dtype=torch.long),
-            n_id=torch.arange(adata.n_obs),
+            n_id=torch.arange(self.m),
             x=torch.tensor(np.asarray(design_df), dtype=torch.float32),
-            # Prior for the learned size factor: fixed geometric measurement from proseg.
             log_sf_prior=torch.tensor(log_size_factors, dtype=torch.float32),
         )
 
-        # Learnable per-cell log size factor, initialized to the volume-based prior.
-        # During training it is regularized toward the prior with a Gaussian penalty,
-        # allowing small per-cell adjustments while staying anchored to cell geometry.
         self.sf_sigma = sf_sigma
         self.include_size_factor = include_size_factor
-        if include_size_factor:
-            self.log_sf_embed = nn.Embedding(m, 1)
-            self.log_sf_embed.weight.data = torch.tensor(
-                log_size_factors, dtype=torch.float32
-            ).unsqueeze(-1)
 
-        # Compute empirical log mean expression for initialization.
-        # With a size factor, gene_bias should reflect the mean normalized rate:
-        # E[counts_g] = mean_sf * exp(gene_bias_g), so gene_bias = log(mean_expr/mean_sf).
-        mean_expr = torch.tensor(
-            np.asarray(self.X.mean(axis=0)).squeeze(), dtype=torch.float32
-        )
+        mean_expr = torch.tensor(X_dense.mean(axis=0), dtype=torch.float32)
         if include_size_factor:
             mean_sf = float(cell_size.mean())
             log_mean_expr = torch.log(mean_expr / mean_sf + 1e-8)
         else:
             log_mean_expr = torch.log(mean_expr + 1e-4)
 
-        # OLS initialization for beta_mu: solve log(x/sf + pseudocount) ≈ gene_bias + design @ beta
-        # One QR factorization of the (m × n_cov) design matrix solves all genes at once.
-        # This gives beta a near-correct starting point so training converges much faster.
-        n_genes = self.X.shape[1]
         n_covariates = self.design.shape[1]
         print("Computing OLS initialization for beta...")
-        X_dense = self.X.toarray().astype(np.float32)  # (m, n_genes)
-        sf_col = np.exp(log_size_factors).reshape(-1, 1)  # (m, 1)
-        # Use a per-gene pseudocount of 0.5 * mean_rate in rate space.
-        # This ensures zero-count cells always get y_resid ≈ log(0.5) ≈ -0.7 regardless
-        # of the gene's mean expression level, avoiding the extreme negative residuals
-        # that a tiny fixed pseudocount (1e-8) causes for lowly-expressed genes (which
-        # drove the OLS to initialize with large negative betas / spurious downregulation).
-        # Being in rate space (not count space) also means the pseudocount is independent
-        # of cell size, preventing the sf-correlated bias that additive count pseudocounts
-        # introduce when cell size correlates with covariates.
-        mean_rate = (  # (1, n_genes) mean expression rate across cells
-            np.asarray(self.X.mean(axis=0)).squeeze().astype(np.float32).reshape(1, -1)
-            / float(sf_col.mean())
-        )
-        gene_pseudocount = 0.5 * np.maximum(mean_rate, 2e-8)  # (1, n_genes)
-        y_log = np.log(X_dense / sf_col + gene_pseudocount)  # (m, n_genes)
-        y_resid = y_log - log_mean_expr.numpy()  # subtract gene_bias
-        design_np = np.asarray(design_df, dtype=np.float64)  # (m, n_cov)
-        beta_init_np, _, _, _ = np.linalg.lstsq(
-            design_np, y_resid.astype(np.float64), rcond=None
-        )
+        sf_col = np.exp(log_size_factors).reshape(-1, 1)
+        mean_rate = np.asarray(X_dense.mean(axis=0)).squeeze().astype(np.float32).reshape(1, -1) / float(sf_col.mean())
+        gene_pseudocount = 0.5 * np.maximum(mean_rate, 2e-8)
+        y_log = np.log(X_dense / sf_col + gene_pseudocount)
+        y_resid = y_log - log_mean_expr.numpy()
+        design_np = np.asarray(design_df, dtype=np.float64)
+        beta_init_np, _, _, _ = np.linalg.lstsq(design_np, y_resid.astype(np.float64), rcond=None)
         beta_init_np = beta_init_np.astype(np.float32)
         print("Done.")
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Cauchy prior scale for regression coefficients.
-        # The intercept gets a wide scale (10.0) so it is essentially unconstrained;
-        # all other covariates get beta_prior_scale (γ) to encourage shrinkage toward zero
-        # while the heavy Cauchy tails still allow genuinely large fold changes.
-        #
-        # Gene-specific scaling: gamma_g ∝ sqrt(mean_rate_g / median_rate).
-        # Motivation: the NB reconstruction gradient w.r.t. beta[k, g] scales with
-        # mean_rate_g, so any systematic effect (real biology or sf artifact) survives
-        # Cauchy shrinkage preferentially for highly expressed genes, producing a spurious
-        # positive correlation between baseline expression and estimated fold changes.
-        # Scaling gamma by sqrt(mean_rate_g / median_rate) matches the typical statistical
-        # uncertainty in estimating a log fold change (∝ 1/sqrt(n * mean_rate_g)), so the
-        # effective prior-to-signal ratio is equalized across the expression range.
         covariate_names = list(self.design.design_info.column_names)
-        scale_per_cov = np.array(
-            [
-                10.0 if name == "Intercept" else beta_prior_scale
-                for name in covariate_names
-            ],
-            dtype=np.float32,
-        )
-        mean_rate_1d = mean_rate.squeeze()  # (n_genes,)
-
-        design_np = np.asarray(self.design, dtype=np.float32)
-        m_design = design_np.shape[0]
-        # edge_index is (2, E).
-        src = self.data.edge_index[0].numpy()
-        dst = self.data.edge_index[1].numpy()
-        suspect_shrinkage = np.ones((n_covariates, n_genes), dtype=np.float32)
-
-        if include_diffusion:
-            print("Computing Spatial-Aware Shrinkage...")
-            for k in range(n_covariates):
-                inside = design_np[:, k] > 0
-                if not inside.any() or inside.all():
-                    continue
-                # Edges entering the "inside" group from the "outside"
-                # Filter indices to avoid out-of-bounds if the graph is larger than design matrix
-                valid_edges = (src < m_design) & (dst < m_design)
-                src_v = src[valid_edges]
-                dst_v = dst[valid_edges]
-                
-                mask_v = inside[dst_v] & (~inside[src_v])
-                if not mask_v.any():
-                    continue
-                
-                # Total incoming prior_alpha from "outside" for each "inside" cell
-                rel_trans = self.state_transitions_t[np.where(valid_edges)[0][mask_v], :]
-                # Use sparse matrix multiplication for efficiency and memory safety
-                from scipy.sparse import coo_matrix
-                n_mask = mask_v.sum()
-                edge_matrix = coo_matrix(
-                    (np.ones(n_mask, dtype=np.float32), (np.arange(n_mask), dst_v[mask_v])),
-                    shape=(n_mask, m_design)
-                ).tocsr()
-                # (m_design, n_genes) = (m_design, n_mask) @ (n_mask, n_genes)
-                incoming_sum = edge_matrix.transpose().tocsr() @ rel_trans
-                
-                # Average "contamination potential" over cells in the group
-                suspect_score = np.asarray(incoming_sum[inside, :].mean(axis=0)).squeeze()
-                # f(s) = 1 / (1 + 1000 * s): extremely strong shrinkage for suspect genes
-                suspect_shrinkage[k, :] = 1.0 / (1.0 + 1000.0 * suspect_score)
-            print("Done.")
-
+        scale_per_cov = np.array([10.0 if name == "Intercept" else beta_prior_scale for name in covariate_names], dtype=np.float32)
+        mean_rate_1d = mean_rate.squeeze()
         expressed_rates = mean_rate_1d[mean_rate_1d > 1e-6]
-        median_rate = (
-            float(np.median(expressed_rates)) if len(expressed_rates) > 0 else 1e-4
-        )
-        gene_scale = (
-            np.sqrt(np.maximum(mean_rate_1d, 1e-8) / median_rate)
-            .clip(0.1, 10.0)
-            .astype(np.float32)
-        )  # (n_genes,); clipped to [0.1, 10]
-        # Interaction terms get an INVERTED gene-scaling: they are tightened for
-        # highly expressed genes to counteract their statistical power advantage.
-        # This forces the diffusion model to take priority for contaminated signals.
-        inv_gene_scale = (
-            np.sqrt(median_rate / np.maximum(mean_rate_1d, 1e-8))
-            .clip(0.01, 1.0)
-            .astype(np.float32)
-        )
+        median_rate = float(np.median(expressed_rates)) if len(expressed_rates) > 0 else 1e-4
+        gene_scale = np.sqrt(np.maximum(mean_rate_1d, 1e-8) / median_rate).clip(0.1, 10.0).astype(np.float32)
         
-        # (n_cov, n_genes): per-covariate base scale * per-gene expression scale * suspect shrinkage
-        # We apply gene_scale loosening ONLY to non-interaction terms.
-        # Interaction terms stay tight (0.5), and receive aggressive suspect shrinkage.
-        beta_prior_scale_matrix = np.zeros((n_covariates, n_genes), dtype=np.float32)
+        # Interaction terms stay tight (0.1) to counteract statistical power.
+        beta_prior_scale_matrix = np.zeros((len(covariate_names), self.n), dtype=np.float32)
         for i, name in enumerate(covariate_names):
             if ":" in name:
-                beta_prior_scale_matrix[i, :] = (
-                    0.5 * suspect_shrinkage[i, :]
-                )
+                beta_prior_scale_matrix[i, :] = 0.1
             else:
                 beta_prior_scale_matrix[i, :] = scale_per_cov[i] * gene_scale
-                
-        self.beta_prior_scale_t = torch.tensor(
-            beta_prior_scale_matrix, dtype=torch.float32
-        ).to(self.device)
+        
+        self.beta_prior_scale_t = torch.tensor(beta_prior_scale_matrix, dtype=torch.float32).to(self.device)
 
-        # For cell-specific strictness, we store the full incoming_sum
-        # We'll map this per-cell in fit()
-        self.incoming_sum_t = torch.zeros((m, n_genes), dtype=torch.float32).to(self.device)
-        if include_diffusion:
-            # incoming_sum was (m_design, n_genes)
-            # We map its rows to the global IDs of the cells in the design matrix
-            design_cell_ids = self.data.n_id[:m_design]
-            self.incoming_sum_t[design_cell_ids, :] = torch.tensor(
-                incoming_sum.toarray(), dtype=torch.float32
-            ).to(self.device)
-
-        # Store for use in fit() to dampen learned diffusion corrections
-        # We take the max suspect score across all covariates for each gene.
-        # shrinkage = 1/(1 + 1000*s) => s = (1/shrinkage - 1)/1000
-        min_shrink = suspect_shrinkage.min(axis=0)
-        self.suspect_score_t = torch.tensor(
-            (1.0 / min_shrink - 1.0) / 1000.0, dtype=torch.float32
-        ).to(self.device)
-
-        # Fisher-information-based initialization for beta_mu and beta_logstd.
-        #
-        # For each (covariate k, gene g), the Fisher information of the NB
-        # likelihood w.r.t. beta[k,g] is approximately:
-        #   I[k,g] = m * mean(design[:,k]^2) * r_init * mean_rate_g / (r_init + mean_rate_g)
-        #
-        # This drives two calibrated initializations:
-        #
-        # 1. Shrink beta_mu toward 0 (posterior mean under Gaussian-prior approximation):
-        #      beta_init[k,g] = beta_ols[k,g] * gamma[k,g]^2 / (gamma[k,g]^2 + 1/I[k,g])
-        #    For near-zero genes (I≈0), the full OLS estimate is noise and gets shrunk
-        #    to ~0. For well-expressed genes (I large), shrinkage is negligible.
-        #
-        # 2. Initialize beta_logstd to the posterior standard deviation:
-        #      sigma_post[k,g] = sqrt(gamma[k,g]^2 / (1 + gamma[k,g]^2 * I[k,g]))
-        #    For near-zero genes: sigma_post ≈ gamma (falls back to prior width).
-        #    For well-expressed genes: sigma_post ≈ 1/sqrt(I) (data-driven precision).
-        #
-        # Because I scales with m and mean_rate_g this self-calibrates across
-        # datasets and expression levels without any arbitrary tuning constants.
-        r_init = float(np.log1p(np.exp(9.3)))  # initial NB dispersion ≈ 10
-        fisher_per_cell_g = (
-            r_init * mean_rate_1d / (r_init + mean_rate_1d + 1e-10)
-        )  # (n_genes,)
-        design_cov_var = np.mean(design_np**2, axis=0).astype(np.float32)  # (n_cov,)
-        fisher_info = np.outer(
-            m * design_cov_var, fisher_per_cell_g
-        )  # (n_cov, n_genes)
-        gamma_sq = beta_prior_scale_matrix**2  # (n_cov, n_genes)
-        sigma_ols_sq = 1.0 / np.maximum(fisher_info, 1e-6)  # (n_cov, n_genes)
-        # Posterior mean: shrink OLS toward 0 proportional to data uncertainty
-        shrink = gamma_sq / (gamma_sq + sigma_ols_sq)  # in [0, 1]
+        r_init = float(np.log1p(np.exp(9.3)))
+        fisher_per_cell_g = r_init * mean_rate_1d / (r_init + mean_rate_1d + 1e-10)
+        design_cov_var = np.mean(design_np**2, axis=0).astype(np.float32)
+        fisher_info = np.outer(self.m * design_cov_var, fisher_per_cell_g)
+        gamma_sq = beta_prior_scale_matrix**2
+        sigma_ols_sq = 1.0 / np.maximum(fisher_info, 1e-6)
+        shrink = gamma_sq / (gamma_sq + sigma_ols_sq)
         beta_init_np = beta_init_np * shrink
 
-        # Identify interaction terms (those containing ':') and initialize them to zero.
-        # This gives the diffusion model 'first dibs' at explaining spatially-correlated variation.
-        covariate_names = list(self.design.design_info.column_names)
         for i, name in enumerate(covariate_names):
             if ":" in name:
                 beta_init_np[i, :] = 0.0
 
-        # Posterior variance: harmonic mean of prior and OLS variances
         post_var = sigma_ols_sq * gamma_sq / (sigma_ols_sq + gamma_sq + 1e-10)
-
-        beta_logstd_init = np.clip(0.5 * np.log(post_var + 1e-10), -5.0, 2.0).astype(
-            np.float32
-        )  # (n_cov, n_genes)
-
-        beta_init = torch.tensor(beta_init_np, dtype=torch.float32)
-        beta_logstd_init_t = torch.tensor(beta_logstd_init, dtype=torch.float32)
-
-        # Pre-densify X and state_transitions_t to GPU tensors to eliminate
-        # per-batch CPU sparse operations (the dominant training bottleneck).
-        # Memory budget: skip if either tensor would exceed 4 GB total.
-        x_bytes = m * n * 4
-        st_bytes = len(self.unique_edge_indices) * n * 4
-        mem_budget = 4 * 1024**3
-        # Always keep unique_edge_indices on GPU for fast searchsorted lookups.
-        self.unique_edge_indices_t = torch.tensor(
-            self.unique_edge_indices, dtype=torch.long
-        ).to(self.device)
-
-        if x_bytes + st_bytes <= mem_budget:
-            self.x_dense = torch.tensor(self.X.toarray(), dtype=torch.float32).to(
-                self.device
-            )
-            self.st_dense = torch.tensor(
-                self.state_transitions_t.toarray(), dtype=torch.float32
-            ).to(self.device)
-        else:
-            self.x_dense = None
-            self.st_dense = None
+        beta_logstd_init = np.clip(0.5 * np.log(post_var + 1e-10), -5.0, 2.0).astype(np.float32)
 
         self.model = SegregVAE(
-            n_genes,
+            self.m,
+            self.n,
             n_covariates,
             hidden_channels=hidden_channels,
             latent_dim=latent_dim,
@@ -697,47 +346,43 @@ class RegressionModel:
             include_diffusion=include_diffusion,
             include_size_factor=include_size_factor,
             log_mean_expr=log_mean_expr,
-            beta_init=beta_init,
-            beta_logstd_init=beta_logstd_init_t,
-        ).to(self.device)
-        self.m = m
-        self.n = n
+            log_sf_prior=torch.tensor(log_size_factors, dtype=torch.float32),
+            beta_init=torch.tensor(beta_init_np),
+            beta_logstd_init=torch.tensor(beta_logstd_init),
+        )
+
+        x_bytes = self.m * self.n * 4
+        mem_budget = 4 * 1024**3
+        if x_bytes <= mem_budget:
+            self.x_dense = torch.tensor(X_dense, dtype=torch.float32).to(self.device)
+        else:
+            self.x_dense = None
 
     def fit(
         self,
-        nepochs: int = 100,
-        nneighbors: int = 10,
+        nepochs: int = 200,
         batch_size: int = 1024,
         lr: float = 1e-3,
-        # beta_kl: float = 0.1,
         beta_kl: float = 1.0,
-        alpha_kl: float = 0.005,
+        alpha_kl: float = 1.0,
         kl_annealing: bool = True,
         seed: int | None = 42,
-
-
     ):
         if seed is not None:
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
             np.random.seed(seed)
-        if self.include_size_factor:
-            self.log_sf_embed = self.log_sf_embed.to(self.device)
-            params = list(self.model.parameters()) + list(
-                self.log_sf_embed.parameters()
-            )
-        else:
-            params = list(self.model.parameters())
-        optimizer = torch.optim.Adam(params, lr=lr)
 
-        loader = NeighborLoader(
-            self.data,
-            num_neighbors=[nneighbors, nneighbors],
-            batch_size=batch_size,
-            input_nodes=None,
-            shuffle=True,
+        from torch.utils.data import DataLoader, TensorDataset
+        dataset = TensorDataset(
+            torch.arange(self.m),
+            self.data.x,
+            self.data.log_sf_prior
         )
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.model.to(self.device)
         self.model.train()
 
         use_amp = self.device.type == "cuda"
@@ -746,418 +391,135 @@ class RegressionModel:
 
         pbar = tqdm(range(nepochs), desc="Training Segreg")
         for epoch in pbar:
-            # Linear KL annealing: beta_kl increases linearly from 0 up to 50% of nepochs
             if kl_annealing and nepochs > 1:
                 progress = min(1.0, (epoch + 1) / (nepochs // 2))
                 current_beta_kl = beta_kl * progress
+                current_alpha_kl = alpha_kl * progress
             else:
                 current_beta_kl = beta_kl
-
-            current_alpha_kl = alpha_kl
-
+                current_alpha_kl = alpha_kl
 
             total_loss = 0.0
-
-            for batch in loader:
+            for batch_idx, batch_x, batch_log_sf_prior in loader:
                 optimizer.zero_grad()
-                batch = batch.to(self.device)
+                batch_idx = batch_idx.to(self.device)
+                batch_x = batch_x.to(self.device)
+                batch_log_sf_prior = batch_log_sf_prior.to(self.device)
 
-                # Fetch dense counts for the sampled nodes.
-                node_idx = batch.n_id
                 if self.x_dense is not None:
-                    x_sub_tensor = self.x_dense[node_idx]
+                    x_sub_tensor = self.x_dense[batch_idx]
                 else:
-                    x_sub = self.X[node_idx.cpu().numpy()].toarray().astype(np.float32)
+                    x_sub = self.X[batch_idx.cpu().numpy()].toarray().astype(np.float32)
                     x_sub_tensor = torch.from_numpy(x_sub).to(self.device)
+
                 if self.model.include_diffusion:
-                    # Fetch edge transition weights.
-                    global_src = batch.n_id[batch.edge_index[0, :]]
-                    global_dst = batch.n_id[batch.edge_index[1, :]]
-
-                    # Cell-specific suspect score for each edge (based on target cell)
-                    batch_suspect_score = self.incoming_sum_t[global_dst, :]
-                    encoded = global_src + global_dst * self.m  # (E,) on GPU
-
-                    mapped_edge_index = torch.searchsorted(
-                        self.unique_edge_indices_t, encoded
-                    )
-                    n_ue = len(self.unique_edge_indices_t)
-                    clamped = mapped_edge_index.clamp(max=n_ue - 1)
-                    invalid = (mapped_edge_index >= n_ue) | (
-                        self.unique_edge_indices_t[clamped] != encoded
-                    )
-                    if invalid.any():
-                        raise RuntimeError(
-                            f"Found {invalid.sum()} edges out of {len(encoded)} that are not in unique_edge_indices!"
-                        )
-
-                    if self.st_dense is not None:
-                        prior_alpha = self.st_dense[mapped_edge_index]
-                    else:
-                        mapped_np = mapped_edge_index.cpu().numpy()
-                        arr = (
-                            self.state_transitions_t[mapped_np, :]
-                            .toarray()
-                            .astype(np.float32)
-                        )
-                        prior_alpha = torch.from_numpy(arr).to(self.device)
+                    pi_prior_sub = self.pi_prior_t[batch_idx]
+                    inflow_sub = self.inflow_t[batch_idx]
                 else:
-                    prior_alpha = None
-                    batch_suspect_score = None
+                    pi_prior_sub = inflow_sub = None
 
-                # Prepare encoder input and run the model forward pass under AMP.
                 if self.model.include_size_factor:
-                    log_sf = self.log_sf_embed(batch.n_id).squeeze(-1)
+                    log_sf = self.model.log_sf_embed(batch_idx).squeeze(-1)
                     size_factor = torch.exp(log_sf).unsqueeze(-1)
                     x_norm = x_sub_tensor / (size_factor + 1e-8) * 1000.0
                     encoder_in = torch.log1p(x_norm)
                 else:
                     log_sf = None
-                    encoder_in = torch.cat([torch.log1p(x_sub_tensor), batch.x], dim=-1)
+                    encoder_in = torch.log1p(x_sub_tensor)
 
-                with torch.autocast(
-                    device_type=self.device.type, dtype=amp_dtype, enabled=use_amp
-                ):
-                    x_hat, mu, logstd, a, b, alpha, beta = self.model(
-                        encoder_in,
-                        batch.x,
-                        batch.edge_index,
-                        prior_alpha,
-                        log_size_factor=log_sf,
-                        suspect_score=batch_suspect_score,
+                with torch.autocast(device_type=self.device.type, dtype=amp_dtype, enabled=use_amp):
+                    x_hat, mu, logstd, beta = self.model(
+                        encoder_in, batch_x, pi_prior=pi_prior_sub, inflow=inflow_sub, log_size_factor=log_sf
                     )
 
-                # ── Loss computation in float32 ──────────────────────────────────────
-                target_mask = torch.arange(batch.batch_size, device=self.device)
-                x_target = x_sub_tensor[target_mask]
-                x_hat_target = x_hat[target_mask].float()
-
-                # 1. Reconstruction Loss
+                x_target = x_sub_tensor
+                x_hat_target = x_hat.float()
                 r = F.softplus(self.model.log_r).clamp(min=1e-3)
                 mu_nb = x_hat_target
                 eps = 1e-8
                 log_r_over_r_plus_mu = torch.log(r / (r + mu_nb + eps))
                 log_mu_over_r_plus_mu = torch.log((mu_nb + eps) / (r + mu_nb + eps))
-                loss_recon = (
-                    -(
-                        torch.lgamma(x_target + r)
-                        - torch.lgamma(r)
-                        - torch.lgamma(x_target + 1)
-                        + r * log_r_over_r_plus_mu
-                        + x_target * log_mu_over_r_plus_mu
-                    )
-                    .sum(dim=-1)
-                    .mean()
-                )
+                loss_recon = -(torch.lgamma(x_target + r) - torch.lgamma(r) - torch.lgamma(x_target + 1) + r * log_r_over_r_plus_mu + x_target * log_mu_over_r_plus_mu).sum(dim=-1).mean()
 
-                # 2. Node KL Divergence
-                mu_target = mu[target_mask].float()
-                logstd_target = logstd[target_mask].float()
-                kl_z = (
-                    -0.5
-                    * torch.sum(
-                        1
-                        + 2 * logstd_target
-                        - mu_target.pow(2)
-                        - torch.exp(2 * logstd_target),
-                        dim=1,
-                    ).mean()
-                )
+                kl_z = -0.5 * torch.sum(1 + 2 * logstd - mu.pow(2) - (2 * logstd).exp(), dim=-1).mean()
 
-                # 3. Edge KL Divergence
-                if self.model.include_diffusion:
-                    dst = batch.edge_index[1]
-                    edge_mask = dst < batch.batch_size
-
-                    if edge_mask.sum() > 0:
-                        a_target = a[edge_mask].float()
-                        b_target = b[edge_mask].float()
-                        prior_alpha_target = prior_alpha[edge_mask]
-                        prior_alpha_target = torch.clamp(
-                            prior_alpha_target, 1e-4, 1.0 - 1e-4
-                        )
-                        kappa = self.model.kappa
-                        prior_a = 1.0 + kappa * prior_alpha_target
-                        prior_b = 1.0 + kappa * (1.0 - prior_alpha_target)
-
-                        q_alpha = Beta(a_target, b_target)
-                        p_alpha = Beta(prior_a, prior_b)
-                        
-                        kl_alpha = (
-                            kl_divergence(q_alpha, p_alpha).sum() / batch.batch_size
-                        )
-                    else:
-                        kl_alpha = torch.tensor(0.0, device=self.device)
-                else:
-                    kl_alpha = torch.tensor(0.0, device=self.device)
-
-                # 4. Global Regression Parameters KL Divergence — Cauchy prior
                 beta_f = beta.float()
                 gamma = self.beta_prior_scale_t
-                log_q = (
-                    -0.5
-                    * (
-                        (beta_f - self.model.beta_mu)
-                        / torch.exp(self.model.beta_logstd)
-                    ).pow(2)
-                    - self.model.beta_logstd
-                    - 0.5 * math.log(2.0 * math.pi)
-                )
-                log_p = (
-                    -math.log(math.pi)
-                    - torch.log(gamma)
-                    - torch.log1p((beta_f / gamma).pow(2))
-                )
+                log_q = -0.5 * ((beta_f - self.model.beta_mu) / torch.exp(self.model.beta_logstd)).pow(2) - self.model.beta_logstd - 0.5 * math.log(2.0 * math.pi)
+                log_p = -math.log(math.pi) - torch.log(gamma) - torch.log1p((beta_f / gamma).pow(2))
                 kl_beta = (log_q - log_p).sum() / self.m
 
-                # 5. Size Factor Regularization
                 if self.model.include_size_factor:
-                    log_sf_target = log_sf[: batch.batch_size]
-                    log_sf_prior_target = batch.log_sf_prior[: batch.batch_size]
-                    loss_sf = (log_sf_target - log_sf_prior_target).pow(2).mean() / (
-                        2 * self.sf_sigma**2
-                    )
+                    loss_sf = (log_sf - batch_log_sf_prior).pow(2).mean() / (2 * self.sf_sigma**2)
                 else:
                     loss_sf = torch.tensor(0.0, device=self.device)
 
-                loss = (
-                    loss_recon
-                    + (current_beta_kl * kl_z)
-                    + (current_alpha_kl * kl_alpha)
-                    + kl_beta
-                    + loss_sf
-                )
-
+                loss = loss_recon + (current_beta_kl * kl_z) + kl_beta + loss_sf
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
+                total_loss += loss.item()
 
-                loss_val = loss.item()
-                if loss_val == loss_val:
-                    total_loss += loss_val
+            pbar.set_description(f"Loss: {total_loss/len(loader):.4f} (Recon: {loss_recon:.2f})")
+        self.model.eval()
 
-            if self.model.include_diffusion:
-                kappa_val = self.model.kappa.item()
-                kappa_str = f", Kappa: {kappa_val:.2f}"
-            else:
-                kappa_str = ""
-
-            pbar.set_postfix_str(
-                f"Loss: {total_loss / len(loader):.4f} "
-                f"(Recon: {loss_recon.item():.4f}, KL_z: {kl_z.item():.4f}, "
-                f"KL_a: {kl_alpha.item():.4f}, KL_b: {kl_beta.item():.4f}{kappa_str})"
-            )
-
-    def get_regression_coefficients(
-        self, credible_interval: float | None = None
-    ) -> pd.DataFrame:
-        """
-        Returns a pandas DataFrame containing the posterior mean point estimates for the
-        regression coefficients. If a credible_interval is provided (e.g. 0.95), it also
-        calculates and includes the corresponding lower and upper bounds.
-        """
+    def get_regression_coefficients(self, credible_interval: float | None = None) -> pd.DataFrame:
         beta_mu = self.model.beta_mu.detach().cpu().numpy()
         covariate_names = self.design.design_info.column_names
-        genes = self.var_names
-
-        df = (
-            pd.DataFrame(beta_mu, index=covariate_names, columns=genes)
-            .melt(ignore_index=False, var_name="Gene", value_name="Mean")
-            .reset_index(names="Covariate")
-        )
-
+        df = pd.DataFrame(beta_mu, index=covariate_names, columns=self.var_names).melt(ignore_index=False, var_name="Gene", value_name="Mean").reset_index(names="Covariate")
         if credible_interval is not None:
             beta_std = torch.exp(self.model.beta_logstd).detach().cpu().numpy()
-            alpha = 1.0 - credible_interval
-            z = stats.norm.ppf(1.0 - alpha / 2.0)
-
-            lower = (
-                pd.DataFrame(
-                    beta_mu - z * beta_std, index=covariate_names, columns=genes
-                )
-                .melt(ignore_index=False, var_name="Gene", value_name="Lower")
-                .reset_index(names="Covariate")
-            )
-
-            upper = (
-                pd.DataFrame(
-                    beta_mu + z * beta_std, index=covariate_names, columns=genes
-                )
-                .melt(ignore_index=False, var_name="Gene", value_name="Upper")
-                .reset_index(names="Covariate")
-            )
-
-            df["Lower"] = lower["Lower"]
-            df["Upper"] = upper["Upper"]
-
-            # The "minimum credible fold change" is the point in the [Lower, Upper] interval nearest to 0.
-            # If the interval contains 0, it is 0.
-            # If the interval is entirely positive, it is Lower.
-            # If the interval is entirely negative, it is Upper.
-            df["MinimumCredible"] = np.where(
-                df["Lower"] > 0,
-                df["Lower"],
-                np.where(df["Upper"] < 0, df["Upper"], 0.0),
-            )
-
+            z = stats.norm.ppf(1.0 - (1.0 - credible_interval) / 2.0)
+            df["Lower"] = (beta_mu - z * beta_std).flatten(order='F')
+            df["Upper"] = (beta_mu + z * beta_std).flatten(order='F')
+            df["MinimumCredible"] = np.where(df["Lower"] > 0, df["Lower"], np.where(df["Upper"] < 0, df["Upper"], 0.0))
         return df
 
-    def get_corrected_expression(
-        self,
-        threshold: float = 1e-4,
-        batch_size: int = 4096,
-        nneighbors: int = 10,
-        n_samples: int = 10,
-    ) -> csr_matrix:
-        """
-        Returns the 'corrected' estimates of gene expression rates (lambda), which
-        represent the modeled expression prior to diffusion effects from neighboring cells.
-        The result is a sparse CSR matrix with values below `threshold` set to 0.
-        By default, it uses Monte Carlo sampling (`n_samples`) to estimate the expected rates.
-        """
+    def get_corrected_expression(self, threshold: float = 1e-4, batch_size: int = 4096, n_samples: int = 10) -> csr_matrix:
         self.model.eval()
-
-        loader = NeighborLoader(
-            self.data,
-            num_neighbors=[nneighbors, nneighbors],
-            batch_size=batch_size,
-            input_nodes=None,
-            shuffle=False,
-        )
-
-        rows = []
-        cols = []
-        data = []
-
+        from torch.utils.data import DataLoader, TensorDataset
+        loader = DataLoader(TensorDataset(torch.arange(self.m), self.data.x), batch_size=batch_size, shuffle=False)
+        rows, cols, data = [], [], []
         current_row = 0
         with torch.no_grad():
-            for batch in loader:
-                batch = batch.to(self.device)
-
-                # Fetch sparse counts for the sampled nodes and convert to dense tensor
-                node_idx = batch.n_id.cpu().numpy()
-                x_sub = self.X[node_idx].toarray()
-                x_sub_tensor = torch.tensor(
-                    x_sub, dtype=torch.float32, device=self.device
-                )
-
+            for batch_idx, batch_x in loader:
+                batch_idx, batch_x = batch_idx.to(self.device), batch_x.to(self.device)
+                x_sub_tensor = self.x_dense[batch_idx] if self.x_dense is not None else torch.tensor(self.X[batch_idx.cpu().numpy()].toarray(), dtype=torch.float32, device=self.device)
                 if self.model.include_size_factor:
-                    log_sf = self.log_sf_embed(batch.n_id).squeeze(-1)
-                    size_factor = torch.exp(log_sf).unsqueeze(-1)
-                    x_norm = x_sub_tensor / (size_factor + 1e-8) * 1000.0
-                    encoder_in = torch.log1p(x_norm)
+                    log_sf = self.model.log_sf_embed(batch_idx).squeeze(-1)
+                    encoder_in = torch.log1p(x_sub_tensor / (torch.exp(log_sf).unsqueeze(-1) + 1e-8) * 1000.0)
                 else:
                     log_sf = None
-                    encoder_in = torch.cat([torch.log1p(x_sub_tensor), batch.x], dim=-1)
-
-                # Forward pass through encoder
-                mu, logstd = self.model.encoder(encoder_in, batch.edge_index)
-
-                # PyG places the target nodes first in the batch up to `batch.batch_size`
-                target_mask = slice(0, batch.batch_size)
-                mu_target = mu[target_mask]
-                logstd_target = logstd[target_mask]
-                covariates_target = batch.x[target_mask]
-                log_sf_target = log_sf[target_mask] if log_sf is not None else None
-                beta = self.model.beta_mu
-
-                std_target = torch.exp(logstd_target)
-
-                lam_target_sum = torch.zeros(
-                    (batch.batch_size, self.n), device=self.device
-                )
-
-                # Monte Carlo sampling to compute expected rates.
-                # The size factor is included so the output is on the same scale as raw counts.
+                    encoder_in = torch.log1p(x_sub_tensor)
+                mu, logstd = self.model.encoder(encoder_in)
+                beta, std = self.model.beta_mu, torch.exp(logstd)
+                lam_sum = torch.zeros((batch_idx.size(0), self.n), device=self.device)
                 for _ in range(n_samples):
-                    z_target = mu_target + torch.randn_like(std_target) * std_target
-                    rho_target = self.model.node_decoder(z_target)
-
-                    log_rate = (
-                        rho_target + covariates_target @ beta + self.model.gene_bias
-                    )
-                    if self.model.include_size_factor:
-                        log_rate = log_rate + log_sf_target.unsqueeze(-1)
-                    lam_target_sum += torch.exp(
-                        torch.clamp(log_rate, min=-15.0, max=15.0)
-                    )
-
-                lam_target = lam_target_sum / n_samples
-                lam_np = lam_target.cpu().numpy()
-
-                # Thresholding
+                    z = mu + torch.randn_like(std) * std
+                    log_rate = self.model.node_decoder(z) + batch_x @ beta + self.model.gene_bias
+                    if self.model.include_size_factor: log_rate = log_rate + log_sf.unsqueeze(-1)
+                    lam_sum += torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
+                lam_np = (lam_sum / n_samples).cpu().numpy()
                 lam_np[lam_np < threshold] = 0.0
-
-                # Extract non-zero elements to build CSR matrix
                 r, c = np.nonzero(lam_np)
-                v = lam_np[r, c]
+                rows.append(r + current_row); cols.append(c); data.append(lam_np[r, c])
+                current_row += batch_idx.size(0)
+        return csr_matrix((np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))), shape=(self.m, self.n))
 
-                rows.append(r + current_row)
-                cols.append(c)
-                data.append(v)
-
-                current_row += batch.batch_size
-
-        if rows:
-            rows = np.concatenate(rows)
-            cols = np.concatenate(cols)
-            data = np.concatenate(data)
-        else:
-            rows = np.array([], dtype=int)
-            cols = np.array([], dtype=int)
-            data = np.array([], dtype=float)
-
-        return csr_matrix((data, (rows, cols)), shape=(self.m, self.n))
-
-    def get_latent_representation(
-        self,
-        batch_size: int = 4096,
-        nneighbors: int = 10,
-    ) -> np.ndarray:
-        """
-        Returns the posterior mean (mu) for each cell in the latent space.
-        """
+    def get_latent_representation(self, batch_size: int = 4096) -> np.ndarray:
         self.model.eval()
-
-        loader = NeighborLoader(
-            self.data,
-            num_neighbors=[nneighbors, nneighbors],
-            batch_size=batch_size,
-            input_nodes=None,
-            shuffle=False,
-        )
-
+        from torch.utils.data import DataLoader, TensorDataset
+        loader = DataLoader(TensorDataset(torch.arange(self.m), self.data.x), batch_size=batch_size, shuffle=False)
         all_mu = []
-
         with torch.no_grad():
-            for batch in loader:
-                batch = batch.to(self.device)
-
-                # Fetch sparse counts for the sampled nodes and convert to dense tensor
-                node_idx = batch.n_id.cpu().numpy()
-                x_sub = self.X[node_idx].toarray()
-                x_sub_tensor = torch.tensor(
-                    x_sub, dtype=torch.float32, device=self.device
-                )
-
+            for batch_idx, batch_x in loader:
+                batch_idx, batch_x = batch_idx.to(self.device), batch_x.to(self.device)
+                x_sub_tensor = self.x_dense[batch_idx] if self.x_dense is not None else torch.tensor(self.X[batch_idx.cpu().numpy()].toarray(), dtype=torch.float32, device=self.device)
                 if self.model.include_size_factor:
-                    log_sf = self.log_sf_embed(batch.n_id).squeeze(-1)
-                    size_factor = torch.exp(log_sf).unsqueeze(-1)
-                    x_norm = x_sub_tensor / (size_factor + 1e-8) * 1000.0
-                    encoder_in = torch.log1p(x_norm)
+                    log_sf = self.model.log_sf_embed(batch_idx).squeeze(-1)
+                    encoder_in = torch.log1p(x_sub_tensor / (torch.exp(log_sf).unsqueeze(-1) + 1e-8) * 1000.0)
                 else:
-                    log_sf = None
-                    encoder_in = torch.cat([torch.log1p(x_sub_tensor), batch.x], dim=-1)
-
-                # Forward pass through encoder
-                mu, _ = self.model.encoder(encoder_in, batch.edge_index)
-
-                # PyG places the target nodes first in the batch up to `batch.batch_size`
-                target_mask = slice(0, batch.batch_size)
-                mu_target = mu[target_mask]
-
-                all_mu.append(mu_target.cpu().numpy())
-
+                    encoder_in = torch.log1p(x_sub_tensor)
+                mu, _ = self.model.encoder(encoder_in)
+                all_mu.append(mu.cpu().numpy())
         return np.concatenate(all_mu, axis=0)
