@@ -257,10 +257,19 @@ class RegressionModel:
         inflow = np.zeros((self.m, self.n), dtype=np.float32)
         
         for g in range(self.n):
-            st_g = state_transitions[g, :].toarray().reshape(self.m, self.m) # [dst_obs, src_true]
+            # Row g of state_transitions gives ST_{ij}^g for all i,j
+            # ST is (n_genes, m*m), index = src_true + dst_obs * m
+            # We construct a sparse (m, m) matrix S_g where S_g[dst_obs, src_true] = P(true | obs)
+            row = state_transitions[g, :]
+            S_g = csr_matrix(
+                (row.data, (row.indices // self.m, row.indices % self.m)), 
+                shape=(self.m, self.m)
+            )
+            
             counts_g = X_dense[:, g]
-            # Expected true counts: sum over dst_obs
-            expected_true_g = st_g.T @ counts_g 
+            # Expected true counts: sum_obs P(true | obs) * Y_obs
+            # This is S_g.T @ counts_g
+            expected_true_g = S_g.transpose() @ counts_g 
             
             inflow[:, g] = np.maximum(0.0, counts_g - expected_true_g)
             
