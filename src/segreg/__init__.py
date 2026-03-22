@@ -100,14 +100,14 @@ class EdgeDecoder(nn.Module):
         self.lin_concentration = nn.Linear(hidden_channels, 1)
         # Per-gene scale for expression-ratio correction: when lam_src[g] > lam_dst[g]
         # (source expresses gene g more than destination), alpha should increase.
-        # Initialised to zero (exp(0) = 1) so the model starts with a strong
-        # prior that expression gradients drive diffusion.
-        self.log_lam_ratio_scale = nn.Parameter(torch.zeros(n_genes))
+        # Initialised to 2.0 (exp(2) ≈ 7.4) to ensure the model responds very
+        # aggressively to expression gradients from the start of training.
+        self.log_lam_ratio_scale = nn.Parameter(torch.full((n_genes,), 2.0))
         # Initialise cell-context correction to zero -> posterior starts at prior
         nn.init.zeros_(self.lin_correction.weight)
         nn.init.zeros_(self.lin_correction.bias)
 
-    def forward(self, z_src, z_dst, prior_alpha, kappa, lam_ratio=None):
+    def forward(self, z_src, z_dst, prior_alpha, kappa, lam_ratio=None, suspect_score=None):
         h = F.relu(self.lin1(torch.cat([z_src, z_dst], dim=-1)))
 
         # Cell-context correction (shared for all genes on this edge)
@@ -127,6 +127,17 @@ class EdgeDecoder(nn.Module):
         prior_mean = (1.0 + kappa * prior_alpha) / (2.0 + kappa)
         prior_logit = torch.logit(prior_mean.clamp(1e-4, 1.0 - 1e-4))
         alpha_mean = torch.sigmoid(prior_logit + logit_correction)  # (E, n_genes)
+
+        # Strict Prior Mode: if a gene has high suspect potential, we strictly
+        # clamp alpha_mean to NOT exceed the prior_mean. This prevents the
+        # reconstruction loss from overriding the spatial prior for contaminated genes.
+        if suspect_score is not None:
+            # Strength of enforcement s in [0, 1]
+            s = torch.clamp(10.0 * suspect_score.to(alpha_mean.dtype), max=1.0)
+            # Differentiable soft-min to enforce alpha_mean <= prior_mean for suspect genes
+            # When s=1, alpha_mean = min(alpha_mean, prior_mean)
+            alpha_mean = (1.0 - s) * alpha_mean + s * torch.minimum(alpha_mean, prior_mean)
+
 
         # Concentration: how tightly the Beta is peaked around alpha_mean.
         # Adding 2 ensures the Beta is unimodal (a, b ≥ 1 when mean ∈ (0,1)).
@@ -215,7 +226,7 @@ class SegregVAE(nn.Module):
         return mu.clamp(-40.0, 40.0)
 
     def forward(
-        self, x, covariates, edge_index, prior_alpha=None, log_size_factor=None
+        self, x, covariates, edge_index, prior_alpha=None, log_size_factor=None, suspect_score=None
     ):
         # 1. Encode into node latents
         mu, logstd = self.encoder(x, edge_index)
@@ -251,7 +262,7 @@ class SegregVAE(nn.Module):
             lam_ratio = (
                 torch.log(lam[src] + 1e-8) - torch.log(lam[dst] + 1e-8)
             ).detach()
-            a, b = self.edge_decoder(z_src, z_dst, prior_alpha, self.kappa, lam_ratio)
+            a, b = self.edge_decoder(z_src, z_dst, prior_alpha, self.kappa, lam_ratio, suspect_score)
 
             # Sample alpha during training, use mean during evaluation.
             # Cast to float32 before sampling: Beta.rsample() via Gamma can produce
@@ -326,7 +337,7 @@ class RegressionModel:
         sf_sigma: float = 0.5,
         hidden_channels: int = 128,
         latent_dim: int = 64,
-        kappa: float = 1000.0,
+        kappa: float = 20.0,
         beta_prior_scale: float = 1.0,
     ):
         if isinstance(data, AnnData):
@@ -385,8 +396,18 @@ class RegressionModel:
 
         # define a graph where there is an edge if there were any transcript transitions between cells
         self.unique_edge_indices = np.unique(state_transitions.indices)
+
+        # Ensure self-loops are included so mass is conserved (cell i -> cell i)
         col = self.unique_edge_indices % m
         row = self.unique_edge_indices // m
+        has_self_loops = (col == row).any()
+        if not has_self_loops:
+            print("Adding self-loops to the graph for mass conservation...")
+            self.unique_edge_indices = np.unique(
+                np.concatenate([self.unique_edge_indices, np.arange(m) * (m + 1)])
+            )
+            col = self.unique_edge_indices % m
+            row = self.unique_edge_indices // m
 
         edge_index = np.stack([col, row], axis=0)
 
@@ -493,12 +514,54 @@ class RegressionModel:
         covariate_names = list(self.design.design_info.column_names)
         scale_per_cov = np.array(
             [
-                10.0 if name == "Intercept" else (beta_prior_scale * 0.005 if ":" in name else beta_prior_scale)
+                10.0 if name == "Intercept" else beta_prior_scale
                 for name in covariate_names
             ],
             dtype=np.float32,
         )
         mean_rate_1d = mean_rate.squeeze()  # (n_genes,)
+
+        design_np = np.asarray(self.design, dtype=np.float32)
+        m_design = design_np.shape[0]
+        # edge_index is (2, E).
+        src = self.data.edge_index[0].numpy()
+        dst = self.data.edge_index[1].numpy()
+        suspect_shrinkage = np.ones((n_covariates, n_genes), dtype=np.float32)
+
+        if include_diffusion:
+            print("Computing Spatial-Aware Shrinkage...")
+            for k in range(n_covariates):
+                inside = design_np[:, k] > 0
+                if not inside.any() or inside.all():
+                    continue
+                # Edges entering the "inside" group from the "outside"
+                # Filter indices to avoid out-of-bounds if the graph is larger than design matrix
+                valid_edges = (src < m_design) & (dst < m_design)
+                src_v = src[valid_edges]
+                dst_v = dst[valid_edges]
+                
+                mask_v = inside[dst_v] & (~inside[src_v])
+                if not mask_v.any():
+                    continue
+                
+                # Total incoming prior_alpha from "outside" for each "inside" cell
+                rel_trans = self.state_transitions_t[np.where(valid_edges)[0][mask_v], :]
+                # Use sparse matrix multiplication for efficiency and memory safety
+                from scipy.sparse import coo_matrix
+                n_mask = mask_v.sum()
+                edge_matrix = coo_matrix(
+                    (np.ones(n_mask, dtype=np.float32), (np.arange(n_mask), dst_v[mask_v])),
+                    shape=(n_mask, m_design)
+                ).tocsr()
+                # (m_design, n_genes) = (m_design, n_mask) @ (n_mask, n_genes)
+                incoming_sum = edge_matrix.transpose().tocsr() @ rel_trans
+                
+                # Average "contamination potential" over cells in the group
+                suspect_score = np.asarray(incoming_sum[inside, :].mean(axis=0)).squeeze()
+                # f(s) = 1 / (1 + 1000 * s): extremely strong shrinkage for suspect genes
+                suspect_shrinkage[k, :] = 1.0 / (1.0 + 1000.0 * suspect_score)
+            print("Done.")
+
         expressed_rates = mean_rate_1d[mean_rate_1d > 1e-6]
         median_rate = (
             float(np.median(expressed_rates)) if len(expressed_rates) > 0 else 1e-4
@@ -508,10 +571,48 @@ class RegressionModel:
             .clip(0.1, 10.0)
             .astype(np.float32)
         )  # (n_genes,); clipped to [0.1, 10]
-        # (n_cov, n_genes): per-covariate base scale * per-gene expression scale
-        beta_prior_scale_matrix = scale_per_cov[:, None] * gene_scale[None, :]
+        # Interaction terms get an INVERTED gene-scaling: they are tightened for
+        # highly expressed genes to counteract their statistical power advantage.
+        # This forces the diffusion model to take priority for contaminated signals.
+        inv_gene_scale = (
+            np.sqrt(median_rate / np.maximum(mean_rate_1d, 1e-8))
+            .clip(0.01, 1.0)
+            .astype(np.float32)
+        )
+        
+        # (n_cov, n_genes): per-covariate base scale * per-gene expression scale * suspect shrinkage
+        # We apply gene_scale loosening ONLY to non-interaction terms.
+        # Interaction terms stay tight (0.5), and receive aggressive suspect shrinkage.
+        beta_prior_scale_matrix = np.zeros((n_covariates, n_genes), dtype=np.float32)
+        for i, name in enumerate(covariate_names):
+            if ":" in name:
+                beta_prior_scale_matrix[i, :] = (
+                    0.5 * suspect_shrinkage[i, :]
+                )
+            else:
+                beta_prior_scale_matrix[i, :] = scale_per_cov[i] * gene_scale
+                
         self.beta_prior_scale_t = torch.tensor(
             beta_prior_scale_matrix, dtype=torch.float32
+        ).to(self.device)
+
+        # For cell-specific strictness, we store the full incoming_sum
+        # We'll map this per-cell in fit()
+        self.incoming_sum_t = torch.zeros((m, n_genes), dtype=torch.float32).to(self.device)
+        if include_diffusion:
+            # incoming_sum was (m_design, n_genes)
+            # We map its rows to the global IDs of the cells in the design matrix
+            design_cell_ids = self.data.n_id[:m_design]
+            self.incoming_sum_t[design_cell_ids, :] = torch.tensor(
+                incoming_sum.toarray(), dtype=torch.float32
+            ).to(self.device)
+
+        # Store for use in fit() to dampen learned diffusion corrections
+        # We take the max suspect score across all covariates for each gene.
+        # shrinkage = 1/(1 + 1000*s) => s = (1/shrinkage - 1)/1000
+        min_shrink = suspect_shrinkage.min(axis=0)
+        self.suspect_score_t = torch.tensor(
+            (1.0 / min_shrink - 1.0) / 1000.0, dtype=torch.float32
         ).to(self.device)
 
         # Fisher-information-based initialization for beta_mu and beta_logstd.
@@ -557,11 +658,6 @@ class RegressionModel:
 
         # Posterior variance: harmonic mean of prior and OLS variances
         post_var = sigma_ols_sq * gamma_sq / (sigma_ols_sq + gamma_sq + 1e-10)
-        # Increase initial uncertainty for interaction terms to let them move if necessary,
-        # but the tighter prior and zero-init will still prefer zero.
-        for i, name in enumerate(covariate_names):
-            if ":" in name:
-                post_var[i, :] = np.maximum(post_var[i, :], 0.5)
 
         beta_logstd_init = np.clip(0.5 * np.log(post_var + 1e-10), -5.0, 2.0).astype(
             np.float32
@@ -615,9 +711,11 @@ class RegressionModel:
         lr: float = 1e-3,
         # beta_kl: float = 0.1,
         beta_kl: float = 1.0,
-        alpha_kl: float = 1.0,
+        alpha_kl: float = 0.005,
         kl_annealing: bool = True,
         seed: int | None = 42,
+
+
     ):
         if seed is not None:
             torch.manual_seed(seed)
@@ -657,6 +755,7 @@ class RegressionModel:
 
             current_alpha_kl = alpha_kl
 
+
             total_loss = 0.0
 
             for batch in loader:
@@ -670,11 +769,13 @@ class RegressionModel:
                 else:
                     x_sub = self.X[node_idx.cpu().numpy()].toarray().astype(np.float32)
                     x_sub_tensor = torch.from_numpy(x_sub).to(self.device)
-
                 if self.model.include_diffusion:
                     # Fetch edge transition weights.
                     global_src = batch.n_id[batch.edge_index[0, :]]
                     global_dst = batch.n_id[batch.edge_index[1, :]]
+
+                    # Cell-specific suspect score for each edge (based on target cell)
+                    batch_suspect_score = self.incoming_sum_t[global_dst, :]
                     encoded = global_src + global_dst * self.m  # (E,) on GPU
 
                     mapped_edge_index = torch.searchsorted(
@@ -702,6 +803,7 @@ class RegressionModel:
                         prior_alpha = torch.from_numpy(arr).to(self.device)
                 else:
                     prior_alpha = None
+                    batch_suspect_score = None
 
                 # Prepare encoder input and run the model forward pass under AMP.
                 if self.model.include_size_factor:
@@ -722,6 +824,7 @@ class RegressionModel:
                         batch.edge_index,
                         prior_alpha,
                         log_size_factor=log_sf,
+                        suspect_score=batch_suspect_score,
                     )
 
                 # ── Loss computation in float32 ──────────────────────────────────────
@@ -779,6 +882,7 @@ class RegressionModel:
 
                         q_alpha = Beta(a_target, b_target)
                         p_alpha = Beta(prior_a, prior_b)
+                        
                         kl_alpha = (
                             kl_divergence(q_alpha, p_alpha).sum() / batch.batch_size
                         )
