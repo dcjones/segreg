@@ -267,11 +267,11 @@ class RegressionModel:
             )
             
             counts_g = X_dense[:, g]
-            # Expected true counts: sum_obs P(true | obs) * Y_obs
-            # This is S_g.T @ counts_g
-            expected_true_g = S_g.transpose() @ counts_g 
-            
-            inflow[:, g] = np.maximum(0.0, counts_g - expected_true_g)
+            # Purity-based inflow: remove all expected contamination.
+            # This is more robust than net inflow (C-T) because it doesn't
+            # allow local production to 'cancel out' incoming contamination.
+            p_self = S_g.diagonal()
+            inflow[:, g] = (1.0 - p_self) * counts_g
             
         self.inflow_t = torch.tensor(inflow, dtype=torch.float32).to(self.device)
         # pi is fixed to 1.0 in this model
@@ -319,11 +319,25 @@ class RegressionModel:
         median_rate = float(np.median(expressed_rates)) if len(expressed_rates) > 0 else 1e-4
         gene_scale = np.sqrt(np.maximum(mean_rate_1d, 1e-8) / median_rate).clip(0.1, 10.0).astype(np.float32)
         
-        # Interaction terms stay tight (0.1) to counteract statistical power.
+        # Power-Balanced Prior: Interaction terms represent local deviations.
+        # As m increases, statistical power to fit spurious non-zero betas grows.
+        # We scale the interaction prior width by 1/sqrt(m) to maintain consistent discipline.
+        interaction_base_scale = 20.0 / np.sqrt(self.m)
+        
+        # Suspect-Specific Shrinkage: calculate contamination potential for each gene.
+        # genes where P(self|obs) is low have high contamination potential.
+        avg_obs = X_dense.mean(axis=0)
+        avg_exp_true = avg_obs - inflow.mean(axis=0)
+        # Suspect score: ratio of contamination to total signal
+        suspect_score = (avg_obs - avg_exp_true) / (avg_obs + 1e-8)
+        # f(s) = 1 / (1 + 50 * s)
+        suspect_shrinkage = 1.0 / (1.0 + 50.0 * suspect_score)
+
         beta_prior_scale_matrix = np.zeros((len(covariate_names), self.n), dtype=np.float32)
         for i, name in enumerate(covariate_names):
             if ":" in name:
-                beta_prior_scale_matrix[i, :] = 0.1
+                # Interaction terms get power-balanced scale and suspect shrinkage
+                beta_prior_scale_matrix[i, :] = interaction_base_scale * suspect_shrinkage
             else:
                 beta_prior_scale_matrix[i, :] = scale_per_cov[i] * gene_scale
         
