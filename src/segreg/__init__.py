@@ -174,6 +174,84 @@ class SegregVAE(nn.Module):
         return x_hat, mu, logstd, beta
 
 
+class SegregTrainingWrapper(nn.Module):
+    def __init__(self, model: SegregVAE, beta_prior_scale: torch.Tensor, m: int, sf_sigma: float):
+        super().__init__()
+        self.model = model
+        self.register_buffer("beta_prior_scale", beta_prior_scale)
+        self.m = m
+        self.sf_sigma = sf_sigma
+
+    def forward(
+        self,
+        batch_idx,
+        batch_x,
+        batch_log_sf_prior,
+        x_sub_tensor,
+        pi_prior_sub,
+        inflow_sub,
+        current_beta_kl: torch.Tensor,
+    ):
+        if self.model.include_size_factor:
+            log_sf = self.model.log_sf_embed(batch_idx).squeeze(-1)
+            size_factor = torch.exp(log_sf).unsqueeze(-1)
+            x_norm = x_sub_tensor / (size_factor + 1e-8) * 1000.0
+            encoder_in = torch.log1p(x_norm)
+        else:
+            log_sf = None
+            encoder_in = torch.log1p(x_sub_tensor)
+
+        x_hat, mu, logstd, beta = self.model(
+            encoder_in,
+            batch_x,
+            pi_prior=pi_prior_sub,
+            inflow=inflow_sub,
+            log_size_factor=log_sf,
+        )
+
+        x_hat_target = x_hat.float()
+        r = F.softplus(self.model.log_r).clamp(min=1e-3)
+        mu_nb = x_hat_target
+        eps = 1e-8
+        log_r_over_r_plus_mu = torch.log(r / (r + mu_nb + eps))
+        log_mu_over_r_plus_mu = torch.log((mu_nb + eps) / (r + mu_nb + eps))
+        loss_recon = -(
+            torch.lgamma(x_sub_tensor + r)
+            - torch.lgamma(r)
+            - torch.lgamma(x_sub_tensor + 1)
+            + r * log_r_over_r_plus_mu
+            + x_sub_tensor * log_mu_over_r_plus_mu
+        ).sum(dim=-1).mean()
+
+        kl_z = -0.5 * torch.sum(
+            1 + 2 * logstd - mu.pow(2) - (2 * logstd).exp(), dim=-1
+        ).mean()
+
+        beta_f = beta.float()
+        gamma = self.beta_prior_scale
+        log_q = (
+            -0.5 * ((beta_f - self.model.beta_mu) / torch.exp(self.model.beta_logstd)).pow(2)
+            - self.model.beta_logstd
+            - 0.5 * math.log(2.0 * math.pi)
+        )
+        log_p = (
+            -math.log(math.pi)
+            - torch.log(gamma)
+            - torch.log1p((beta_f / gamma).pow(2))
+        )
+        kl_beta = (log_q - log_p).sum() / self.m
+
+        if self.model.include_size_factor:
+            loss_sf = (
+                (log_sf - batch_log_sf_prior).pow(2).mean() / (2 * self.sf_sigma**2)
+            )
+        else:
+            loss_sf = torch.tensor(0.0, device=x_hat.device)
+
+        loss = loss_recon + (current_beta_kl * kl_z) + kl_beta + loss_sf
+        return loss, loss_recon
+
+
 class RegressionModel:
     X: csr_matrix
     data: Data
@@ -390,6 +468,7 @@ class RegressionModel:
         alpha_kl: float = 1.0,
         kl_annealing: bool = True,
         seed: int | None = 42,
+        compile: bool = False,
     ):
         if seed is not None:
             torch.manual_seed(seed)
@@ -408,6 +487,16 @@ class RegressionModel:
         self.model.to(self.device)
         self.model.train()
 
+        training_wrapper = SegregTrainingWrapper(
+            self.model, self.beta_prior_scale_t, self.m, self.sf_sigma
+        )
+
+        if compile:
+            # torch.compile provides ~20% speedup on CUDA.
+            # Requires CUDA toolkit (ptxas) to be in PATH and TRITON_PTXAS_PATH set if not standard.
+            print("Compiling model...")
+            training_wrapper = torch.compile(training_wrapper, mode="reduce-overhead")
+
         use_amp = self.device.type == "cuda"
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         scaler = torch.amp.GradScaler(enabled=use_amp)
@@ -421,6 +510,8 @@ class RegressionModel:
             else:
                 current_beta_kl = beta_kl
                 current_alpha_kl = alpha_kl
+
+            current_beta_kl_t = torch.tensor(current_beta_kl, device=self.device)
 
             total_loss = 0.0
             for batch_idx, batch_x, batch_log_sf_prior in loader:
@@ -441,49 +532,27 @@ class RegressionModel:
                 else:
                     pi_prior_sub = inflow_sub = None
 
-                if self.model.include_size_factor:
-                    log_sf = self.model.log_sf_embed(batch_idx).squeeze(-1)
-                    size_factor = torch.exp(log_sf).unsqueeze(-1)
-                    x_norm = x_sub_tensor / (size_factor + 1e-8) * 1000.0
-                    encoder_in = torch.log1p(x_norm)
-                else:
-                    log_sf = None
-                    encoder_in = torch.log1p(x_sub_tensor)
-
-                with torch.autocast(device_type=self.device.type, dtype=amp_dtype, enabled=use_amp):
-                    x_hat, mu, logstd, beta = self.model(
-                        encoder_in, batch_x, pi_prior=pi_prior_sub, inflow=inflow_sub, log_size_factor=log_sf
+                with torch.autocast(
+                    device_type=self.device.type, dtype=amp_dtype, enabled=use_amp
+                ):
+                    loss, loss_recon = training_wrapper(
+                        batch_idx,
+                        batch_x,
+                        batch_log_sf_prior,
+                        x_sub_tensor,
+                        pi_prior_sub,
+                        inflow_sub,
+                        current_beta_kl_t,
                     )
 
-                x_target = x_sub_tensor
-                x_hat_target = x_hat.float()
-                r = F.softplus(self.model.log_r).clamp(min=1e-3)
-                mu_nb = x_hat_target
-                eps = 1e-8
-                log_r_over_r_plus_mu = torch.log(r / (r + mu_nb + eps))
-                log_mu_over_r_plus_mu = torch.log((mu_nb + eps) / (r + mu_nb + eps))
-                loss_recon = -(torch.lgamma(x_target + r) - torch.lgamma(r) - torch.lgamma(x_target + 1) + r * log_r_over_r_plus_mu + x_target * log_mu_over_r_plus_mu).sum(dim=-1).mean()
-
-                kl_z = -0.5 * torch.sum(1 + 2 * logstd - mu.pow(2) - (2 * logstd).exp(), dim=-1).mean()
-
-                beta_f = beta.float()
-                gamma = self.beta_prior_scale_t
-                log_q = -0.5 * ((beta_f - self.model.beta_mu) / torch.exp(self.model.beta_logstd)).pow(2) - self.model.beta_logstd - 0.5 * math.log(2.0 * math.pi)
-                log_p = -math.log(math.pi) - torch.log(gamma) - torch.log1p((beta_f / gamma).pow(2))
-                kl_beta = (log_q - log_p).sum() / self.m
-
-                if self.model.include_size_factor:
-                    loss_sf = (log_sf - batch_log_sf_prior).pow(2).mean() / (2 * self.sf_sigma**2)
-                else:
-                    loss_sf = torch.tensor(0.0, device=self.device)
-
-                loss = loss_recon + (current_beta_kl * kl_z) + kl_beta + loss_sf
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
                 total_loss += loss.item()
 
-            pbar.set_description(f"Loss: {total_loss/len(loader):.4f} (Recon: {loss_recon:.2f})")
+            pbar.set_description(
+                f"Loss: {total_loss/len(loader):.4f} (Recon: {loss_recon:.2f})"
+            )
         self.model.eval()
 
     def get_regression_coefficients(self, credible_interval: float | None = None) -> pd.DataFrame:
