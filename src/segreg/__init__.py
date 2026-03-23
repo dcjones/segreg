@@ -65,37 +65,6 @@ class NodeDecoder(nn.Module):
         return self.lin(z)
 
 
-class PurityDecoder(nn.Module):
-    """
-    Decodes node latents into parameters for the posterior Beta distribution 
-    of cell-gene purity (pi), representing the proportion of transcripts in 
-    a cell that actually belong to it.
-    """
-
-    def __init__(self, latent_dim: int, hidden_channels: int, n_genes: int):
-        super().__init__()
-        self.lin1 = nn.Linear(latent_dim, hidden_channels)
-        self.lin_correction = nn.Linear(hidden_channels, n_genes)
-        self.lin_concentration = nn.Linear(hidden_channels, 1)
-        nn.init.zeros_(self.lin_correction.weight)
-        nn.init.zeros_(self.lin_correction.bias)
-
-    def forward(self, z, pi_prior, kappa):
-        h = F.relu(self.lin1(z))
-        logit_correction = self.lin_correction(h)
-
-        # Posterior mean anchored to the proseg purity prior (self-transition)
-        prior_mean = (1.0 + kappa * pi_prior) / (2.0 + kappa)
-        prior_logit = torch.logit(prior_mean.clamp(1e-4, 1.0 - 1e-4))
-        pi_mean = torch.sigmoid(prior_logit + logit_correction)
-
-        concentration = (F.softplus(self.lin_concentration(h)) + 2.0).clamp(max=1000.0)
-        pi_mean = pi_mean.clamp(1e-4, 1.0 - 1e-4)
-        a = (pi_mean * concentration).clamp(min=1e-3)
-        b = ((1.0 - pi_mean) * concentration).clamp(min=1e-3)
-        return a, b
-
-
 class SegregVAE(nn.Module):
     def __init__(
         self,
@@ -130,6 +99,13 @@ class SegregVAE(nn.Module):
             self.gene_bias = nn.Parameter(torch.zeros(n_genes))
 
         self.log_r = nn.Parameter(torch.full((n_genes,), 9.3))
+
+        if include_diffusion:
+            # log_alpha initialized so that alpha = 1.0
+            # alpha = 0.1 + softplus(log_alpha)
+            # 1.0 = 0.1 + softplus(log_alpha) => 0.9 = softplus(log_alpha)
+            # log_alpha = log(exp(0.9) - 1) approx 0.37
+            self.log_alpha = nn.Parameter(torch.full((n_genes,), 0.3747))
 
         if beta_init is not None:
             self.beta_mu = nn.Parameter(beta_init.clone())
@@ -167,7 +143,9 @@ class SegregVAE(nn.Module):
 
         if self.include_diffusion and pi_prior is not None:
             # Deterministic Simplified Diffusion: fix pi to the prior
-            x_hat = pi_prior * lam + inflow
+            # alpha scales the pre-calculated inflow.
+            alpha = 0.1 + F.softplus(self.log_alpha)
+            x_hat = pi_prior * lam + alpha * inflow
         else:
             x_hat = lam
 
@@ -191,6 +169,7 @@ class SegregTrainingWrapper(nn.Module):
         pi_prior_sub,
         inflow_sub,
         current_beta_kl: torch.Tensor,
+        current_alpha_kl: torch.Tensor,
     ):
         if self.model.include_size_factor:
             log_sf = self.model.log_sf_embed(batch_idx).squeeze(-1)
@@ -248,7 +227,13 @@ class SegregTrainingWrapper(nn.Module):
         else:
             loss_sf = torch.tensor(0.0, device=x_hat.device)
 
-        loss = loss_recon + (current_beta_kl * kl_z) + kl_beta + loss_sf
+        if self.model.include_diffusion:
+            # log_alpha prior: N(0.3747, 0.5) to keep alpha near 1.0
+            kl_alpha = 0.5 * ((self.model.log_alpha - 0.3747)**2 / (0.5**2)).sum() / self.m
+        else:
+            kl_alpha = torch.tensor(0.0, device=x_hat.device)
+
+        loss = loss_recon + (current_beta_kl * kl_z) + kl_beta + loss_sf + (current_alpha_kl * kl_alpha)
         return loss, loss_recon
 
 
@@ -512,6 +497,7 @@ class RegressionModel:
                 current_alpha_kl = alpha_kl
 
             current_beta_kl_t = torch.tensor(current_beta_kl, device=self.device)
+            current_alpha_kl_t = torch.tensor(current_alpha_kl, device=self.device)
 
             total_loss = 0.0
             for batch_idx, batch_x, batch_log_sf_prior in loader:
@@ -543,6 +529,7 @@ class RegressionModel:
                         pi_prior_sub,
                         inflow_sub,
                         current_beta_kl_t,
+                        current_alpha_kl_t,
                     )
 
                 scaler.scale(loss).backward()
@@ -553,6 +540,12 @@ class RegressionModel:
             pbar.set_description(
                 f"Loss: {total_loss/len(loader):.4f} (Recon: {loss_recon:.2f})"
             )
+        
+        if self.model.include_diffusion:
+            with torch.no_grad():
+                learned_alpha = (0.1 + F.softplus(self.model.log_alpha)).cpu().numpy()
+            print(f"Learned alpha (inflow scaling): mean={learned_alpha.mean():.4f}, std={learned_alpha.std():.4f}, min={learned_alpha.min():.4f}, max={learned_alpha.max():.4f}")
+
         self.model.eval()
 
     def get_regression_coefficients(self, credible_interval: float | None = None) -> pd.DataFrame:
@@ -588,9 +581,15 @@ class RegressionModel:
                 lam_sum = torch.zeros((batch_idx.size(0), self.n), device=self.device)
                 for _ in range(n_samples):
                     z = mu + torch.randn_like(std) * std
-                    log_rate = self.model.node_decoder(z) + batch_x @ beta + self.model.gene_bias
-                    if self.model.include_size_factor: log_rate = log_rate + log_sf.unsqueeze(-1)
-                    lam_sum += torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
+                    out = self.model(
+                        encoder_in,
+                        batch_x,
+                        pi_prior=None, # We want corrected (lam), so skip diffusion
+                        inflow=None,
+                        log_size_factor=log_sf
+                    )
+                    # out[0] is x_hat, which is lam because pi_prior/inflow are None
+                    lam_sum += out[0]
                 lam_np = (lam_sum / n_samples).cpu().numpy()
                 lam_np[lam_np < threshold] = 0.0
                 r, c = np.nonzero(lam_np)
