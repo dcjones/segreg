@@ -100,13 +100,6 @@ class SegregVAE(nn.Module):
 
         self.log_r = nn.Parameter(torch.full((n_genes,), 9.3))
 
-        if include_diffusion:
-            # log_alpha initialized so that alpha = 1.0
-            # alpha = 0.1 + softplus(log_alpha)
-            # 1.0 = 0.1 + softplus(log_alpha) => 0.9 = softplus(log_alpha)
-            # log_alpha = log(exp(0.9) - 1) approx 0.37
-            self.log_alpha = nn.Parameter(torch.full((n_genes,), 0.3747))
-
         if beta_init is not None:
             self.beta_mu = nn.Parameter(beta_init.clone())
         else:
@@ -143,9 +136,7 @@ class SegregVAE(nn.Module):
 
         if self.include_diffusion and pi_prior is not None:
             # Deterministic Simplified Diffusion: fix pi to the prior
-            # alpha scales the pre-calculated inflow.
-            alpha = 0.1 + F.softplus(self.log_alpha)
-            x_hat = pi_prior * lam + alpha * inflow
+            x_hat = pi_prior * lam + inflow
         else:
             x_hat = lam
 
@@ -169,7 +160,6 @@ class SegregTrainingWrapper(nn.Module):
         pi_prior_sub,
         inflow_sub,
         current_beta_kl: torch.Tensor,
-        current_alpha_kl: torch.Tensor,
     ):
         if self.model.include_size_factor:
             log_sf = self.model.log_sf_embed(batch_idx).squeeze(-1)
@@ -227,13 +217,7 @@ class SegregTrainingWrapper(nn.Module):
         else:
             loss_sf = torch.tensor(0.0, device=x_hat.device)
 
-        if self.model.include_diffusion:
-            # log_alpha prior: N(0.3747, 0.5) to keep alpha near 1.0
-            kl_alpha = 0.5 * ((self.model.log_alpha - 0.3747)**2 / (0.5**2)).sum() / self.m
-        else:
-            kl_alpha = torch.tensor(0.0, device=x_hat.device)
-
-        loss = loss_recon + (current_beta_kl * kl_z) + kl_beta + loss_sf + (current_alpha_kl * kl_alpha)
+        loss = loss_recon + (current_beta_kl * kl_z) + kl_beta + loss_sf
         return loss, loss_recon
 
 
@@ -491,13 +475,10 @@ class RegressionModel:
             if kl_annealing and nepochs > 1:
                 progress = min(1.0, (epoch + 1) / (nepochs // 2))
                 current_beta_kl = beta_kl * progress
-                current_alpha_kl = alpha_kl * progress
             else:
                 current_beta_kl = beta_kl
-                current_alpha_kl = alpha_kl
 
             current_beta_kl_t = torch.tensor(current_beta_kl, device=self.device)
-            current_alpha_kl_t = torch.tensor(current_alpha_kl, device=self.device)
 
             total_loss = 0.0
             for batch_idx, batch_x, batch_log_sf_prior in loader:
@@ -529,7 +510,6 @@ class RegressionModel:
                         pi_prior_sub,
                         inflow_sub,
                         current_beta_kl_t,
-                        current_alpha_kl_t,
                     )
 
                 scaler.scale(loss).backward()
@@ -541,11 +521,6 @@ class RegressionModel:
                 f"Loss: {total_loss/len(loader):.4f} (Recon: {loss_recon:.2f})"
             )
         
-        if self.model.include_diffusion:
-            with torch.no_grad():
-                learned_alpha = (0.1 + F.softplus(self.model.log_alpha)).cpu().numpy()
-            print(f"Learned alpha (inflow scaling): mean={learned_alpha.mean():.4f}, std={learned_alpha.std():.4f}, min={learned_alpha.min():.4f}, max={learned_alpha.max():.4f}")
-
         self.model.eval()
 
     def get_regression_coefficients(self, credible_interval: float | None = None) -> pd.DataFrame:
