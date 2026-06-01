@@ -22,10 +22,10 @@ estimated number of transcripts of gene $g$ in cell $c$.
 Because it is a sampler, we also have a great deal of flexibility when it comes
 to estimating uncertainty. What Proseg reports is two matrices estimating
 expected inflow and outflow, respectively. Inflow, for gene $g$ and cell $c$, is
-given by $accent(lambda, arrow.l)_(c g)$ and outflow $accent(lambda, arrow.r)_(c
+given by $accent(f, arrow.l)_(c g)$ and outflow $accent(f, arrow.r)_(c
 g)$. The former estimates the expected number of transcripts of gene $g$ that
-are eroneously assigned to cell $c$ in the point estimate $X$. The latter, is
-the expected number that belong to $c$ but are eroneously assigned to other
+are erroneously assigned to cell $c$ in the point estimate $X$. The latter, is
+the expected number that belong to $c$ but are erroneously assigned to other
 cells.
 
 These are both estimated using the following procedure:
@@ -49,16 +49,28 @@ $ log(lambda_(c g)) = D_(c :) B_(: g) $
 where $D$ is the design matrix and $B$ is the regression coefficient matrix.
 
 We expect $X$ to be a reasonable estimate of the true gene expression matrix,
-but also be contaminated because by genuine uncertanity about which transcripts
+but also be contaminated because of genuine uncertainty about which transcripts
 belong to which cells.
 
-Towards that end, we posit that the rate $lambda$ that governs $X$ is corrupted
-by another matrix term $delta$.
+Towards that end, we posit that the observed counts $X$ are generated from a
+true (latent) rate $lambda$ that is inflated by a known contamination term
+$delta$. The contamination represents transcripts that are erroneously assigned
+to a cell due to segmentation uncertainty. When net inflow is positive, the
+observed expression is higher than the true rate would suggest; when net outflow
+dominates, the observed expression is lower.
 $ X_(c g) tilde.op text("Poisson")(lambda_(c g) + delta_(c, g)) $
 
-Since delta here should represent the aggregate expected error, we plug in the estimates from
-Proseg's sampling procedure, taking the further step to clamp values to be non-negative to avoid numerical issues.
-$ delta_(c, g) = max(0, accent(lambda, arrow.l)_(c g) - accent(lambda, arrow.r)) $
+Since $delta$ represents the aggregate expected error, we plug in the estimates
+from Proseg's sampling procedure, taking the further step to clamp values to be
+non-negative to avoid numerical issues.
+$ delta_(c, g) = max(0, accent(f, arrow.l)_(c g) - accent(f, arrow.r)_(c g)) $
+
+// TODO: I don't love the lambda notation for quantities that proseg estimates.
+
+= Segmentation error as a parameter
+
+We can further elaborate on this model by instead of using a fixed estimate of $delta_(c g)$,
+estimating it as a model parameter
 
 = Amortized Inference
 
