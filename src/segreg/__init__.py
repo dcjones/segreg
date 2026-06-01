@@ -112,6 +112,13 @@ class SegregVAE(nn.Module):
         else:
             self.beta_logstd = nn.Parameter(torch.full((n_covariates, n_genes), -3.0))
 
+        if include_diffusion:
+            # Per-gene learnable inflow scale: proseg inflow may systematically underestimate
+            # contamination for highly expressed neighboring-cell genes. A learned scale
+            # is identifiable because contamination genes are under-fitted (x_hat < x),
+            # while genuine DE genes are already well-explained by beta/z and stay near 1.
+            self.log_inflow_scale = nn.Parameter(torch.zeros(n_genes))
+
     def reparameterize(self, mu, logstd):
         if self.training:
             std = torch.exp(logstd.clamp(max=8.0))
@@ -136,11 +143,8 @@ class SegregVAE(nn.Module):
         lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
 
         if self.include_diffusion:
-            # Simple point estimate of expected contamination
-            x_hat = (lam + self.rate_offset) + inflow
-
-            # TODO: More sophisticated estimate where inflow is a parameter constrained
-            # by a prior.
+            inflow_scale = torch.exp(self.log_inflow_scale)
+            x_hat = lam + inflow_scale * inflow + self.rate_offset
         else:
             x_hat = lam + self.rate_offset
 
@@ -149,13 +153,19 @@ class SegregVAE(nn.Module):
 
 class SegregTrainingWrapper(nn.Module):
     def __init__(
-        self, model: SegregVAE, beta_prior_scale: torch.Tensor, m: int, sf_sigma: float
+        self,
+        model: SegregVAE,
+        beta_prior_scale: torch.Tensor,
+        m: int,
+        sf_sigma: float,
+        inflow_scale_reg: float = 0.1,
     ):
         super().__init__()
         self.model = model
         self.register_buffer("beta_prior_scale", beta_prior_scale)
         self.m = m
         self.sf_sigma = sf_sigma
+        self.inflow_scale_reg = inflow_scale_reg
 
     def forward(
         self,
@@ -227,7 +237,16 @@ class SegregTrainingWrapper(nn.Module):
         else:
             loss_sf = torch.tensor(0.0, device=x_hat.device)
 
-        loss = loss_recon + (current_beta_kl * kl_z) + kl_beta + loss_sf
+        if self.model.include_diffusion:
+            # L2 prior on log_inflow_scale: encourages inflow scale to stay near 1
+            # but allows it to grow for genes where proseg systematically underestimates.
+            loss_inflow_scale = (
+                self.inflow_scale_reg * self.model.log_inflow_scale.pow(2).mean()
+            )
+        else:
+            loss_inflow_scale = torch.tensor(0.0, device=x_hat.device)
+
+        loss = loss_recon + (current_beta_kl * kl_z) + kl_beta + loss_sf + loss_inflow_scale
         return loss, loss_recon
 
 
@@ -252,7 +271,6 @@ def _ols_init_beta(
     )
     gene_pseudocount = (0.5 * np.maximum(mean_rate_1d, 2e-8)).reshape(1, -1)
 
-    print("Computing OLS initialization for beta...")
     sf_col_f64 = sf_col.astype(np.float64)
     chunk_size = 1024
     beta_chunks = []
@@ -265,7 +283,6 @@ def _ols_init_beta(
         beta_chunk, _, _, _ = np.linalg.lstsq(design_np, y_resid, rcond=None)
         beta_chunks.append(beta_chunk.astype(np.float32))
     beta_init_np = np.concatenate(beta_chunks, axis=1)
-    print("Done.")
 
     scale_per_cov = np.array(
         [10.0 if name == "Intercept" else beta_prior_scale for name in covariate_names],
@@ -346,6 +363,7 @@ class RegressionModel:
         latent_dim: int = 64,
         kappa: float = 1000.0,
         beta_prior_scale: float = 1.0,
+        inflow_scale_reg: float = 1.0,
     ):
         if isinstance(data, AnnData):
             adata = data
@@ -389,6 +407,7 @@ class RegressionModel:
         )
 
         self.sf_sigma = sf_sigma
+        self.inflow_scale_reg = inflow_scale_reg
         self.include_size_factor = include_size_factor
 
         sf_col = np.exp(log_size_factors).reshape(-1, 1)
@@ -448,6 +467,7 @@ class RegressionModel:
         kl_annealing: bool = True,
         seed: int | None = 42,
         compile: bool = False,
+        quiet: bool = False,
     ):
         if seed is not None:
             torch.manual_seed(seed)
@@ -466,7 +486,11 @@ class RegressionModel:
         self.model.train()
 
         training_wrapper = SegregTrainingWrapper(
-            self.model, self.beta_prior_scale_t, self.m, self.sf_sigma
+            self.model,
+            self.beta_prior_scale_t,
+            self.m,
+            self.sf_sigma,
+            inflow_scale_reg=self.inflow_scale_reg,
         )
 
         if compile:
@@ -479,7 +503,7 @@ class RegressionModel:
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         scaler = torch.amp.GradScaler(enabled=use_amp)
 
-        pbar = tqdm(range(nepochs), desc="Training Segreg")
+        pbar = tqdm(range(nepochs), desc="Training Segreg", disable=quiet)
         for epoch in pbar:
             if kl_annealing and nepochs > 1:
                 progress = min(1.0, (epoch + 1) / (nepochs // 2))
@@ -583,14 +607,10 @@ class RegressionModel:
         with torch.no_grad():
             for batch_idx, batch_x in loader:
                 batch_idx, batch_x = batch_idx.to(self.device), batch_x.to(self.device)
-                x_sub_tensor = (
-                    self.x_dense[batch_idx]
-                    if self.x_dense is not None
-                    else torch.tensor(
-                        self.X[batch_idx.cpu().numpy()].toarray(),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
+                x_sub_tensor = torch.tensor(
+                    self.X[batch_idx.cpu().numpy()].toarray(),
+                    dtype=torch.float32,
+                    device=self.device,
                 )
                 if self.model.include_size_factor:
                     log_sf = self.model.log_sf_embed(batch_idx).squeeze(-1)
@@ -601,19 +621,16 @@ class RegressionModel:
                     log_sf = None
                     encoder_in = torch.log1p(x_sub_tensor)
                 mu, logstd = self.model.encoder(encoder_in)
-                beta, std = self.model.beta_mu, torch.exp(logstd)
+                std = torch.exp(logstd)
                 lam_sum = torch.zeros((batch_idx.size(0), self.n), device=self.device)
                 for _ in range(n_samples):
                     z = mu + torch.randn_like(std) * std
-                    out = self.model(
-                        encoder_in,
-                        batch_x,
-                        pi_prior=None,  # We want corrected (lam), so skip diffusion
-                        inflow=None,
-                        log_size_factor=log_sf,
-                    )
-                    # out[0] is x_hat, which is lam because pi_prior/inflow are None
-                    lam_sum += out[0]
+                    rho = self.model.node_decoder(z)
+                    log_rate = rho + batch_x @ self.model.beta_mu + self.model.gene_bias
+                    if self.model.include_size_factor and log_sf is not None:
+                        log_rate = log_rate + log_sf.unsqueeze(-1)
+                    lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
+                    lam_sum += lam + self.model.rate_offset
                 lam_np = (lam_sum / n_samples).cpu().numpy()
                 lam_np[lam_np < threshold] = 0.0
                 r, c = np.nonzero(lam_np)
@@ -639,14 +656,10 @@ class RegressionModel:
         with torch.no_grad():
             for batch_idx, batch_x in loader:
                 batch_idx, batch_x = batch_idx.to(self.device), batch_x.to(self.device)
-                x_sub_tensor = (
-                    self.x_dense[batch_idx]
-                    if self.x_dense is not None
-                    else torch.tensor(
-                        self.X[batch_idx.cpu().numpy()].toarray(),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
+                x_sub_tensor = torch.tensor(
+                    self.X[batch_idx.cpu().numpy()].toarray(),
+                    dtype=torch.float32,
+                    device=self.device,
                 )
                 if self.model.include_size_factor:
                     log_sf = self.model.log_sf_embed(batch_idx).squeeze(-1)
