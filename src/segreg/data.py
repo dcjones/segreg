@@ -6,8 +6,14 @@ from spatialdata import SpatialData
 
 def load_proseg_data(
     data: SpatialData | AnnData,
-) -> tuple[AnnData, csr_matrix, csr_matrix, csr_matrix]:
-    """Extract expression, inflow, and outflow from a proseg AnnData/SpatialData."""
+    include_diffusion: bool = True,
+) -> tuple[AnnData, csr_matrix, csr_matrix | None, csr_matrix | None]:
+    """Extract expression, and optionally inflow/outflow, from an AnnData/SpatialData.
+
+    When include_diffusion is True, requires proseg data and reads inflow/outflow.
+    When False, skips the proseg check and returns None for inflow/outflow, allowing
+    general AnnData or SpatialData files to be used.
+    """
     if isinstance(data, AnnData):
         adata = data
     elif isinstance(data, SpatialData):
@@ -15,10 +21,17 @@ def load_proseg_data(
     else:
         raise ValueError("data must be an AnnData or SpatialData object")
 
-    if "proseg_run" not in adata.uns:
-        raise ValueError("This is not a proseg spatialdata file")
-
     X = adata.X.tocsr() if not isinstance(adata.X, csr_matrix) else adata.X
+
+    if not include_diffusion:
+        return adata, X, None, None
+
+    if "proseg_run" not in adata.uns:
+        raise ValueError(
+            "This is not a proseg spatialdata file. "
+            "Set include_diffusion=False to use general AnnData/SpatialData."
+        )
+
     inflow = adata.layers["expected_inflow"].tocsr()
     assert isinstance(inflow, csr_matrix)
     outflow = adata.layers["expected_outflow"].tocsr()
@@ -29,7 +42,7 @@ def load_proseg_data(
 
 def ols_init_beta(
     X: csr_matrix,
-    inflow: csr_matrix,
+    inflow: csr_matrix | None,
     design_np: np.ndarray,
     sf_col: np.ndarray,
     log_mean_expr: np.ndarray,
@@ -80,11 +93,14 @@ def ols_init_beta(
     interaction_base_scale = 10.0 / np.sqrt(m)
 
     # Suspect-Specific Shrinkage: genes where inflow dominates have high contamination
-    # potential and should be shrunk more aggressively.
-    avg_obs = np.asarray(X.mean(axis=0)).squeeze()
-    avg_inflow = np.asarray(inflow.mean(axis=0)).squeeze()
-    suspect_score = avg_inflow / (avg_obs + 1e-8)
-    suspect_shrinkage = 1.0 / (1.0 + 50.0 * suspect_score)
+    # potential and should be shrunk more aggressively. Only applies with proseg data.
+    if inflow is not None:
+        avg_obs = np.asarray(X.mean(axis=0)).squeeze()
+        avg_inflow = np.asarray(inflow.mean(axis=0)).squeeze()
+        suspect_score = avg_inflow / (avg_obs + 1e-8)
+        suspect_shrinkage = 1.0 / (1.0 + 50.0 * suspect_score)
+    else:
+        suspect_shrinkage = np.ones(n, dtype=np.float32)
 
     beta_prior_scale_matrix = np.zeros((len(covariate_names), n), dtype=np.float32)
     for i, name in enumerate(covariate_names):

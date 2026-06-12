@@ -44,7 +44,9 @@ class RegressionModel:
         beta_prior_scale: float = 1.0,
         inflow_scale_reg: float = 1.0,
     ):
-        adata, self.X, self.inflow, self.outflow = load_proseg_data(data)
+        adata, self.X, self.inflow, self.outflow = load_proseg_data(
+            data, include_diffusion
+        )
 
         self.m, self.n = adata.shape
         self.var_names = adata.var_names
@@ -270,7 +272,9 @@ class RegressionModel:
                     dtype=torch.float32,
                     device=self.device,
                 )
-                encoder_in, log_sf = self.model.prepare_encoder_input(x_sub_tensor, batch_idx)
+                encoder_in, log_sf = self.model.prepare_encoder_input(
+                    x_sub_tensor, batch_idx
+                )
                 mu, logstd = self.model.encoder(encoder_in)
                 std = torch.exp(logstd)
                 lam_sum = torch.zeros((batch_idx.size(0), self.n), device=self.device)
@@ -311,7 +315,9 @@ class RegressionModel:
                     dtype=torch.float32,
                     device=self.device,
                 )
-                encoder_in, _ = self.model.prepare_encoder_input(x_sub_tensor, batch_idx)
+                encoder_in, _ = self.model.prepare_encoder_input(
+                    x_sub_tensor, batch_idx
+                )
                 mu, _ = self.model.encoder(encoder_in)
                 all_mu.append(mu.cpu().numpy())
         return np.concatenate(all_mu, axis=0)

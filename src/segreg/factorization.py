@@ -35,7 +35,7 @@ class FactorizationModel:
         h_reg: float = 1.0,
         inflow_scale_reg: float = 1.0,
     ):
-        adata, self.X, self.inflow, self.outflow = load_proseg_data(data)
+        adata, self.X, self.inflow, self.outflow = load_proseg_data(data, include_diffusion)
 
         self.m, self.n = adata.shape
         self.var_names = adata.var_names
