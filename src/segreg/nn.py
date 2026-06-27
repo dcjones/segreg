@@ -84,11 +84,12 @@ class SegregBase(nn.Module):
         self.log_r = nn.Parameter(torch.full((n_genes,), 9.3))
 
         if include_diffusion:
-            # Per-gene learnable inflow scale: proseg inflow may systematically underestimate
-            # contamination for highly expressed neighboring-cell genes. A learned scale
-            # is identifiable because contamination genes are under-fitted (x_hat < x),
-            # while genuine DE genes are already well-explained by beta/z and stay near 1.
-            self.log_inflow_scale = nn.Parameter(torch.zeros(n_genes))
+            # alpha_g: shared per-gene leak coefficient calibrating how far to trust
+            # proseg's inflow/outflow estimates. alpha_g = 1 takes them at face value;
+            # it's identifiable because contamination genes are under-fitted by
+            # beta/z alone, while genuine DE genes already fit well and keep alpha
+            # near 1. Prior centered at alpha_g = 1, i.e. log_alpha = 0.
+            self.log_alpha = nn.Parameter(torch.zeros(n_genes))
 
     def reparameterize(self, mu, logstd):
         if self.training:
@@ -151,10 +152,10 @@ class SegregVAE(SegregBase):
         else:
             self.beta_logstd = nn.Parameter(torch.full((n_covariates, n_genes), -3.0))
 
-    def forward(self, x, covariates, inflow, outflow, log_size_factor=None):
-        mu, logstd = self.encoder(x)
-        z = self.reparameterize(mu, logstd)
-        rho = self.node_decoder(z)
+    def forward(self, x, covariates, inflow, phi, log_size_factor=None):
+        z_mu, z_logstd = self.encoder(x)
+        z = self.reparameterize(z_mu, z_logstd)
+        z_offset = self.node_decoder(z)
 
         if self.training:
             beta_std = torch.exp(self.beta_logstd.clamp(max=4.0))
@@ -162,18 +163,20 @@ class SegregVAE(SegregBase):
         else:
             beta = self.beta_mu
 
-        log_rate = rho + covariates @ beta + self.gene_bias
+        log_rate = z_offset + covariates @ beta + self.gene_bias
         if self.include_size_factor and log_size_factor is not None:
             log_rate = log_rate + log_size_factor.unsqueeze(-1)
         lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
 
         if self.include_diffusion:
-            inflow_scale = torch.exp(self.log_inflow_scale)
-            x_hat = lam + inflow_scale * inflow + self.rate_offset
+            alpha = torch.exp(self.log_alpha)
+            retention = torch.exp(-alpha * phi)
+            delta = alpha * inflow
+            mu = retention * lam + delta + self.rate_offset
         else:
-            x_hat = lam + self.rate_offset
+            mu = lam + self.rate_offset
 
-        return x_hat, mu, logstd, beta
+        return mu, z_mu, z_logstd, beta
 
 
 class SegregFactorizationVAE(SegregBase):
@@ -213,23 +216,25 @@ class SegregFactorizationVAE(SegregBase):
         encoder_in: torch.Tensor,
         batch_idx: torch.Tensor,
         inflow: torch.Tensor | None,
-        outflow: torch.Tensor | None,
+        phi: torch.Tensor | None,
         log_size_factor: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu, logstd = self.encoder(encoder_in)
-        z = self.reparameterize(mu, logstd)
-        rho = self.node_decoder(z)
+        z_mu, z_logstd = self.encoder(encoder_in)
+        z = self.reparameterize(z_mu, z_logstd)
+        z_offset = self.node_decoder(z)
 
         W = self.W_embed(batch_idx)  # (batch, n_factors)
-        log_rate = rho + W @ self.H + self.gene_bias
+        log_rate = z_offset + W @ self.H + self.gene_bias
         if self.include_size_factor and log_size_factor is not None:
             log_rate = log_rate + log_size_factor.unsqueeze(-1)
         lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
 
         if self.include_diffusion:
-            inflow_scale = torch.exp(self.log_inflow_scale)
-            x_hat = lam + inflow_scale * inflow + self.rate_offset
+            alpha = torch.exp(self.log_alpha)
+            retention = torch.exp(-alpha * phi)
+            delta = alpha * inflow
+            mu = retention * lam + delta + self.rate_offset
         else:
-            x_hat = lam + self.rate_offset
+            mu = lam + self.rate_offset
 
-        return x_hat, mu, logstd, W
+        return mu, z_mu, z_logstd, W

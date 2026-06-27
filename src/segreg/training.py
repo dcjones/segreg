@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
-from .losses import inflow_scale_loss, kl_z, nb_loss, size_factor_loss
+from .losses import alpha_loss, kl_z, nb_loss, size_factor_loss
 from .nn import SegregFactorizationVAE, SegregVAE
 
 
@@ -14,14 +14,14 @@ class SegregTrainingWrapper(nn.Module):
         beta_prior_scale: torch.Tensor,
         m: int,
         sf_sigma: float,
-        inflow_scale_reg: float = 0.1,
+        alpha_reg: float = 0.1,
     ):
         super().__init__()
         self.model = model
         self.register_buffer("beta_prior_scale", beta_prior_scale)
         self.m = m
         self.sf_sigma = sf_sigma
-        self.inflow_scale_reg = inflow_scale_reg
+        self.alpha_reg = alpha_reg
 
     def forward(
         self,
@@ -30,21 +30,21 @@ class SegregTrainingWrapper(nn.Module):
         batch_log_sf_prior,
         x_sub_tensor,
         inflow_sub,
-        outflow_sub,
+        phi_sub,
         current_beta_kl: torch.Tensor,
     ):
         encoder_in, log_sf = self.model.prepare_encoder_input(x_sub_tensor, batch_idx)
 
-        x_hat, mu, logstd, beta = self.model(
+        mu_hat, z_mu, z_logstd, beta = self.model(
             encoder_in,
             batch_x,
             inflow=inflow_sub,
-            outflow=outflow_sub,
+            phi=phi_sub,
             log_size_factor=log_sf,
         )
 
-        loss_recon = nb_loss(x_sub_tensor, x_hat, self.model.log_r)
-        kl_z_val = kl_z(mu, logstd)
+        loss_recon = nb_loss(x_sub_tensor, mu_hat, self.model.log_r)
+        kl_z_val = kl_z(z_mu, z_logstd)
 
         beta_f = beta.float()
         gamma = self.beta_prior_scale
@@ -62,16 +62,14 @@ class SegregTrainingWrapper(nn.Module):
         if self.model.include_size_factor and log_sf is not None:
             loss_sf = size_factor_loss(log_sf, batch_log_sf_prior, self.sf_sigma)
         else:
-            loss_sf = torch.tensor(0.0, device=x_hat.device)
+            loss_sf = torch.tensor(0.0, device=mu_hat.device)
 
         if self.model.include_diffusion:
-            loss_inflow_scale = inflow_scale_loss(
-                self.model.log_inflow_scale, self.inflow_scale_reg
-            )
+            loss_alpha = alpha_loss(self.model.log_alpha, self.alpha_reg)
         else:
-            loss_inflow_scale = torch.tensor(0.0, device=x_hat.device)
+            loss_alpha = torch.tensor(0.0, device=mu_hat.device)
 
-        loss = loss_recon + (current_beta_kl * kl_z_val) + kl_beta + loss_sf + loss_inflow_scale
+        loss = loss_recon + (current_beta_kl * kl_z_val) + kl_beta + loss_sf + loss_alpha
         return loss, loss_recon
 
 
@@ -83,7 +81,7 @@ class FactorizationTrainingWrapper(nn.Module):
         sf_sigma: float,
         w_reg: float = 1.0,
         h_reg: float = 1.0,
-        inflow_scale_reg: float = 0.1,
+        alpha_reg: float = 0.1,
     ):
         super().__init__()
         self.model = model
@@ -91,7 +89,7 @@ class FactorizationTrainingWrapper(nn.Module):
         self.sf_sigma = sf_sigma
         self.w_reg = w_reg
         self.h_reg = h_reg
-        self.inflow_scale_reg = inflow_scale_reg
+        self.alpha_reg = alpha_reg
 
     def forward(
         self,
@@ -99,21 +97,21 @@ class FactorizationTrainingWrapper(nn.Module):
         batch_log_sf_prior,
         x_sub_tensor,
         inflow_sub,
-        outflow_sub,
+        phi_sub,
         current_kl_weight: torch.Tensor,
     ):
         encoder_in, log_sf = self.model.prepare_encoder_input(x_sub_tensor, batch_idx)
 
-        x_hat, mu, logstd, W = self.model(
+        mu_hat, z_mu, z_logstd, W = self.model(
             encoder_in,
             batch_idx,
             inflow=inflow_sub,
-            outflow=outflow_sub,
+            phi=phi_sub,
             log_size_factor=log_sf,
         )
 
-        loss_recon = nb_loss(x_sub_tensor, x_hat, self.model.log_r)
-        kl_z_val = kl_z(mu, logstd)
+        loss_recon = nb_loss(x_sub_tensor, mu_hat, self.model.log_r)
+        kl_z_val = kl_z(z_mu, z_logstd)
 
         loss_w = self.w_reg * W.pow(2).mean()
         loss_h = self.h_reg * self.model.H.pow(2).mean()
@@ -121,14 +119,12 @@ class FactorizationTrainingWrapper(nn.Module):
         if self.model.include_size_factor and log_sf is not None:
             loss_sf = size_factor_loss(log_sf, batch_log_sf_prior, self.sf_sigma)
         else:
-            loss_sf = torch.tensor(0.0, device=x_hat.device)
+            loss_sf = torch.tensor(0.0, device=mu_hat.device)
 
         if self.model.include_diffusion:
-            loss_inflow_scale = inflow_scale_loss(
-                self.model.log_inflow_scale, self.inflow_scale_reg
-            )
+            loss_alpha = alpha_loss(self.model.log_alpha, self.alpha_reg)
         else:
-            loss_inflow_scale = torch.tensor(0.0, device=x_hat.device)
+            loss_alpha = torch.tensor(0.0, device=mu_hat.device)
 
-        loss = loss_recon + current_kl_weight * kl_z_val + loss_w + loss_h + loss_sf + loss_inflow_scale
+        loss = loss_recon + current_kl_weight * kl_z_val + loss_w + loss_h + loss_sf + loss_alpha
         return loss, loss_recon

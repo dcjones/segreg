@@ -6,7 +6,7 @@ from spatialdata import SpatialData
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from .data import load_proseg_data
+from .data import estimate_phi, load_proseg_data
 from .nn import SegregFactorizationVAE
 from .training import FactorizationTrainingWrapper
 
@@ -33,7 +33,7 @@ class FactorizationModel:
         latent_dim: int = 64,
         w_reg: float = 1.0,
         h_reg: float = 1.0,
-        inflow_scale_reg: float = 1.0,
+        alpha_reg: float = 1.0,
     ):
         adata, self.X, self.inflow, self.outflow = load_proseg_data(data, include_diffusion)
 
@@ -54,7 +54,7 @@ class FactorizationModel:
         self.sf_sigma = sf_sigma
         self.w_reg = w_reg
         self.h_reg = h_reg
-        self.inflow_scale_reg = inflow_scale_reg
+        self.alpha_reg = alpha_reg
 
         sf_col = np.exp(log_size_factors).reshape(-1, 1)
         mean_expr_raw = np.asarray(self.X.mean(axis=0)).squeeze().astype(np.float32)
@@ -109,7 +109,7 @@ class FactorizationModel:
             self.sf_sigma,
             w_reg=self.w_reg,
             h_reg=self.h_reg,
-            inflow_scale_reg=self.inflow_scale_reg,
+            alpha_reg=self.alpha_reg,
         )
 
         if compile:
@@ -150,11 +150,13 @@ class FactorizationModel:
                         .toarray()
                         .astype(np.float32)
                     )
+                    phi_sub = estimate_phi(x_sub, inflow_sub, outflow_sub)
+
                     inflow_sub_tensor = torch.from_numpy(inflow_sub).to(self.device)
-                    outflow_sub_tensor = torch.from_numpy(outflow_sub).to(self.device)
+                    phi_sub_tensor = torch.from_numpy(phi_sub).to(self.device)
                 else:
                     inflow_sub_tensor = None
-                    outflow_sub_tensor = None
+                    phi_sub_tensor = None
 
                 with torch.autocast(
                     device_type=self.device.type, dtype=amp_dtype, enabled=use_amp
@@ -164,7 +166,7 @@ class FactorizationModel:
                         batch_log_sf_prior,
                         x_sub_tensor,
                         inflow_sub_tensor,
-                        outflow_sub_tensor,
+                        phi_sub_tensor,
                         current_kl_t,
                     )
 
@@ -208,14 +210,14 @@ class FactorizationModel:
                     device=self.device,
                 )
                 encoder_in, log_sf = self.model.prepare_encoder_input(x_sub_tensor, batch_idx)
-                mu, logstd = self.model.encoder(encoder_in)
-                std = torch.exp(logstd)
+                z_mu, z_logstd = self.model.encoder(encoder_in)
+                std = torch.exp(z_logstd)
                 lam_sum = torch.zeros((batch_idx.size(0), self.n), device=self.device)
                 for _ in range(n_samples):
-                    z = mu + torch.randn_like(std) * std
-                    rho = self.model.node_decoder(z)
+                    z = z_mu + torch.randn_like(std) * std
+                    z_offset = self.model.node_decoder(z)
                     W = self.model.W_embed(batch_idx)
-                    log_rate = rho + W @ self.model.H + self.model.gene_bias
+                    log_rate = z_offset + W @ self.model.H + self.model.gene_bias
                     if self.model.include_size_factor and log_sf is not None:
                         log_rate = log_rate + log_sf.unsqueeze(-1)
                     lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
@@ -240,7 +242,7 @@ class FactorizationModel:
             batch_size=batch_size,
             shuffle=False,
         )
-        all_mu = []
+        all_z_mu = []
         with torch.no_grad():
             for batch_idx, _ in loader:
                 batch_idx = batch_idx.to(self.device)
@@ -250,6 +252,6 @@ class FactorizationModel:
                     device=self.device,
                 )
                 encoder_in, _ = self.model.prepare_encoder_input(x_sub_tensor, batch_idx)
-                mu, _ = self.model.encoder(encoder_in)
-                all_mu.append(mu.cpu().numpy())
-        return np.concatenate(all_mu, axis=0)
+                z_mu, _ = self.model.encoder(encoder_in)
+                all_z_mu.append(z_mu.cpu().numpy())
+        return np.concatenate(all_z_mu, axis=0)

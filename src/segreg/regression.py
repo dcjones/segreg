@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch_geometric.data import Data
 from tqdm import tqdm
 
-from .data import load_proseg_data, ols_init_beta
+from .data import estimate_phi, load_proseg_data, ols_init_beta
 from .nn import SegregVAE
 from .training import SegregTrainingWrapper
 
@@ -42,7 +42,7 @@ class RegressionModel:
         latent_dim: int = 64,
         kappa: float = 1000.0,
         beta_prior_scale: float = 1.0,
-        inflow_scale_reg: float = 1.0,
+        alpha_reg: float = 1.0,
     ):
         adata, self.X, self.inflow, self.outflow = load_proseg_data(
             data, include_diffusion
@@ -73,7 +73,7 @@ class RegressionModel:
         )
 
         self.sf_sigma = sf_sigma
-        self.inflow_scale_reg = inflow_scale_reg
+        self.alpha_reg = alpha_reg
         self.include_size_factor = include_size_factor
 
         sf_col = np.exp(log_size_factors).reshape(-1, 1)
@@ -154,7 +154,7 @@ class RegressionModel:
             self.beta_prior_scale_t,
             self.m,
             self.sf_sigma,
-            inflow_scale_reg=self.inflow_scale_reg,
+            alpha_reg=self.alpha_reg,
         )
 
         if compile:
@@ -198,12 +198,13 @@ class RegressionModel:
                         .toarray()
                         .astype(np.float32)
                     )
+                    phi_sub = estimate_phi(x_sub, inflow_sub, outflow_sub)
 
                     inflow_sub_tensor = torch.from_numpy(inflow_sub).to(self.device)
-                    outflow_sub_tensor = torch.from_numpy(outflow_sub).to(self.device)
+                    phi_sub_tensor = torch.from_numpy(phi_sub).to(self.device)
                 else:
                     inflow_sub_tensor = None
-                    outflow_sub_tensor = None
+                    phi_sub_tensor = None
 
                 with torch.autocast(
                     device_type=self.device.type, dtype=amp_dtype, enabled=use_amp
@@ -214,7 +215,7 @@ class RegressionModel:
                         batch_log_sf_prior,
                         x_sub_tensor,
                         inflow_sub_tensor,
-                        outflow_sub_tensor,
+                        phi_sub_tensor,
                         current_beta_kl_t,
                     )
 
@@ -275,13 +276,13 @@ class RegressionModel:
                 encoder_in, log_sf = self.model.prepare_encoder_input(
                     x_sub_tensor, batch_idx
                 )
-                mu, logstd = self.model.encoder(encoder_in)
-                std = torch.exp(logstd)
+                z_mu, z_logstd = self.model.encoder(encoder_in)
+                std = torch.exp(z_logstd)
                 lam_sum = torch.zeros((batch_idx.size(0), self.n), device=self.device)
                 for _ in range(n_samples):
-                    z = mu + torch.randn_like(std) * std
-                    rho = self.model.node_decoder(z)
-                    log_rate = rho + batch_x @ self.model.beta_mu + self.model.gene_bias
+                    z = z_mu + torch.randn_like(std) * std
+                    z_offset = self.model.node_decoder(z)
+                    log_rate = z_offset + batch_x @ self.model.beta_mu + self.model.gene_bias
                     if self.model.include_size_factor and log_sf is not None:
                         log_rate = log_rate + log_sf.unsqueeze(-1)
                     lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
@@ -306,7 +307,7 @@ class RegressionModel:
             batch_size=batch_size,
             shuffle=False,
         )
-        all_mu = []
+        all_z_mu = []
         with torch.no_grad():
             for batch_idx, batch_x in loader:
                 batch_idx, batch_x = batch_idx.to(self.device), batch_x.to(self.device)
@@ -318,6 +319,6 @@ class RegressionModel:
                 encoder_in, _ = self.model.prepare_encoder_input(
                     x_sub_tensor, batch_idx
                 )
-                mu, _ = self.model.encoder(encoder_in)
-                all_mu.append(mu.cpu().numpy())
-        return np.concatenate(all_mu, axis=0)
+                z_mu, _ = self.model.encoder(encoder_in)
+                all_z_mu.append(z_mu.cpu().numpy())
+        return np.concatenate(all_z_mu, axis=0)

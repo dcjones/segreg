@@ -40,6 +40,20 @@ def load_proseg_data(
     return adata, X, inflow, outflow
 
 
+def estimate_phi(X: np.ndarray, inflow: np.ndarray, outflow: np.ndarray) -> np.ndarray:
+    """Estimate phi_cg, the fraction of a cell's true transcripts lost to neighbors.
+
+    T_cg = X_cg + outflow_cg - inflow_cg is the true-count identity from the paper,
+    and phi_cg = outflow_cg / T_cg (taking phi_cg = 0 where T_cg <= 0, which also
+    guards against estimation noise pushing T below zero).
+    """
+    T = X + outflow - inflow
+    phi = np.zeros_like(outflow)
+    mask = T > 0
+    phi[mask] = outflow[mask] / T[mask]
+    return np.clip(phi, 0.0, 1.0)
+
+
 def ols_init_beta(
     X: csr_matrix,
     inflow: csr_matrix | None,
