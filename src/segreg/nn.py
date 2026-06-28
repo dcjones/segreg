@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class Encoder(nn.Module):
     """
-    Node-based Encoder with LayerNorm.
-    Takes gene counts and design covariates,
-    and outputs parameters for the latent normal distribution (mu, logstd).
+    Stochastic encoder for SegregVAE.
+    Outputs parameters for the latent normal distribution (mu, logstd).
     """
 
     def __init__(
@@ -32,6 +32,27 @@ class Encoder(nn.Module):
         return mu, logstd
 
 
+class DeterministicEncoder(nn.Module):
+    """Deterministic encoder: maps input directly to latent z without stochastic sampling."""
+
+    def __init__(
+        self, in_channels: int, hidden_channels: int = 128, latent_dim: int = 64
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.ReLU(),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.ReLU(),
+            nn.Linear(hidden_channels, latent_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class NodeDecoder(nn.Module):
     """
     Decodes the node latent representation back into unconstrained expression rates (rho).
@@ -48,7 +69,12 @@ class NodeDecoder(nn.Module):
 
 
 class SegregBase(nn.Module):
-    """Shared VAE backbone: encoder, decoder, gene_bias, log_r, size factor, inflow scale."""
+    """Shared backbone: gene_bias, log_r, size factor, inflow scale.
+
+    Subclasses that use the stochastic Encoder/NodeDecoder should pass
+    create_encoder_decoder=True (the default). SegregFactorizationVAE
+    uses its own DeterministicEncoder and skips the node decoder.
+    """
 
     def __init__(
         self,
@@ -62,14 +88,16 @@ class SegregBase(nn.Module):
         include_size_factor: bool = True,
         log_mean_expr: torch.Tensor | None = None,
         log_sf_prior: torch.Tensor | None = None,
+        create_encoder_decoder: bool = True,
     ):
         super().__init__()
         self.include_diffusion = include_diffusion
         self.include_size_factor = include_size_factor
         self.rate_offset = rate_offset
 
-        self.encoder = Encoder(encoder_in_channels, hidden_channels, latent_dim)
-        self.node_decoder = NodeDecoder(latent_dim, hidden_channels, n_genes)
+        if create_encoder_decoder:
+            self.encoder = Encoder(encoder_in_channels, hidden_channels, latent_dim)
+            self.node_decoder = NodeDecoder(latent_dim, hidden_channels, n_genes)
 
         if self.include_size_factor:
             self.log_sf_embed = nn.Embedding(n_cells, 1)
@@ -84,11 +112,6 @@ class SegregBase(nn.Module):
         self.log_r = nn.Parameter(torch.full((n_genes,), 9.3))
 
         if include_diffusion:
-            # alpha_g: shared per-gene leak coefficient calibrating how far to trust
-            # proseg's inflow/outflow estimates. alpha_g = 1 takes them at face value;
-            # it's identifiable because contamination genes are under-fitted by
-            # beta/z alone, while genuine DE genes already fit well and keep alpha
-            # near 1. Prior centered at alpha_g = 1, i.e. log_alpha = 0.
             self.log_alpha = nn.Parameter(torch.zeros(n_genes))
 
     def reparameterize(self, mu, logstd):
@@ -185,51 +208,57 @@ class SegregFactorizationVAE(SegregBase):
         n_cells: int,
         n_genes: int,
         n_factors: int,
-        hidden_channels: int = 64,
-        latent_dim: int = 32,
         rate_offset: float = 1e-2,
         include_diffusion: bool = True,
         include_size_factor: bool = True,
         log_mean_expr: torch.Tensor | None = None,
         log_sf_prior: torch.Tensor | None = None,
+        init_method: str = "normal",
+        h_init: torch.Tensor | None = None,
     ):
-        # W is per-cell and looked up by index, not fed to the encoder
         super().__init__(
             n_cells=n_cells,
             n_genes=n_genes,
             encoder_in_channels=n_genes,
-            hidden_channels=hidden_channels,
-            latent_dim=latent_dim,
             rate_offset=rate_offset,
             include_diffusion=include_diffusion,
             include_size_factor=include_size_factor,
             log_mean_expr=log_mean_expr,
             log_sf_prior=log_sf_prior,
+            create_encoder_decoder=False,
         )
         self.n_factors = n_factors
+
         self.W_embed = nn.Embedding(n_cells, n_factors)
         nn.init.normal_(self.W_embed.weight, std=0.1)
-        self.H = nn.Parameter(torch.randn(n_factors, n_genes) * 0.01)
+
+        if h_init is not None:
+            self.H = nn.Parameter(h_init.clone())
+        elif init_method == "normal":
+            self.H = nn.Parameter(torch.randn(n_factors, n_genes) * 0.01)
+        else:
+            raise ValueError(f"Unknown init_method: {init_method}")
+
+        if hasattr(self, "log_r"):
+            nn.init.constant_(self.log_r, 0.1)
 
     def forward(
         self,
-        encoder_in: torch.Tensor,
         batch_idx: torch.Tensor,
         inflow: torch.Tensor | None,
         phi: torch.Tensor | None,
         log_size_factor: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        z_mu, z_logstd = self.encoder(encoder_in)
-        z = self.reparameterize(z_mu, z_logstd)
-        z_offset = self.node_decoder(z)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        W = F.softplus(self.W_embed(batch_idx))
+        H = F.softplus(self.H)
 
-        W = self.W_embed(batch_idx)  # (batch, n_factors)
-        log_rate = z_offset + W @ self.H + self.gene_bias
+        log_rate = W @ H + self.gene_bias
         if self.include_size_factor and log_size_factor is not None:
             log_rate = log_rate + log_size_factor.unsqueeze(-1)
         lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
 
         if self.include_diffusion:
+            assert inflow is not None and phi is not None
             alpha = torch.exp(self.log_alpha)
             retention = torch.exp(-alpha * phi)
             delta = alpha * inflow
@@ -237,4 +266,4 @@ class SegregFactorizationVAE(SegregBase):
         else:
             mu = lam + self.rate_offset
 
-        return mu, z_mu, z_logstd, W
+        return mu, W, H

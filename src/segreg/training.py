@@ -3,7 +3,14 @@ import math
 import torch
 import torch.nn as nn
 
-from .losses import alpha_loss, kl_z, nb_loss, size_factor_loss
+from .losses import (
+    alpha_loss,
+    gamma_prior_loss,
+    kl_z,
+    metagene_correlation_loss,
+    nb_loss,
+    size_factor_loss,
+)
 from .nn import SegregFactorizationVAE, SegregVAE
 
 
@@ -79,17 +86,21 @@ class FactorizationTrainingWrapper(nn.Module):
         model: SegregFactorizationVAE,
         m: int,
         sf_sigma: float,
-        w_reg: float = 1.0,
-        h_reg: float = 1.0,
-        alpha_reg: float = 0.1,
+        r_weight: float,
+        r_prior_alpha: float = 2.0,
+        r_prior_beta: float = 2.0,
+        alpha_reg: float = 1.0,
+        metagene_reg_strength: float = 0.01,
     ):
         super().__init__()
         self.model = model
         self.m = m
         self.sf_sigma = sf_sigma
-        self.w_reg = w_reg
-        self.h_reg = h_reg
+        self.r_weight = r_weight
+        self.r_prior_alpha = r_prior_alpha
+        self.r_prior_beta = r_prior_beta
         self.alpha_reg = alpha_reg
+        self.metagene_reg_strength = metagene_reg_strength
 
     def forward(
         self,
@@ -98,12 +109,10 @@ class FactorizationTrainingWrapper(nn.Module):
         x_sub_tensor,
         inflow_sub,
         phi_sub,
-        current_kl_weight: torch.Tensor,
     ):
-        encoder_in, log_sf = self.model.prepare_encoder_input(x_sub_tensor, batch_idx)
+        _, log_sf = self.model.prepare_encoder_input(x_sub_tensor, batch_idx)
 
-        mu_hat, z_mu, z_logstd, W = self.model(
-            encoder_in,
+        mu_hat, W, H = self.model(
             batch_idx,
             inflow=inflow_sub,
             phi=phi_sub,
@@ -111,10 +120,10 @@ class FactorizationTrainingWrapper(nn.Module):
         )
 
         loss_recon = nb_loss(x_sub_tensor, mu_hat, self.model.log_r)
-        kl_z_val = kl_z(z_mu, z_logstd)
 
-        loss_w = self.w_reg * W.pow(2).mean()
-        loss_h = self.h_reg * self.model.H.pow(2).mean()
+        loss_r_prior = gamma_prior_loss(
+            self.model.log_r, self.r_prior_alpha, self.r_prior_beta, self.r_weight
+        )
 
         if self.model.include_size_factor and log_sf is not None:
             loss_sf = size_factor_loss(log_sf, batch_log_sf_prior, self.sf_sigma)
@@ -126,5 +135,7 @@ class FactorizationTrainingWrapper(nn.Module):
         else:
             loss_alpha = torch.tensor(0.0, device=mu_hat.device)
 
-        loss = loss_recon + current_kl_weight * kl_z_val + loss_w + loss_h + loss_sf + loss_alpha
+        loss_metagene = metagene_correlation_loss(H, self.metagene_reg_strength)
+
+        loss = loss_recon + loss_r_prior + loss_sf + loss_alpha + loss_metagene
         return loss, loss_recon
