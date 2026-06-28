@@ -4,6 +4,12 @@ import torch
 import torch.nn.functional as F
 
 
+def poisson_loss(x_sub_tensor, mu):
+    """Poisson negative log-likelihood, summed over genes, averaged over cells."""
+    mu_f = mu.float()
+    return (mu_f - x_sub_tensor * torch.log(mu_f.clamp(min=1e-8))).sum(dim=-1).mean()
+
+
 def nb_loss(x_sub_tensor, mu, log_r):
     """Negative binomial reconstruction loss, summed over genes, averaged over cells.
 

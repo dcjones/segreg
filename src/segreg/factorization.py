@@ -83,6 +83,7 @@ class FactorizationModel:
         r_prior_beta: float = 2.0,
         metagene_reg_strength: float = 0.01,
         init_method: str = "nndsvd",
+        likelihood: str = "poisson",
     ):
         adata, self.X, self.inflow, self.outflow = load_proseg_data(data, include_diffusion)
 
@@ -105,6 +106,7 @@ class FactorizationModel:
         self.r_prior_alpha = r_prior_alpha
         self.r_prior_beta = r_prior_beta
         self.metagene_reg_strength = metagene_reg_strength
+        self.likelihood = likelihood
 
         sf_col = np.exp(log_size_factors).reshape(-1, 1)
         mean_expr_raw = np.asarray(self.X.mean(axis=0)).squeeze().astype(np.float32)
@@ -192,6 +194,7 @@ class FactorizationModel:
             r_prior_beta=self.r_prior_beta,
             alpha_reg=self.alpha_reg,
             metagene_reg_strength=self.metagene_reg_strength,
+            likelihood=self.likelihood,
         )
 
         if compile:

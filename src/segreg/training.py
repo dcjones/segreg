@@ -9,6 +9,7 @@ from .losses import (
     kl_z,
     metagene_correlation_loss,
     nb_loss,
+    poisson_loss,
     size_factor_loss,
 )
 from .nn import SegregFactorizationVAE, SegregVAE
@@ -91,6 +92,7 @@ class FactorizationTrainingWrapper(nn.Module):
         r_prior_beta: float = 2.0,
         alpha_reg: float = 1.0,
         metagene_reg_strength: float = 0.01,
+        likelihood: str = "poisson",
     ):
         super().__init__()
         self.model = model
@@ -101,6 +103,7 @@ class FactorizationTrainingWrapper(nn.Module):
         self.r_prior_beta = r_prior_beta
         self.alpha_reg = alpha_reg
         self.metagene_reg_strength = metagene_reg_strength
+        self.likelihood = likelihood
 
     def forward(
         self,
@@ -119,11 +122,14 @@ class FactorizationTrainingWrapper(nn.Module):
             log_size_factor=log_sf,
         )
 
-        loss_recon = nb_loss(x_sub_tensor, mu_hat, self.model.log_r)
-
-        loss_r_prior = gamma_prior_loss(
-            self.model.log_r, self.r_prior_alpha, self.r_prior_beta, self.r_weight
-        )
+        if self.likelihood == "poisson":
+            loss_recon = poisson_loss(x_sub_tensor, mu_hat)
+            loss_r_prior = torch.tensor(0.0, device=mu_hat.device)
+        else:
+            loss_recon = nb_loss(x_sub_tensor, mu_hat, self.model.log_r)
+            loss_r_prior = gamma_prior_loss(
+                self.model.log_r, self.r_prior_alpha, self.r_prior_beta, self.r_weight
+            )
 
         if self.model.include_size_factor and log_sf is not None:
             loss_sf = size_factor_loss(log_sf, batch_log_sf_prior, self.sf_sigma)
