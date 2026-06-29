@@ -93,6 +93,7 @@ class FactorizationTrainingWrapper(nn.Module):
         alpha_reg: float = 1.0,
         metagene_reg_strength: float = 0.01,
         likelihood: str = "poisson",
+        gene_expression: torch.Tensor | None = None,
     ):
         super().__init__()
         self.model = model
@@ -104,6 +105,10 @@ class FactorizationTrainingWrapper(nn.Module):
         self.alpha_reg = alpha_reg
         self.metagene_reg_strength = metagene_reg_strength
         self.likelihood = likelihood
+        if gene_expression is not None:
+            self.register_buffer("gene_expression", gene_expression)
+        else:
+            self.gene_expression = None
 
     def forward(
         self,
@@ -137,7 +142,8 @@ class FactorizationTrainingWrapper(nn.Module):
             loss_sf = torch.tensor(0.0, device=mu_hat.device)
 
         if self.model.include_diffusion:
-            loss_alpha = alpha_loss(self.model.log_alpha, self.alpha_reg)
+            gene_expr = self.gene_expression.to(mu_hat.device) if self.gene_expression is not None else None
+            loss_alpha = alpha_loss(self.model.log_alpha, self.alpha_reg, gene_expr)
         else:
             loss_alpha = torch.tensor(0.0, device=mu_hat.device)
 

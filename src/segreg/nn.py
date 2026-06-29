@@ -112,7 +112,7 @@ class SegregBase(nn.Module):
         self.log_r = nn.Parameter(torch.full((n_genes,), 9.3))
 
         if include_diffusion:
-            self.log_alpha = nn.Parameter(torch.zeros(n_genes))
+            self.log_alpha = nn.Parameter(torch.full((n_genes,), -3.0))
 
     def reparameterize(self, mu, logstd):
         if self.training:
@@ -192,7 +192,8 @@ class SegregVAE(SegregBase):
         lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
 
         if self.include_diffusion:
-            alpha = torch.exp(self.log_alpha)
+            assert inflow is not None and phi is not None
+            alpha = torch.sigmoid(self.log_alpha)
             retention = torch.exp(-alpha * phi)
             delta = alpha * inflow
             mu = retention * lam + delta + self.rate_offset
@@ -259,7 +260,7 @@ class SegregFactorizationVAE(SegregBase):
 
         if self.include_diffusion:
             assert inflow is not None and phi is not None
-            alpha = torch.exp(self.log_alpha)
+            alpha = torch.sigmoid(self.log_alpha)
             retention = torch.exp(-alpha * phi)
             delta = alpha * inflow
             mu = retention * lam + delta + self.rate_offset

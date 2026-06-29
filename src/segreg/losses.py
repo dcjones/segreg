@@ -43,9 +43,13 @@ def size_factor_loss(log_sf, batch_log_sf_prior, sf_sigma):
     return (log_sf - batch_log_sf_prior).pow(2).mean() / (2 * sf_sigma**2)
 
 
-def alpha_loss(log_alpha, alpha_reg):
-    """Penalty pulling alpha_g (shared inflow/outflow leak coefficient) toward 1."""
-    return alpha_reg * log_alpha.pow(2).mean()
+def alpha_loss(log_alpha, alpha_reg, gene_expression=None):
+    """Penalty on sigmoid(alpha), optionally weighted by inverse expression."""
+    alpha = torch.sigmoid(log_alpha)
+    if gene_expression is not None:
+        weight = 1.0 / torch.sqrt(gene_expression + 1.0)
+        return alpha_reg * (alpha ** 2 * weight).sum()
+    return alpha_reg * (alpha ** 2).sum()
 
 
 def gamma_prior_loss(log_r, alpha, beta, r_weight):

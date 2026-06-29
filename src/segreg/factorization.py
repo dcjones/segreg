@@ -78,7 +78,7 @@ class FactorizationModel:
         include_size_factor: bool = True,
         sf_sigma: float = 0.5,
         rate_offset: float = 1e-2,
-        alpha_reg: float = 1.0,
+        alpha_reg: float = 100.0,
         r_prior_alpha: float = 2.0,
         r_prior_beta: float = 2.0,
         metagene_reg_strength: float = 0.01,
@@ -118,6 +118,8 @@ class FactorizationModel:
             log_mean_expr = torch.tensor(
                 np.log(mean_expr_raw + 1e-4), dtype=torch.float32
             )
+
+        self.gene_expression = torch.tensor(mean_expr_raw, dtype=torch.float32)
 
         h_init = None
         if init_method == "nndsvd":
@@ -195,6 +197,7 @@ class FactorizationModel:
             alpha_reg=self.alpha_reg,
             metagene_reg_strength=self.metagene_reg_strength,
             likelihood=self.likelihood,
+            gene_expression=None,
         )
 
         if compile:
