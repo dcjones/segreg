@@ -1,18 +1,24 @@
 import math
+import warnings
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from anndata import AnnData
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import svds
 from spatialdata import SpatialData
-from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from .data import estimate_phi, load_proseg_data
-from .nn import SegregFactorizationVAE
+from .data import SparseBatchSampler, estimate_phi, load_proseg_data
 from .training import FactorizationTrainingWrapper
+
+warnings.filterwarnings(
+    "ignore",
+    message="Sparse CSR tensor support is in beta state",
+    category=UserWarning,
+)
 
 
 def _nndsvd_h_init(X: csr_matrix, k: int, init_ncells: int = 10000) -> np.ndarray:
@@ -60,12 +66,137 @@ def _nndsvd_h_init(X: csr_matrix, k: int, init_ncells: int = 10000) -> np.ndarra
     return np.log(H_norm).astype(np.float32)
 
 
+class SparseLinear(nn.Module):
+    """
+    Linear layer that handles both sparse CSR and dense input.
+    Weight is stored as [in_features, out_features] for torch.sparse.mm compatibility.
+    Initialized with LeCun normal (std = sqrt(1/fan_in)).
+    """
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(in_features, out_features))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        std = math.sqrt(1.0 / in_features)
+        nn.init.normal_(self.weight, 0.0, std)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.layout == torch.sparse_csr:
+            return torch.sparse.mm(x, self.weight) + self.bias
+        return x @ self.weight + self.bias
+
+
+class SparseFactorizationEncoder(nn.Module):
+    """
+    Very simple encoder that maps a sparse count matrix into metagene rates.
+    """
+
+    def __init__(self, n: int, k: int):
+        super().__init__()
+        self.layer = SparseLinear(n, k)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        return F.softplus(self.layer(X))
+
+
+class FactorizationVAE(nn.Module):
+    def __init__(
+        self, n: int, k: int, v_init: np.ndarray | None, include_diffusion: bool
+    ):
+        super().__init__()
+
+        if v_init is None:
+            v = torch.empty(k, n)
+            nn.init.normal_(v, std=1.0 / math.sqrt(n))
+            self.v = nn.Parameter(v)
+        else:
+            self.v = nn.Parameter(torch.from_numpy(v_init))
+
+        self.encoder = SparseFactorizationEncoder(n, k)
+        self.include_diffusion = include_diffusion
+        if include_diffusion:
+            self.log_α = nn.Parameter(torch.full((n,), -3.0))
+
+    def v_norm(self) -> torch.Tensor:
+        return F.softmax(self.v, dim=1)
+
+    def forward(
+        self, X: torch.Tensor, inflow: torch.Tensor | None, φ: torch.Tensor | None
+    ):
+        u = self.encoder(X)
+        λ = u @ self.v_norm()
+
+        if self.include_diffusion:
+            assert inflow is not None and φ is not None
+            α = torch.sigmoid(self.log_α)
+            retension = torch.exp(-α * φ.to_dense())
+            δ = α * inflow.to_dense()
+            λ = retension * λ + δ
+
+        return u, λ
+
+    def metagene_regularization(self):
+        pass
+
+
+def _sparse_row_col_indices(
+    X: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (row_idx, col_idx) arrays indexing every non-zero element in a sparse_csr_tensor."""
+    crow = X.crow_indices()
+    col_idx = X.col_indices()
+    batch_size = X.shape[0]
+    row_idx = torch.repeat_interleave(
+        torch.arange(batch_size, device=X.device),
+        crow[1:] - crow[:-1],
+    )
+    return row_idx, col_idx
+
+
+def loss_fn(
+    model: FactorizationVAE,
+    X: torch.Tensor,
+    inflow: torch.Tensor | None = None,
+    φ: torch.Tensor | None = None,
+    row_idx: torch.Tensor | None = None,
+) -> torch.Tensor:
+    u, λ = model(X, inflow, φ)
+    v = model.v_norm()
+
+    loss = -poisson_logprob_sparse(λ, X, constant_terms=False, row_idx=row_idx)
+    if model.include_diffusion:
+        log_α = model.log_α if model.include_diffusion else None
+        # TODO: Prior on α. Maybe just Normal(0, σ) neg log prob.
+
+    # TODO: metagene regularization on v. I think we want to do min-volume regularization here.
+
+    return loss
+
+
+def poisson_logprob_sparse(
+    λ: torch.Tensor,
+    X: torch.Tensor,
+    constant_terms: bool = False,
+    row_idx: torch.Tensor | None = None,
+):
+    """Log probability for sparse CSR input under Poisson likelihood."""
+    col_idx = X.col_indices()
+    if row_idx is None:
+        row_idx, col_idx = _sparse_row_col_indices(X)
+    x_data = X.values()
+    lp = (x_data * torch.log(λ[row_idx, col_idx].clamp(1e-8))).sum() - λ.sum()
+    if constant_terms:
+        lp -= torch.lgamma(x_data + 1).sum()
+
+    return lp
+
+
 class FactorizationModel:
     X: csr_matrix
     inflow: csr_matrix | None
-    outflow: csr_matrix | None
+    φ: csr_matrix | None
     device: torch.device
-    model: SegregFactorizationVAE
+    model: FactorizationVAE
     m: int
     n: int
 
@@ -75,31 +206,26 @@ class FactorizationModel:
         n_factors: int,
         batch_size: int | None = 4096,
         include_diffusion: bool = True,
-        include_size_factor: bool = True,
         sf_sigma: float = 0.5,
         rate_offset: float = 1e-2,
         alpha_reg: float = 100.0,
         r_prior_alpha: float = 2.0,
         r_prior_beta: float = 2.0,
+        metagene_reg_type: str = "none",
         metagene_reg_strength: float = 0.01,
         init_method: str = "nndsvd",
         likelihood: str = "poisson",
     ):
-        adata, self.X, self.inflow, self.outflow = load_proseg_data(data, include_diffusion)
+        adata, self.X, self.inflow, outflow, self.φ = load_proseg_data(
+            data, include_diffusion
+        )
 
         self.m, self.n = adata.shape
+        self.n_factors = n_factors
         self.var_names = adata.var_names
         self.obs_names = adata.obs_names
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        if include_size_factor and "volume" in adata.obs.columns:
-            cell_size = np.asarray(adata.obs["volume"]).squeeze().astype(np.float64)
-        else:
-            cell_size = np.asarray(self.X.sum(axis=1)).squeeze().astype(np.float64)
-        log_size_factors = np.log(cell_size + 1e-8).astype(np.float32)
-
-        self.log_sf_prior_t = torch.tensor(log_size_factors, dtype=torch.float32)
 
         self.sf_sigma = sf_sigma
         self.alpha_reg = alpha_reg
@@ -108,35 +234,20 @@ class FactorizationModel:
         self.metagene_reg_strength = metagene_reg_strength
         self.likelihood = likelihood
 
-        sf_col = np.exp(log_size_factors).reshape(-1, 1)
         mean_expr_raw = np.asarray(self.X.mean(axis=0)).squeeze().astype(np.float32)
-        if include_size_factor:
-            log_mean_expr = torch.tensor(
-                np.log(mean_expr_raw / float(sf_col.mean()) + 1e-8), dtype=torch.float32
-            )
-        else:
-            log_mean_expr = torch.tensor(
-                np.log(mean_expr_raw + 1e-4), dtype=torch.float32
-            )
+        log_mean_expr = torch.tensor(np.log(mean_expr_raw + 1e-4), dtype=torch.float32)
 
         self.gene_expression = torch.tensor(mean_expr_raw, dtype=torch.float32)
 
-        h_init = None
+        v_init = None
         if init_method == "nndsvd":
-            h_init_np = _nndsvd_h_init(self.X, n_factors)
-            h_init = torch.tensor(h_init_np, dtype=torch.float32)
+            v_init = _nndsvd_h_init(self.X, n_factors)
 
-        self.model = SegregFactorizationVAE(
-            self.m,
+        self.model = FactorizationVAE(
             self.n,
             n_factors,
-            rate_offset=rate_offset,
+            v_init,
             include_diffusion=include_diffusion,
-            include_size_factor=include_size_factor,
-            log_mean_expr=log_mean_expr,
-            log_sf_prior=torch.tensor(log_size_factors, dtype=torch.float32),
-            init_method=init_method,
-            h_init=h_init,
         )
 
     def fit(
@@ -152,18 +263,14 @@ class FactorizationModel:
         patience: int = 80,
         min_delta: float = 1e-5,
     ):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         if seed is not None:
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
             np.random.seed(seed)
 
-        dataset = TensorDataset(torch.arange(self.m), self.log_sf_prior_t)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-        n_batches = len(loader)
-
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-
-        r_weight = 1.0 / n_batches
 
         if lr_schedule == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -181,133 +288,118 @@ class FactorizationModel:
                 f"Must be one of: 'cosine', 'reduce_on_plateau', 'none'."
             )
 
+        if compile:
+            print("Compiling model...")
+            train_loss_fn = torch.compile(loss_fn)
+        else:
+            train_loss_fn = loss_fn
+
         best_loss = float("inf")
-        no_improvement = 0
+        no_improvement_count = 0
+
+        # TODO: Need to handle the case where inflow and φ are None
+        # if we want this to be more widely applicable. (E.g. if we want to replace countdown
+        # entirely with this code.)
+        batch_sampler = SparseBatchSampler(
+            self.X, self.inflow, self.φ, batch_size, device
+        )
 
         self.model.to(self.device)
         self.model.train()
 
-        training_wrapper = FactorizationTrainingWrapper(
-            self.model,
-            self.m,
-            self.sf_sigma,
-            r_weight=r_weight,
-            r_prior_alpha=self.r_prior_alpha,
-            r_prior_beta=self.r_prior_beta,
-            alpha_reg=self.alpha_reg,
-            metagene_reg_strength=self.metagene_reg_strength,
-            likelihood=self.likelihood,
-            gene_expression=None,
-        )
+        with tqdm(range(nepochs), desc="Training", unit="epoch", disable=quiet) as pbar:
+            for epoch in pbar:
+                batch_sampler.shuffle()
+                epoch_loss_sum = 0.0
+                epoch_batch_count = 0
 
-        if compile:
-            print("Compiling model...")
-            training_wrapper = torch.compile(training_wrapper, mode="reduce-overhead")
-
-        use_amp = self.device.type == "cuda"
-        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        scaler = torch.amp.GradScaler(enabled=use_amp)
-
-        pbar = tqdm(range(nepochs), desc="Training FactorizationModel", disable=quiet)
-        for epoch in pbar:
-            total_loss = 0.0
-            n_batch = 0
-            loss_recon = 0.0
-            for batch_idx, batch_log_sf_prior in loader:
-                optimizer.zero_grad()
-                batch_idx = batch_idx.to(self.device)
-                batch_log_sf_prior = batch_log_sf_prior.to(self.device)
-
-                x_sub = self.X[batch_idx.cpu().numpy()].toarray().astype(np.float32)
-                x_sub_tensor = torch.from_numpy(x_sub).to(self.device)
-
-                if self.model.include_diffusion:
-                    assert self.inflow is not None and self.outflow is not None
-                    inflow_sub = (
-                        self.inflow[batch_idx.cpu().numpy()]
-                        .toarray()
-                        .astype(np.float32)
+                for (
+                    X_batch,
+                    inflow_batch,
+                    φ_batch,
+                    precomputed_row_idx,
+                ) in batch_sampler:
+                    optimizer.zero_grad(set_to_none=True)
+                    loss = train_loss_fn(
+                        self.model,
+                        X_batch,
+                        inflow_batch,
+                        φ_batch,
+                        row_idx=precomputed_row_idx,
                     )
-                    outflow_sub = (
-                        self.outflow[batch_idx.cpu().numpy()]
-                        .toarray()
-                        .astype(np.float32)
-                    )
-                    phi_sub = estimate_phi(x_sub, inflow_sub, outflow_sub)
+                    loss.backward()
+                    if grad_clip is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), grad_clip
+                        )
+                    optimizer.step()
 
-                    inflow_sub_tensor = torch.from_numpy(inflow_sub).to(self.device)
-                    phi_sub_tensor = torch.from_numpy(phi_sub).to(self.device)
+                    epoch_loss_sum += loss.detach().item()
+                    epoch_batch_count += 1
+                    pass
+
+                if not np.isfinite(epoch_loss_sum):
+                    raise ValueError(f"Non-finite loss: {epoch_loss_sum}")
+
+                # Step LR scheduler once per epoch.
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(epoch_loss_sum)
+                elif scheduler is not None:
+                    scheduler.step()
+
+                if best_loss - epoch_loss_sum > min_delta:
+                    best_loss = epoch_loss_sum
+                    no_improvement_count = 0
                 else:
-                    inflow_sub_tensor = None
-                    phi_sub_tensor = None
+                    no_improvement_count += 1
 
-                with torch.autocast(
-                    device_type=self.device.type, dtype=amp_dtype, enabled=use_amp
-                ):
-                    loss, loss_recon_val = training_wrapper(
-                        batch_idx,
-                        batch_log_sf_prior,
-                        x_sub_tensor,
-                        inflow_sub_tensor,
-                        phi_sub_tensor,
+                pbar.set_postfix(
+                    loss=f"{epoch_loss_sum:.4f}",
+                    best=f"{best_loss:.4f}",
+                    patience=f"{no_improvement_count}/{patience}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.2g}",
+                )
+
+                if no_improvement_count >= patience:
+                    pbar.write(
+                        f"Early stopping at epoch {epoch + 1}: no improvement for {patience} epochs"
                     )
+                    break
 
-                scaler.scale(loss).backward()
-                if grad_clip is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), grad_clip
-                    )
-                scaler.step(optimizer)
-                scaler.update()
-
-                total_loss += loss.item()
-                loss_recon = loss_recon_val.item()
-                n_batch += 1
-
-            avg_loss = total_loss / n_batch
-
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(avg_loss)
-            elif scheduler is not None:
-                scheduler.step()
-
-            if best_loss - avg_loss > min_delta:
-                best_loss = avg_loss
-                no_improvement = 0
-            else:
-                no_improvement += 1
-
-            pbar.set_description(
-                f"Loss: {avg_loss:.4f} (Recon: {loss_recon:.2f}) "
-                f"Best: {best_loss:.4f} [{no_improvement}/{patience}] "
-                f"lr: {optimizer.param_groups[0]['lr']:.2g}"
-            )
-
-            if no_improvement >= patience:
-                if not quiet:
-                    print(
-                        f"Early stopping at epoch {epoch + 1}: "
-                        f"no improvement for {patience} epochs"
-                    )
-                break
-
-        self.model.eval()
-
-    def get_factor_loadings(self) -> np.ndarray:
+    def get_factor_loadings(self, batch_size: int = 4096) -> np.ndarray:
         """Returns non-negative W matrix (after softplus), shape (n_cells, n_factors)."""
-        return (
-            F.softplus(self.model.W_embed.weight).detach().cpu().numpy()
-        )
+
+        Xnmf = np.zeros((self.m, self.n_factors), dtype=np.float32)
+        self.model.eval()
+        with torch.no_grad():
+            for start_idx in range(0, self.m, batch_size):
+                end_idx = min(start_idx + batch_size, self.m)
+
+                X_chunk = self.X[start_idx:end_idx, :]
+                X_chunk_tensor = torch.sparse_csr_tensor(
+                    X_chunk.indptr,
+                    X_chunk.indices,
+                    X_chunk.data,
+                    size=(end_idx - start_idx, self.n),
+                    dtype=torch.float32,
+                    device=self.device,
+                ).to(self.device)
+
+                encoded_chunk = self.model.encoder(X_chunk_tensor)
+                Xnmf[start_idx:end_idx, :] = encoded_chunk.cpu().numpy()
+
+        return Xnmf
 
     def get_factor_programs(self) -> np.ndarray:
         """Returns non-negative H matrix (after softplus), shape (n_factors, n_genes)."""
-        return F.softplus(self.model.H).detach().cpu().numpy()
+        return self.model.v_norm().detach().cpu().numpy().T
 
     def get_corrected_expression(
         self, threshold: float = 1e-4, batch_size: int = 4096
     ) -> csr_matrix:
         self.model.eval()
+
+        # TODO: Gotta rewrite this. Though I'm not sure I even need it.
 
         loader = DataLoader(
             TensorDataset(torch.arange(self.m)),

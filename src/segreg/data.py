@@ -1,13 +1,20 @@
+from dataclasses import dataclass
+
 import numpy as np
+import numpy.typing as npt
+import torch
 from anndata import AnnData
 from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix as make_csr
 from spatialdata import SpatialData
 
 
 def load_proseg_data(
     data: SpatialData | AnnData,
     include_diffusion: bool = True,
-) -> tuple[AnnData, csr_matrix, csr_matrix | None, csr_matrix | None]:
+) -> tuple[
+    AnnData, csr_matrix, csr_matrix | None, csr_matrix | None, csr_matrix | None
+]:
     """Extract expression, and optionally inflow/outflow, from an AnnData/SpatialData.
 
     When include_diffusion is True, requires proseg data and reads inflow/outflow.
@@ -24,7 +31,7 @@ def load_proseg_data(
     X = adata.X.tocsr() if not isinstance(adata.X, csr_matrix) else adata.X
 
     if not include_diffusion:
-        return adata, X, None, None
+        return adata, X, None, None, None
 
     if "proseg_run" not in adata.uns:
         raise ValueError(
@@ -37,7 +44,16 @@ def load_proseg_data(
     outflow = adata.layers["expected_outflow"].tocsr()
     assert isinstance(outflow, csr_matrix)
 
-    return adata, X, inflow, outflow
+    # expected counts
+    T = X + outflow - inflow
+
+    # expected proportion lost to outflow
+    T_recip = T.copy()
+    nz_mask = T_recip.data != 0
+    T_recip.data[nz_mask] = 1.0 / T_recip.data[nz_mask]
+    φ = outflow.multiply(T_recip)
+
+    return adata, X, inflow, outflow, φ
 
 
 def estimate_phi(X: np.ndarray, inflow: np.ndarray, outflow: np.ndarray) -> np.ndarray:
@@ -144,3 +160,112 @@ def ols_init_beta(
     )
 
     return beta_init_np, beta_prior_scale_matrix, beta_logstd_init
+
+
+@dataclass
+class CSRMatrixBatch:
+    data: torch.Tensor
+    indices: torch.Tensor
+    indptr: torch.Tensor
+    row_idx: torch.Tensor
+    batch_m: int
+
+    def __init__(self, M: csr_matrix, batch_idx: npt.NDArray[np.int64], use_pin: bool):
+        sliced = M[batch_idx, :]
+        nnz_per_row = np.diff(sliced.indptr)
+        row_idx_np = np.repeat(np.arange(sliced.shape[0], dtype=np.int64), nnz_per_row)
+
+        def _maybe_pin(t: torch.Tensor) -> torch.Tensor:
+            return t.pin_memory() if use_pin else t
+
+        self.data = _maybe_pin(torch.from_numpy(sliced.data.copy()))
+        self.indices = _maybe_pin(torch.from_numpy(sliced.indices.astype(np.int64)))
+        self.indptr = _maybe_pin(torch.from_numpy(sliced.indptr.astype(np.int64)))
+        self.row_idx = _maybe_pin(torch.from_numpy(row_idx_np))
+        self.batch_m = sliced.shape[0]
+
+    def to_csr_tensor(
+        self, n: int, non_blocking: bool, device: torch.device
+    ) -> torch.Tensor:
+        return torch.sparse_csr_tensor(
+            crow_indices=self.indptr.to(device, non_blocking=non_blocking),
+            col_indices=self.indices.to(device, non_blocking=non_blocking),
+            values=self.data.to(device, non_blocking=non_blocking),
+            size=(self.batch_m, n),
+            dtype=torch.float32,
+            device=device,
+        )
+
+
+# TODO: OK, this was copied from countdown, but now we need to jointly sample three sparse matrices:
+# X, inflow, and phi
+#
+# These do not necessarily have the same
+class SparseBatchSampler:
+    """
+    Samples batches of rows from a CSR matrix as torch sparse_csr_tensor objects.
+
+    Precomputes all batches at initialization as pinned CPU tensors (including
+    row indices for the loss function), then transfers to GPU during iteration
+    using non-blocking transfers for better CPU/GPU overlap.
+    """
+
+    def __init__(
+        self,
+        X: csr_matrix,
+        inflow: csr_matrix,
+        φ: csr_matrix,
+        batch_size: int,
+        device: torch.device,
+    ):
+        m, n = X.shape
+        assert inflow.shape == φ.shape == (m, n)
+        self.X = X.astype(np.float32)
+        self.inflow = inflow.astype(np.float32)
+        self.φ = φ.astype(np.float32)
+        self.m = m
+        self.n = n
+        self.batch_size = batch_size
+        self.device = device
+        self.use_pin = device.type == "cuda"
+        self._batches: list[tuple[CSRMatrixBatch, CSRMatrixBatch, CSRMatrixBatch]] = []
+        self.shuffle()
+
+    def shuffle(self) -> None:
+        """Rebuild the batched pre-sliced CPU tensors with a fresh row permutation.
+
+        Called once at construction and once per epoch by the training loop so
+        that batch order/composition varies across epochs, mirroring
+        DenseRowSampler. Keeping the per-batch CSR slices precomputed on the
+        CPU (pinned when on CUDA) preserves the cheap non-blocking transfer
+        path while still reshuffling between epochs.
+        """
+
+        idx = np.arange(self.m)
+        np.random.shuffle(idx)
+
+        self._batches = []
+        for fr in range(0, self.m, self.batch_size):
+            to = min(fr + self.batch_size, self.m)
+            batch_idx = idx[fr:to].copy()
+            batch_idx.sort()
+
+            X_batch = CSRMatrixBatch(self.X, batch_idx, self.use_pin)
+            inflow_batch = CSRMatrixBatch(self.inflow, batch_idx, self.use_pin)
+            φ_batch = CSRMatrixBatch(self.φ, batch_idx, self.use_pin)
+            self._batches.append((X_batch, inflow_batch, φ_batch))
+
+    def __iter__(self):
+        nb = self.device.type == "cuda"
+        with torch.sparse.check_sparse_tensor_invariants(enable=False):
+            for X_batch, inflow_batch, φ_batch in self._batches:
+                X_batch_csr = X_batch.to_csr_tensor(self.n, nb, self.device)
+                inflow_batch_csr = inflow_batch.to_csr_tensor(self.n, nb, self.device)
+                φ_batch_csr = φ_batch.to_csr_tensor(self.n, nb, self.device)
+
+                yield (
+                    X_batch_csr,
+                    inflow_batch_csr,
+                    φ_batch_csr,
+                    X_batch.row_idx.to(self.device, non_blocking=nb),
+                )
