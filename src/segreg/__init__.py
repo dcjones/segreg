@@ -1,16 +1,14 @@
 from .factorization import FactorizationModel
-from .nn import Encoder, NodeDecoder, SegregBase, SegregFactorizationVAE, SegregVAE
+from .nn import Encoder, NodeDecoder, SegregBase, SegregVAE
 from .regression import RegressionModel
-from .training import FactorizationTrainingWrapper, SegregTrainingWrapper
+from .training import SegregTrainingWrapper
 
 __all__ = [
     "RegressionModel",
     "FactorizationModel",
     "SegregVAE",
-    "SegregFactorizationVAE",
     "SegregBase",
     "Encoder",
     "NodeDecoder",
     "SegregTrainingWrapper",
-    "FactorizationTrainingWrapper",
 ]

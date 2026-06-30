@@ -12,7 +12,7 @@ from spatialdata import SpatialData
 from tqdm import tqdm
 
 from .data import SparseBatchSampler, estimate_phi, load_proseg_data
-from .training import FactorizationTrainingWrapper
+from .losses import alpha_loss
 
 warnings.filterwarnings(
     "ignore",
@@ -159,14 +159,14 @@ def loss_fn(
     inflow: torch.Tensor | None = None,
     φ: torch.Tensor | None = None,
     row_idx: torch.Tensor | None = None,
+    alpha_reg: float = 0.0,
 ) -> torch.Tensor:
     u, λ = model(X, inflow, φ)
     v = model.v_norm()
 
     loss = -poisson_logprob_sparse(λ, X, constant_terms=False, row_idx=row_idx)
     if model.include_diffusion:
-        log_α = model.log_α if model.include_diffusion else None
-        # TODO: Prior on α. Maybe just Normal(0, σ) neg log prob.
+        loss = loss + alpha_loss(model.log_α, alpha_reg)
 
     # TODO: metagene regularization on v. I think we want to do min-volume regularization here.
 
@@ -297,11 +297,13 @@ class FactorizationModel:
         best_loss = float("inf")
         no_improvement_count = 0
 
-        # TODO: Need to handle the case where inflow and φ are None
-        # if we want this to be more widely applicable. (E.g. if we want to replace countdown
-        # entirely with this code.)
+        # inflow/φ are unused by FactorizationVAE.forward when include_diffusion=False,
+        # but SparseBatchSampler always requires same-shape matrices, so substitute zeros.
+        empty = csr_matrix(self.X.shape, dtype=np.float32)
+        inflow_for_sampler = self.inflow if self.inflow is not None else empty
+        φ_for_sampler = self.φ if self.φ is not None else empty
         batch_sampler = SparseBatchSampler(
-            self.X, self.inflow, self.φ, batch_size, device
+            self.X, inflow_for_sampler, φ_for_sampler, batch_size, device
         )
 
         self.model.to(self.device)
@@ -326,6 +328,7 @@ class FactorizationModel:
                         inflow_batch,
                         φ_batch,
                         row_idx=precomputed_row_idx,
+                        alpha_reg=self.alpha_reg,
                     )
                     loss.backward()
                     if grad_clip is not None:
@@ -375,16 +378,7 @@ class FactorizationModel:
             for start_idx in range(0, self.m, batch_size):
                 end_idx = min(start_idx + batch_size, self.m)
 
-                X_chunk = self.X[start_idx:end_idx, :]
-                X_chunk_tensor = torch.sparse_csr_tensor(
-                    X_chunk.indptr,
-                    X_chunk.indices,
-                    X_chunk.data,
-                    size=(end_idx - start_idx, self.n),
-                    dtype=torch.float32,
-                    device=self.device,
-                ).to(self.device)
-
+                X_chunk_tensor = self._chunk_csr_tensor(self.X, start_idx, end_idx)
                 encoded_chunk = self.model.encoder(X_chunk_tensor)
                 Xnmf[start_idx:end_idx, :] = encoded_chunk.cpu().numpy()
 
@@ -394,44 +388,51 @@ class FactorizationModel:
         """Returns non-negative H matrix (after softplus), shape (n_factors, n_genes)."""
         return self.model.v_norm().detach().cpu().numpy().T
 
+    def _chunk_csr_tensor(self, M: csr_matrix, start: int, end: int) -> torch.Tensor:
+        chunk = M[start:end, :]
+        return torch.sparse_csr_tensor(
+            chunk.indptr,
+            chunk.indices,
+            chunk.data,
+            size=(end - start, self.n),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
     def get_corrected_expression(
         self, threshold: float = 1e-4, batch_size: int = 4096
     ) -> csr_matrix:
+        """Returns the (diffusion-corrected, if enabled) rate matrix λ, shape (n_cells, n_genes)."""
         self.model.eval()
 
-        # TODO: Gotta rewrite this. Though I'm not sure I even need it.
-
-        loader = DataLoader(
-            TensorDataset(torch.arange(self.m)),
-            batch_size=batch_size,
-            shuffle=False,
-        )
         rows, cols, data = [], [], []
         current_row = 0
         with torch.no_grad():
-            for (batch_idx,) in loader:
-                batch_idx = batch_idx.to(self.device)
+            for start_idx in range(0, self.m, batch_size):
+                end_idx = min(start_idx + batch_size, self.m)
 
-                if self.model.include_size_factor:
-                    log_sf = self.model.log_sf_embed(batch_idx).squeeze(-1)
-                else:
-                    log_sf = None
+                X_chunk_tensor = self._chunk_csr_tensor(self.X, start_idx, end_idx)
+                inflow_chunk_tensor = None
+                φ_chunk_tensor = None
+                if self.model.include_diffusion:
+                    assert self.inflow is not None and self.φ is not None
+                    inflow_chunk_tensor = self._chunk_csr_tensor(
+                        self.inflow, start_idx, end_idx
+                    )
+                    φ_chunk_tensor = self._chunk_csr_tensor(
+                        self.φ, start_idx, end_idx
+                    )
 
-                W = F.softplus(self.model.W_embed(batch_idx))
-                H = F.softplus(self.model.H)
+                _, λ = self.model(X_chunk_tensor, inflow_chunk_tensor, φ_chunk_tensor)
+                λ_np = λ.cpu().numpy()
 
-                log_rate = W @ H + self.model.gene_bias
-                if self.model.include_size_factor and log_sf is not None:
-                    log_rate = log_rate + log_sf.unsqueeze(-1)
-                lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
-                lam_np = (lam + self.model.rate_offset).cpu().numpy()
-
-                lam_np[lam_np < threshold] = 0.0
-                r, c = np.nonzero(lam_np)
+                λ_np[λ_np < threshold] = 0.0
+                r, c = np.nonzero(λ_np)
                 rows.append(r + current_row)
                 cols.append(c)
-                data.append(lam_np[r, c])
-                current_row += batch_idx.size(0)
+                data.append(λ_np[r, c])
+                current_row += end_idx - start_idx
+
         return csr_matrix(
             (np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
             shape=(self.m, self.n),

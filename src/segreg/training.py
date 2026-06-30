@@ -5,14 +5,11 @@ import torch.nn as nn
 
 from .losses import (
     alpha_loss,
-    gamma_prior_loss,
     kl_z,
-    metagene_correlation_loss,
     nb_loss,
-    poisson_loss,
     size_factor_loss,
 )
-from .nn import SegregFactorizationVAE, SegregVAE
+from .nn import SegregVAE
 
 
 class SegregTrainingWrapper(nn.Module):
