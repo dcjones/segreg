@@ -52,6 +52,66 @@ def alpha_loss(log_alpha, alpha_reg, gene_expression=None):
     return alpha_reg * (alpha ** 2).sum()
 
 
+def alpha_log_prior_loss(log_alpha, alpha_reg, gene_expression=None):
+    """L2 penalty on log(alpha), i.e. a log-normal prior on alpha = exp(log_alpha)
+    centered at 1 -- the paper's "trust Proseg's estimates at face value" reference
+    point, with alpha free to move above 1 (Proseg underestimated leakage) or below
+    (Proseg overestimated it) as the data demands.
+
+    If gene_expression (mean count per cell) is given, the penalty is weighted by
+    1/sqrt(expression+1), same as the older alpha_loss: low-count genes keep close
+    to the full baseline pull toward alpha=1, while high-count genes -- where there's
+    enough signal to actually distinguish contamination from noise -- get a weaker
+    pull and more freedom to deviate. Without this, a single global alpha_reg applies
+    equally regardless of how much evidence a gene's counts can support, which let
+    low-count genes get corrected just as aggressively as well-supported ones and
+    measurably degraded separation of rarer cell types relying on them.
+    """
+    if gene_expression is not None:
+        weight = 1.0 / torch.sqrt(gene_expression + 1.0)
+        return alpha_reg * (log_alpha ** 2 * weight).sum()
+    return alpha_reg * (log_alpha ** 2).sum()
+
+
+def metagene_entropy_loss(u, sparsity_reg, eps=1e-8):
+    """Entropy penalty on each cell's normalized metagene loadings (u / sum(u)),
+    encouraging concentration onto few metagenes rather than spreading contamination
+    across several factors. sparsity_reg should be annealed in over training."""
+    pi = u / (u.sum(dim=1, keepdim=True) + eps)
+    entropy = -(pi * torch.log(pi.clamp(min=eps))).sum(dim=1)
+    return sparsity_reg * entropy.mean()
+
+
+def dirichlet_purity_loss(
+    composition: torch.Tensor, weight: float, alpha: float = 0.5, eps: float = 1e-8
+) -> torch.Tensor:
+    """Negative log-density (dropping the pi-independent normalizing constant)
+    of a symmetric Dirichlet(alpha) prior over each cell's metagene composition
+    (a simplex vector, e.g. SparseCompositionAbundanceEncoder's composition
+    output -- NOT u itself, which also carries the abundance scale and so
+    isn't on the simplex).
+
+    log p(pi | alpha) = const + (alpha - 1) * sum_k log(pi_k)
+
+    For alpha < 1 this density is bathtub-shaped: it blows up toward the
+    simplex corners (one pi_k -> 1, the rest -> 0) and is lowest at the
+    uniform center, so minimizing the returned loss (the negative log
+    density) continuously pulls composition toward purity.
+
+    Unlike sparsemax/entmax's hard sparsity (see DIFFUSION_INVESTIGATION_NOTES.md
+    sec. 18-20), this never creates a literal zero-gradient trap: composition
+    is expected to come from softmax (always strictly positive), and this
+    penalty just adds smooth, everywhere-nonzero pressure toward (but never
+    exactly reaching) a corner -- so nothing can get permanently excluded the
+    way v's entmax/sparsemax entries could.
+
+    weight controls the prior's strength relative to the reconstruction loss;
+    with alpha < 1 the loss is intentionally unbounded below as composition
+    sharpens, so weight needs to be tuned rather than left arbitrarily large.
+    """
+    return weight * (1 - alpha) * torch.log(composition.clamp(min=eps)).sum(dim=1).mean()
+
+
 def gamma_prior_loss(log_r, alpha, beta, r_weight):
     """Negative log Gamma(alpha, beta) prior on dispersion r = exp(log_r).
 
@@ -83,3 +143,45 @@ def metagene_correlation_loss(H_constrained, strength):
     corr_matrix = h_normalized @ h_normalized.T
     mask = 1.0 - torch.eye(k, device=H_constrained.device)
     return strength * ((corr_matrix * mask) ** 2).sum()
+
+
+def gene_floor_loss(v_raw: torch.Tensor, weight: float, margin: float = -3.0) -> torch.Tensor:
+    """Anti-collapse regularizer for FactorizationVAE.v (the raw, pre-activation
+    metagene-program parameter), for use with the sparsemax/entmax15
+    metagene_activation options.
+
+    Both sparsemax and entmax give exactly zero gradient to v[k, g] whenever
+    gene g falls outside factor k's support -- so once every factor's
+    independent per-row optimization happens to exclude a low-signal gene
+    (observed for B-cell markers under entmax15: excluded from all 50 factors,
+    not just the wrong ones -- DIFFUSION_INVESTIGATION_NOTES.md sec. 20), there
+    is no gradient path back through the normal reconstruction loss to recover
+    it. This penalizes each gene's best-positioned factor directly on the raw
+    parameter (bypassing the clamp entirely, so it always has a live gradient,
+    even for genes currently excluded everywhere): for each gene, shift every
+    factor's row by its own max (matching entmax/sparsemax's internal
+    shift-invariant normalization) and penalize the best (least-negative)
+    shifted score if it falls below `margin` -- i.e. "every gene should be
+    within `margin` of at least one factor's own top choice," not "every gene
+    should have some absolute raw score." Zero cost once a gene clears the
+    margin somewhere, so it does not fight genuine sparsification.
+    """
+    row_shifted = v_raw - v_raw.max(dim=1, keepdim=True).values
+    gene_best = row_shifted.max(dim=0).values
+    return weight * F.relu(margin - gene_best).pow(2).sum()
+
+
+def min_volume_loss(H: torch.Tensor, strength: float, delta: float = 1e-3) -> torch.Tensor:
+    """Minimum-volume regularization on metagene programs H (k x n, e.g. v_norm()).
+
+    Penalizes log-det of the Gram matrix H @ H^T + delta*I. sqrt(det(H H^T)) is
+    proportional to the k-dimensional volume of the simplex spanned by H's rows, so
+    minimizing this pulls the metagenes toward the smallest simplex that can still
+    explain the data -- discouraging redundant/overlapping factors that let
+    ambiguous cells blend between them for free, without penalizing genuine
+    diversity the reconstruction loss actually needs.
+    """
+    k = H.shape[0]
+    gram = H @ H.T + delta * torch.eye(k, device=H.device, dtype=H.dtype)
+    _, logdet = torch.linalg.slogdet(gram)
+    return strength * logdet
