@@ -298,12 +298,15 @@ class FactorizationVAE(nn.Module):
         decontaminate_encoder: bool = False,
         include_retention: bool = True,
         include_delta: bool = True,
-        metagene_activation: str = "softmax",
+        metagene_activation: str = "entmax15",
         encoder_architecture: str = "joint",
         composition_activation: str = "softmax",
         gene_expression: torch.Tensor | None = None,
+        n_components: int | None = None,
+        resp_temperature: float = 2.0,
     ):
         super().__init__()
+        self.resp_temperature = resp_temperature
 
         if encoder_architecture not in ("joint", "composition_abundance"):
             raise ValueError(
@@ -388,6 +391,29 @@ class FactorizationVAE(nn.Module):
             else:
                 self.gene_expression = None
 
+        # GMM prior on U (VaDE/GMVAE-style). Cluster responsibilities are computed
+        # *analytically* from the Gaussian components (see compute_gmm_loss), not by
+        # a separate amortized MLP head. An earlier version used an MLP head to
+        # predict mixture logits from u; it was a second, redundant parametrization
+        # of cluster membership decoupled from the actual component geometry, and it
+        # drifted between regimes run-to-run (identical config/seed swung the argmax
+        # from a clean 10-way split to a 2-way collapse, with matching swings in the
+        # marker metrics). Tying responsibilities to the components directly removes
+        # that instability and the extra parameters.
+        self.n_components = n_components
+        if n_components is not None:
+            # Component means in factor space
+            self.component_means = nn.Parameter(torch.randn(n_components, k) * 0.1)
+            # Component log-variances (learnable, initialized to log(1) = 0, i.e.
+            # σ²=1, matching the var_reg prior's center so components start
+            # well-conditioned rather than as narrow spikes).
+            self.component_log_vars = nn.Parameter(torch.zeros(n_components, k))
+            # Global log mixing weights π_k. Fixed uniform (a buffer, not a
+            # Parameter): the load-balancing term already governs aggregate usage,
+            # and leaving the mixing weights learnable just gives collapse another
+            # unconstrained degree of freedom to exploit.
+            self.register_buffer("mixture_logits", torch.zeros(n_components))
+
     def v_norm(self) -> torch.Tensor:
         if self.metagene_activation == "sparsemax":
             return sparsemax(self.v, dim=1)
@@ -419,11 +445,72 @@ class FactorizationVAE(nn.Module):
         else:
             return self.encoder(X)
 
+    def compute_gmm_loss(
+        self, u: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Compute the per-cell GMM prior log-density on u and the analytic
+        cluster responsibilities (GMM posterior over components).
+
+        Returns:
+            log_mixture_prob: [batch] per-cell log Σ_k π_k N(u | μ_k, σ²_k), or
+                None if n_components is None. Returned per-cell (not reduced) so
+                loss_fn can *sum* it over the batch -- the reconstruction term is
+                a batch sum (poisson_logprob_sparse), so a .mean() here would make
+                the prior ~batch_size× too weak to actually shape u (it would only
+                fit the components to a latent space reconstruction alone
+                organizes). See loss_fn.
+            γ: [batch, n_components] responsibilities γ_ik = p(k | u_i), computed
+                analytically from the components (softmax of the per-component log
+                joint), or None. This replaces the old amortized MLP head: it is a
+                deterministic function of u and the Gaussians, so it cannot drift
+                into a different clustering regime the way the decoupled head did.
+        """
+        if self.n_components is None:
+            return None, None
+
+        # log N(u | μ_k, σ²_k) = -0.5 [ Σ_g log σ²_kg + Σ_g (u_g - μ_kg)²/σ²_kg ]
+        # (dropping the u-independent -0.5*d*log(2π) constant), vectorized over
+        # components.
+        var = torch.exp(self.component_log_vars) + 1e-6  # [K, k]
+        diff = u.unsqueeze(1) - self.component_means.unsqueeze(0)  # [B, K, k]
+        mahal = (diff**2 / var.unsqueeze(0)).sum(dim=-1)  # [B, K]
+        log_norm = self.component_log_vars.sum(dim=-1).unsqueeze(0)  # [1, K]
+        log_probs = -0.5 * (log_norm + mahal)  # [B, K]
+
+        # log joint p(u, k) = log N(u | k) + log π_k, up to the shared 2π constant.
+        log_pi = F.log_softmax(self.mixture_logits, dim=-1)  # [K]
+        log_joint = log_probs + log_pi.unsqueeze(0)  # [B, K]
+
+        # Marginal log p(u) = logsumexp_k log joint. Used as-is (temperature 1) for
+        # the generative NLL, which must stay the exact GMM marginal.
+        log_mixture_prob = torch.logsumexp(log_joint, dim=-1)  # [B]
+
+        # Responsibilities for the clustering *regularizers* (entropy/balance) and
+        # for reported assignments are tempered. In a k-dim latent the untempered
+        # posterior saturates to one-hot (the Mahalanobis term is a sum over k dims,
+        # so between-component log-density gaps grow ~linearly in k -- hundreds at
+        # k=100), and a saturated softmax has ~zero gradient, which silently kills
+        # the load-balancing term and lets usage collapse back onto 1-2 components
+        # (empirically: two components held 95% of cells at T=1). We divide the
+        # logits by resp_temperature * k: the extra factor of k normalizes out the
+        # dimension so resp_temperature is an O(1), latent-dim-independent knob
+        # (~2 keeps all components alive with well-spread usage here). This keeps
+        # the balance gradient alive while still tracking the component geometry, so
+        # assignments stay stable run-to-run -- unlike the old decoupled MLP head.
+        k_dim = self.component_means.shape[1]
+        γ = F.softmax(log_joint / (self.resp_temperature * k_dim), dim=-1)  # [B, K]
+
+        return log_mixture_prob, γ
+
     def forward(
         self, X: torch.Tensor, inflow: torch.Tensor | None, φ: torch.Tensor | None
     ):
         α = torch.exp(self.log_α) if self.include_diffusion else None
         u = self.encode(X, inflow, φ, α)
+
+        # Per-cell GMM prior log-density and amortized responsibilities.
+        log_mixture_prob, π = self.compute_gmm_loss(u)
+
         λ = u @ self.v_norm()
 
         if self.include_diffusion:
@@ -435,7 +522,7 @@ class FactorizationVAE(nn.Module):
             else:
                 λ = λ + δ
 
-        return u, λ
+        return u, λ, log_mixture_prob, π
 
     def metagene_regularization(self):
         pass
@@ -468,8 +555,12 @@ def loss_fn(
     gene_floor_margin: float = -3.0,
     dirichlet_reg: float = 0.0,
     dirichlet_alpha: float = 0.5,
+    mixture_strength: float = 0.0,
+    entropy_weight: float = 0.01,
+    balance_weight: float = 1.0,
+    var_reg: float = 1.0,
 ) -> torch.Tensor:
-    u, λ = model(X, inflow, φ)
+    u, λ, log_mixture_prob, π = model(X, inflow, φ)
     v = model.v_norm()
 
     loss = -poisson_logprob_sparse(λ, X, constant_terms=False, row_idx=row_idx)
@@ -487,6 +578,46 @@ def loss_fn(
         loss = loss + dirichlet_purity_loss(
             model.encoder.last_composition, dirichlet_reg, alpha=dirichlet_alpha
         )
+    
+    # GMM prior on u, as a "regularized information maximization" clustering
+    # objective (Krause et al. 2010; Hu et al. IMSAT 2017) plus the Gaussian
+    # fit. All per-cell terms are *summed* over the batch so they sit on the
+    # same scale as the summed poisson reconstruction above -- with a .mean()
+    # the prior was ~batch_size× too weak to shape u at all (it merely fit the
+    # components to a latent space reconstruction alone had already organized).
+    if mixture_strength > 0 and π is not None:
+        B = π.shape[0]
+
+        # (a) Gaussian fit: pull each cell's u toward its responsible
+        # component(s) and vice-versa (maximize log p(u)).
+        nll = -log_mixture_prob.sum()
+
+        # (b) Conditional entropy H(y|x): minimize -> each cell commits to one
+        # component (confident, sharp responsibilities).
+        cond_entropy = -(π * torch.log(π + 1e-8)).sum(dim=-1).sum()
+
+        # (c) Marginal entropy H(y-bar): MAXIMIZE (note the minus sign) -> the
+        # batch-averaged assignment stays spread across all components, which is
+        # what actually prevents component collapse. Without this, (a)+(b) have a
+        # degenerate optimum where every cell picks one component and the rest
+        # die (exactly the collapse observed: 1 component held 45% of cells,
+        # 4 were unused, and the abundant cell type replicated across several).
+        # Scaled by B so this batch-level scalar (bounded by log K) is
+        # commensurate with the summed per-cell terms.
+        π_bar = π.mean(dim=0)
+        marg_entropy = -(π_bar * torch.log(π_bar + 1e-8)).sum()
+
+        gmm_loss = nll + entropy_weight * cond_entropy - balance_weight * B * marg_entropy
+        loss = loss + mixture_strength * gmm_loss
+
+        # (d) Anti-catch-all variance prior: log-normal on σ² centered at 1
+        # (log σ² = 0). The Gaussian normalizer already penalizes inflating
+        # variance, but per-factor diagonal variances (K×k free params) can
+        # still let a component balloon into a flat catch-all that swallows
+        # unrelated cells (observed: σ² up to ~12 on some components vs ~0.3 on
+        # others). This keeps component scales comparable and well-conditioned.
+        if var_reg > 0:
+            loss = loss + var_reg * (model.component_log_vars**2).sum()
 
     return loss
 
@@ -522,21 +653,16 @@ class FactorizationModel:
         self,
         data: SpatialData | AnnData,
         n_factors: int,
-        batch_size: int | None = 4096,
         include_diffusion: bool = True,
         diffusion_aware_encoder: bool = False,
         decontaminate_encoder: bool = False,
         include_retention: bool = True,
         include_delta: bool = True,
-        metagene_activation: str = "softmax",
+        metagene_activation: str = "entmax15",
         encoder_architecture: str = "joint",
         composition_activation: str = "softmax",
-        sf_sigma: float = 0.5,
-        rate_offset: float = 1e-2,
         alpha_reg: float = 100.0,
         sparsity_reg: float = 0.0,
-        r_prior_alpha: float = 2.0,
-        r_prior_beta: float = 2.0,
         metagene_reg_type: str = "none",
         metagene_reg_strength: float = 0.01,
         gene_floor_reg: float = 0.0,
@@ -544,8 +670,22 @@ class FactorizationModel:
         dirichlet_reg: float = 0.0,
         dirichlet_alpha: float = 0.5,
         init_method: str = "nndsvd",
-        likelihood: str = "poisson",
+        n_components: int | None = 10,
+        mixture_strength: float = 0.1,
+        entropy_weight: float = 0.05,
+        balance_weight: float = 1.0,
+        var_reg: float = 1.0,
+        resp_temperature: float = 2.0,
     ):
+        # NOTE on the GMM-prior hyperparameters (only active when n_components is
+        # set). The per-cell prior terms in loss_fn are *summed* over the batch to
+        # match the summed poisson reconstruction, so mixture_strength is on a very
+        # different scale than a mean-reduced prior would be -- ~0.1 is a strong-but-
+        # not-dominating setting here, NOT a weak one. balance_weight drives the
+        # marginal-entropy (load-balancing) term that prevents component collapse
+        # and needs to be ~1.0 to be effective (at 0.3 collapse still occurs);
+        # var_reg keeps per-component variances well-conditioned. Defaults were
+        # chosen from the sweep in examples/correction-benchmark/sweep-gmm.py.
         if dirichlet_reg > 0 and encoder_architecture != "composition_abundance":
             raise ValueError(
                 "dirichlet_reg > 0 requires encoder_architecture="
@@ -563,11 +703,8 @@ class FactorizationModel:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.sf_sigma = sf_sigma
         self.alpha_reg = alpha_reg
         self.sparsity_reg = sparsity_reg
-        self.r_prior_alpha = r_prior_alpha
-        self.r_prior_beta = r_prior_beta
         if metagene_reg_type not in ("none", "min_volume"):
             raise ValueError(
                 f"Unknown metagene_reg_type: {metagene_reg_type}. "
@@ -581,7 +718,12 @@ class FactorizationModel:
         self.gene_floor_margin = gene_floor_margin
         self.dirichlet_reg = dirichlet_reg
         self.dirichlet_alpha = dirichlet_alpha
-        self.likelihood = likelihood
+        self.n_components = n_components
+        self.mixture_strength = mixture_strength
+        self.entropy_weight = entropy_weight
+        self.balance_weight = balance_weight
+        self.var_reg = var_reg
+        self.resp_temperature = resp_temperature
 
         mean_expr_raw = np.asarray(self.X.mean(axis=0)).squeeze().astype(np.float32)
         log_mean_expr = torch.tensor(np.log(mean_expr_raw + 1e-4), dtype=torch.float32)
@@ -605,6 +747,8 @@ class FactorizationModel:
             encoder_architecture=encoder_architecture,
             composition_activation=composition_activation,
             gene_expression=self.gene_expression,
+            n_components=n_components,
+            resp_temperature=resp_temperature,
         )
 
     def fit(
@@ -620,6 +764,7 @@ class FactorizationModel:
         patience: int = 80,
         min_delta: float = 1e-5,
         sparsity_annealing: bool = True,
+        mixture_warmup: bool = True,
     ):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -675,6 +820,19 @@ class FactorizationModel:
                 else:
                     current_sparsity_reg = self.sparsity_reg
 
+                # Warm the GMM prior in over the first ~40% of training. Applying
+                # full mixture pressure to a still-random u collapses components
+                # before the latent has organized into anything cluster-shaped;
+                # letting reconstruction establish structure first, then ramping
+                # in the prior, is markedly more robust.
+                if self.n_components is not None and mixture_warmup and nepochs > 1:
+                    warmup_frac = 0.4
+                    current_mixture_strength = self.mixture_strength * min(
+                        1.0, (epoch + 1) / max(1, int(nepochs * warmup_frac))
+                    )
+                else:
+                    current_mixture_strength = self.mixture_strength
+
                 batch_sampler.shuffle()
                 epoch_loss_sum = 0.0
                 epoch_batch_count = 0
@@ -699,6 +857,10 @@ class FactorizationModel:
                         gene_floor_margin=self.gene_floor_margin,
                         dirichlet_reg=self.dirichlet_reg,
                         dirichlet_alpha=self.dirichlet_alpha,
+                        mixture_strength=current_mixture_strength if self.n_components is not None else 0.0,
+                        entropy_weight=self.entropy_weight,
+                        balance_weight=self.balance_weight,
+                        var_reg=self.var_reg,
                     )
                     loss.backward()
                     if grad_clip is not None:
@@ -819,3 +981,30 @@ class FactorizationModel:
     def get_latent_representation(self, batch_size: int = 4096) -> np.ndarray:
         """Returns the non-negative cell factor loadings W (after softplus)."""
         return self.get_factor_loadings()
+
+    def get_cluster_assignments(self, batch_size: int = 4096) -> tuple[np.ndarray, np.ndarray]:
+        """Returns cluster assignments from the GMM prior on U.
+        
+        Returns:
+            assignments: Array of shape (n_cells,) with cluster indices (argmax of π)
+            π: Array of shape (n_cells, n_components) with mixture weights
+        """
+        if self.n_components is None:
+            raise ValueError("Model was not initialized with n_components")
+        
+        self.model.eval()
+        π_list = []
+        
+        with torch.no_grad():
+            α = torch.exp(self.model.log_α) if self.model.include_diffusion else None
+            for start_idx in range(0, self.m, batch_size):
+                end_idx = min(start_idx + batch_size, self.m)
+                u_chunk = self._encode_chunk(start_idx, end_idx, α)
+                _, γ = self.model.compute_gmm_loss(u_chunk)
+                assert γ is not None
+                π_list.append(γ.cpu().numpy())
+        
+        π_all = np.concatenate(π_list, axis=0)
+        assignments = np.argmax(π_all, axis=-1)
+        
+        return assignments, π_all
