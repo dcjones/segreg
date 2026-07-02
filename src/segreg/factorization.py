@@ -357,6 +357,7 @@ class FactorizationVAE(nn.Module):
         resp_temperature: float = 2.0,
         likelihood: str = "poisson",
         mixture_space: str = "clr",
+        mixture_prior: str = "generative",
         component_means_init: np.ndarray | None = None,
         component_log_vars_init: np.ndarray | None = None,
     ):
@@ -400,6 +401,33 @@ class FactorizationVAE(nn.Module):
                 f"Must be one of: 'softmax', 'sparsemax', 'entmax15'."
             )
         self.metagene_activation = metagene_activation
+
+        # "regularizer": the GMM is a soft density term bolted onto the
+        # deterministic point-estimate u (the original). "generative": a proper
+        # VaDE-style mixture *prior* -- z is sampled from q(z|x)=N(clr(u), σ²),
+        # the composition is decoded from the *sampled* z (u_z = scale·softmax(z)),
+        # and responsibilities are evaluated at that same z, so component
+        # assignment is coupled to reconstruction likelihood (a dedicated
+        # component is rewarded for explaining a cell's counts). This is the
+        # structural analog of proseg's generative Gamma mixture, motivated by the
+        # probe finding that immune types are linearly separable in the latent yet
+        # the density-only regularizer refuses to carve them out.
+        if mixture_prior not in ("regularizer", "generative"):
+            raise ValueError(
+                f"Unknown mixture_prior: {mixture_prior}. "
+                f"Must be 'regularizer' or 'generative'."
+            )
+        if mixture_prior == "generative" and mixture_space != "clr":
+            raise ValueError(
+                "mixture_prior='generative' requires mixture_space='clr' "
+                "(it decodes the composition as softmax(z) in the CLR latent)."
+            )
+        self.mixture_prior = mixture_prior
+        if mixture_prior == "generative":
+            # Global (cell-independent) encoder log-variance for q(z|x). A
+            # per-cell amortized head is the natural next step; a shared σ² is a
+            # smaller first change and still supplies the stochastic coupling.
+            self.encoder_log_var = nn.Parameter(torch.full((k,), math.log(0.1)))
 
         if v_init is None:
             v = torch.empty(k, n)
@@ -581,7 +609,21 @@ class FactorizationVAE(nn.Module):
         # strips the cell-size axis (CLR is scale-invariant) so the Gaussian
         # components fit composition *shape* rather than scale·shape.
         z = self._mixture_features(u)  # [B, k]
+        return self._gmm_terms(z, tempered=self.mixture_prior != "generative")
 
+    def _gmm_terms(
+        self, z: torch.Tensor, tempered: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """GMM marginal log-density and responsibilities at latent z (already in
+        the mixture space). Split out from compute_gmm_loss so the generative path
+        can evaluate it at a *sampled* z rather than at clr(u).
+
+        tempered=True divides the responsibility logits by resp_temperature·k --
+        needed by the regularizer path to keep the load-balancing gradient alive
+        at high k (an untempered posterior saturates to one-hot). The generative
+        (VaDE) path passes tempered=False: its ELBO requires the *true* posterior
+        γ=p(c|z), and it relies on separated k-means-initialized components rather
+        than a balance term to avoid collapse."""
         # log N(z | μ_k, σ²_k) = -0.5 [ Σ_g log σ²_kg + Σ_g (z_g - μ_kg)²/σ²_kg ]
         # (dropping the z-independent -0.5*d*log(2π) constant), vectorized over
         # components.
@@ -611,8 +653,11 @@ class FactorizationVAE(nn.Module):
         # (~2 keeps all components alive with well-spread usage here). This keeps
         # the balance gradient alive while still tracking the component geometry, so
         # assignments stay stable run-to-run -- unlike the old decoupled MLP head.
-        k_dim = self.component_means.shape[1]
-        γ = F.softmax(log_joint / (self.resp_temperature * k_dim), dim=-1)  # [B, K]
+        if tempered:
+            k_dim = self.component_means.shape[1]
+            γ = F.softmax(log_joint / (self.resp_temperature * k_dim), dim=-1)  # [B, K]
+        else:
+            γ = F.softmax(log_joint, dim=-1)  # true posterior p(c|z) for the ELBO
 
         return log_mixture_prob, γ
 
@@ -622,8 +667,26 @@ class FactorizationVAE(nn.Module):
         α = torch.exp(self.log_α) if self.include_diffusion else None
         u = self.encode(X, inflow, φ, α)
 
-        # Per-cell GMM prior log-density and amortized responsibilities.
-        log_mixture_prob, π = self.compute_gmm_loss(u)
+        aux = None
+        if self.mixture_prior == "generative" and self.n_components is not None:
+            # z ~ q(z|x) = N(z_mean, σ²) with z_mean = clr(u); decode the
+            # composition from the *sampled* z so reconstruction and cluster
+            # responsibilities share the latent. At eval (no grad / not training)
+            # z = z_mean, so u_z = scale·softmax(clr(u)) = u exactly and the
+            # inference/eval paths are unchanged.
+            z_mean = self._mixture_features(u)  # clr(u), [B, k]
+            if self.training:
+                std = torch.exp(0.5 * self.encoder_log_var)
+                z = z_mean + std * torch.randn_like(z_mean)
+            else:
+                z = z_mean
+            scale = u.sum(dim=-1, keepdim=True)
+            u = scale * F.softmax(z, dim=-1)  # u_z drives the decoder
+            log_mixture_prob, π = self._gmm_terms(z, tempered=False)
+            aux = (z_mean, self.encoder_log_var)
+        else:
+            # Per-cell GMM prior log-density and amortized responsibilities.
+            log_mixture_prob, π = self.compute_gmm_loss(u)
 
         λ = u @ self.v_norm()
 
@@ -636,7 +699,7 @@ class FactorizationVAE(nn.Module):
             else:
                 λ = λ + δ
 
-        return u, λ, log_mixture_prob, π
+        return u, λ, log_mixture_prob, π, aux
 
     def metagene_regularization(self):
         pass
@@ -674,7 +737,7 @@ def loss_fn(
     balance_weight: float = 1.0,
     var_reg: float = 1.0,
 ) -> torch.Tensor:
-    u, λ, log_mixture_prob, π = model(X, inflow, φ)
+    u, λ, log_mixture_prob, π, aux = model(X, inflow, φ)
     v = model.v_norm()
 
     if model.likelihood == "nb":
@@ -704,7 +767,45 @@ def loss_fn(
     # same scale as the summed poisson reconstruction above -- with a .mean()
     # the prior was ~batch_size× too weak to shape u at all (it merely fit the
     # components to a latent space reconstruction alone had already organized).
-    if mixture_strength > 0 and π is not None:
+    if mixture_strength > 0 and π is not None and model.mixture_prior == "generative":
+        # Proper VaDE ELBO for the mixture prior. The reconstruction above already
+        # used the sampled z (see forward), so here we add the KL between q(z,c|x)
+        # and the mixture prior p(z,c). All terms summed over the batch to match
+        # the summed reconstruction. z_mean and the encoder log-variance come back
+        # in aux; μ_c, σ²_c are the component parameters; γ = π are the
+        # responsibilities evaluated at the sampled z.
+        assert aux is not None
+        B = π.shape[0]
+        z_mean, enc_log_var = aux  # [B,k], [k]
+        enc_var = torch.exp(enc_log_var)  # [k]
+        var_c = torch.exp(model.component_log_vars) + 1e-6  # [K,k]
+        diff = z_mean.unsqueeze(1) - model.component_means.unsqueeze(0)  # [B,K,k]
+        # E_q E_γ[-log p(z|c)] (drop 2π): 0.5 Σ_c γ_c Σ_j[logσ²_c + σ²_x/σ²_c + (m-μ)²/σ²_c]
+        per_ck = (
+            model.component_log_vars.unsqueeze(0)
+            + enc_var.view(1, 1, -1) / var_c.unsqueeze(0)
+            + diff**2 / var_c.unsqueeze(0)
+        )  # [B,K,k]
+        gauss_kl = 0.5 * (π * per_ck.sum(dim=-1)).sum()
+        # -E_q[log q(z|x)] = +0.5 Σ_j(1 + logσ²_x) per cell (encoder entropy).
+        qz_entropy = -0.5 * (1.0 + enc_log_var).sum() * B
+        # E_γ[log q(c|z)] responsibility entropy (drives confident assignment);
+        # -E_γ[log p(c)] is constant for uniform π and dropped.
+        resp_entropy = (π * torch.log(π + 1e-8)).sum()
+        vade_kl = gauss_kl + qz_entropy + resp_entropy
+
+        # Keep the marginal-entropy load-balancing term (anti-collapse); it is
+        # orthogonal to the ELBO and still needed to keep all components alive.
+        π_bar = π.mean(dim=0)
+        marg_entropy = -(π_bar * torch.log(π_bar + 1e-8)).sum()
+
+        gmm_loss = vade_kl - balance_weight * B * marg_entropy
+        loss = loss + mixture_strength * gmm_loss
+
+        if var_reg > 0:
+            loss = loss + var_reg * (model.component_log_vars**2).sum()
+
+    elif mixture_strength > 0 and π is not None:
         B = π.shape[0]
 
         # (a) Gaussian fit: pull each cell's u toward its responsible
@@ -834,24 +935,27 @@ class FactorizationModel:
         dirichlet_alpha: float = 0.5,
         init_method: str = "nndsvd",
         n_components: int | None = 10,
-        mixture_strength: float = 0.1,
+        mixture_strength: float = 1.0,
         entropy_weight: float = 0.05,
         balance_weight: float = 1.0,
         var_reg: float = 1.0,
         resp_temperature: float = 2.0,
         likelihood: str = "poisson",
         mixture_space: str = "clr",
+        mixture_prior: str = "generative",
         component_init: str = "random",
     ):
         # NOTE on the GMM-prior hyperparameters (only active when n_components is
-        # set). The per-cell prior terms in loss_fn are *summed* over the batch to
-        # match the summed poisson reconstruction, so mixture_strength is on a very
-        # different scale than a mean-reduced prior would be -- ~0.1 is a strong-but-
-        # not-dominating setting here, NOT a weak one. balance_weight drives the
-        # marginal-entropy (load-balancing) term that prevents component collapse
-        # and needs to be ~1.0 to be effective (at 0.3 collapse still occurs);
-        # var_reg keeps per-component variances well-conditioned. Defaults were
-        # chosen from the sweep in examples/correction-benchmark/sweep-gmm.py.
+        # set). The default is the generative (VaDE-style) mixture prior, which
+        # couples cluster assignment to reconstruction and reproduces proseg's
+        # cell-type separation (see the mixture_prior arg). For it, mixture_strength
+        # is the β on the VaDE KL and 1.0 (the proper ELBO weight) is correct; the
+        # KL and reconstruction are both summed over the batch, so they sit on the
+        # same scale. balance_weight drives the marginal-entropy load-balancing term
+        # (keeps all components in use); var_reg keeps per-component variances
+        # well-conditioned. entropy_weight and resp_temperature only affect the
+        # older mixture_prior="regularizer" path. Defaults come from the sweeps in
+        # examples/correction-benchmark/sweep-gmm.py.
         if dirichlet_reg > 0 and encoder_architecture != "composition_abundance":
             raise ValueError(
                 "dirichlet_reg > 0 requires encoder_architecture="
@@ -928,6 +1032,7 @@ class FactorizationModel:
             resp_temperature=resp_temperature,
             likelihood=likelihood,
             mixture_space=mixture_space,
+            mixture_prior=mixture_prior,
             component_means_init=component_means_init,
             component_log_vars_init=component_log_vars_init,
         )
