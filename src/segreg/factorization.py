@@ -304,9 +304,27 @@ class FactorizationVAE(nn.Module):
         gene_expression: torch.Tensor | None = None,
         n_components: int | None = None,
         resp_temperature: float = 2.0,
+        likelihood: str = "poisson",
+        mixture_space: str = "clr",
     ):
         super().__init__()
         self.resp_temperature = resp_temperature
+        if likelihood not in ("poisson", "nb"):
+            raise ValueError(
+                f"Unknown likelihood: {likelihood}. Must be 'poisson' or 'nb'."
+            )
+        self.likelihood = likelihood
+        # Space the latent GMM operates in. "u" = the raw loadings scale·composition
+        # (the original; clusters partly on cell size, per the scale-confound
+        # diagnostic). "clr" = centered-log-ratio of u, i.e. a logistic-normal
+        # mixture in Aitchison geometry. CLR is scale-invariant (clr(s·c)=clr(c)),
+        # so it removes the cell-size axis exactly and clusters on composition
+        # shape alone, while reusing the same Gaussian components/responsibilities.
+        if mixture_space not in ("u", "clr"):
+            raise ValueError(
+                f"Unknown mixture_space: {mixture_space}. Must be 'u' or 'clr'."
+            )
+        self.mixture_space = mixture_space
 
         if encoder_architecture not in ("joint", "composition_abundance"):
             raise ValueError(
@@ -336,6 +354,15 @@ class FactorizationVAE(nn.Module):
             self.v = nn.Parameter(v)
         else:
             self.v = nn.Parameter(torch.from_numpy(v_init))
+
+        # Per-gene NB dispersion r_g = exp(log_r); variance = μ + μ²/r. Larger r →
+        # Poisson limit. Only used when likelihood="nb". Initialized at r=10
+        # (mild overdispersion) and learned per gene; the point (per the
+        # scale-confound diagnostic) is to let r shrink for overdispersed
+        # high-count structural genes, softening their grip on the reconstruction
+        # gradient so low-count marker genes can shape the latent.
+        if likelihood == "nb":
+            self.log_r = nn.Parameter(torch.full((n,), math.log(10.0)))
 
         self.include_diffusion = include_diffusion
         self.diffusion_aware_encoder = diffusion_aware_encoder and include_diffusion
@@ -445,6 +472,22 @@ class FactorizationVAE(nn.Module):
         else:
             return self.encoder(X)
 
+    def _mixture_features(self, u: torch.Tensor) -> torch.Tensor:
+        """Project the loadings u into the space the latent GMM clusters in.
+
+        "u": identity (cluster scale·composition directly).
+        "clr": centered log-ratio, clr(u)_i = log u_i - mean_j log u_j. Because
+        clr(s·c) = clr(c), this discards the per-cell scale exactly and leaves
+        only the composition shape, mapped to the zero-sum subspace of R^k where
+        a Gaussian mixture (a logistic-normal mixture on the simplex) is the
+        appropriate model. A small floor guards log(0); u from the joint encoder
+        is a strictly-positive softplus, so the floor only bounds tiny entries.
+        """
+        if self.mixture_space == "clr":
+            log_u = torch.log(u.clamp_min(1e-3))
+            return log_u - log_u.mean(dim=-1, keepdim=True)
+        return u
+
     def compute_gmm_loss(
         self, u: torch.Tensor
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -468,11 +511,16 @@ class FactorizationVAE(nn.Module):
         if self.n_components is None:
             return None, None
 
-        # log N(u | μ_k, σ²_k) = -0.5 [ Σ_g log σ²_kg + Σ_g (u_g - μ_kg)²/σ²_kg ]
-        # (dropping the u-independent -0.5*d*log(2π) constant), vectorized over
+        # Map the loadings into the space the mixture lives in. For "clr" this
+        # strips the cell-size axis (CLR is scale-invariant) so the Gaussian
+        # components fit composition *shape* rather than scale·shape.
+        z = self._mixture_features(u)  # [B, k]
+
+        # log N(z | μ_k, σ²_k) = -0.5 [ Σ_g log σ²_kg + Σ_g (z_g - μ_kg)²/σ²_kg ]
+        # (dropping the z-independent -0.5*d*log(2π) constant), vectorized over
         # components.
         var = torch.exp(self.component_log_vars) + 1e-6  # [K, k]
-        diff = u.unsqueeze(1) - self.component_means.unsqueeze(0)  # [B, K, k]
+        diff = z.unsqueeze(1) - self.component_means.unsqueeze(0)  # [B, K, k]
         mahal = (diff**2 / var.unsqueeze(0)).sum(dim=-1)  # [B, K]
         log_norm = self.component_log_vars.sum(dim=-1).unsqueeze(0)  # [1, K]
         log_probs = -0.5 * (log_norm + mahal)  # [B, K]
@@ -563,7 +611,12 @@ def loss_fn(
     u, λ, log_mixture_prob, π = model(X, inflow, φ)
     v = model.v_norm()
 
-    loss = -poisson_logprob_sparse(λ, X, constant_terms=False, row_idx=row_idx)
+    if model.likelihood == "nb":
+        loss = -nb_logprob_sparse(
+            λ, X, model.log_r, constant_terms=False, row_idx=row_idx
+        )
+    else:
+        loss = -poisson_logprob_sparse(λ, X, constant_terms=False, row_idx=row_idx)
     if model.include_diffusion:
         loss = loss + alpha_log_prior_loss(
             model.log_α, alpha_reg, gene_expression=model.gene_expression
@@ -640,6 +693,50 @@ def poisson_logprob_sparse(
     return lp
 
 
+def nb_logprob_sparse(
+    λ: torch.Tensor,
+    X: torch.Tensor,
+    log_r: torch.Tensor,
+    constant_terms: bool = False,
+    row_idx: torch.Tensor | None = None,
+):
+    """Log probability for sparse CSR input under a negative-binomial likelihood
+    with per-gene dispersion r_g = exp(log_r), mean μ = λ (dense).
+
+    Mirrors poisson_logprob_sparse's sparsity trick. The NB logpmf is
+
+        lgamma(x+r) - lgamma(r) - lgamma(x+1) + r·log r - (x+r)·log(r+μ) + x·log μ
+
+    which does not collapse to −λ at x=0 (unlike Poisson), so the zero-entries
+    still carry a μ-dependent term r·log(r/(r+μ)). We compute that baseline
+    densely over all entries (μ is already dense) and add the x>0 correction over
+    the nonzeros only.
+    """
+    r = torch.exp(log_r)  # [n_genes], broadcasts over cells
+    col_idx = X.col_indices()
+    if row_idx is None:
+        row_idx, col_idx = _sparse_row_col_indices(X)
+    x_data = X.values()
+    μ = λ.clamp(1e-8)
+    log_r_plus_μ = torch.log(r + μ)  # [B, n_genes]
+
+    # x=0 baseline over every cell×gene entry: r·log r − r·log(r+μ).
+    baseline = (r * (torch.log(r) - log_r_plus_μ)).sum()
+
+    # x>0 correction on the nonzeros: everything the baseline omitted.
+    r_nz = r[col_idx]
+    lp_nz = (
+        torch.lgamma(x_data + r_nz)
+        - torch.lgamma(r_nz)
+        + x_data * torch.log(μ[row_idx, col_idx])
+        - x_data * log_r_plus_μ[row_idx, col_idx]
+    ).sum()
+    if constant_terms:
+        lp_nz = lp_nz - torch.lgamma(x_data + 1).sum()
+
+    return baseline + lp_nz
+
+
 class FactorizationModel:
     X: csr_matrix
     inflow: csr_matrix | None
@@ -676,6 +773,8 @@ class FactorizationModel:
         balance_weight: float = 1.0,
         var_reg: float = 1.0,
         resp_temperature: float = 2.0,
+        likelihood: str = "poisson",
+        mixture_space: str = "clr",
     ):
         # NOTE on the GMM-prior hyperparameters (only active when n_components is
         # set). The per-cell prior terms in loss_fn are *summed* over the batch to
@@ -749,6 +848,8 @@ class FactorizationModel:
             gene_expression=self.gene_expression,
             n_components=n_components,
             resp_temperature=resp_temperature,
+            likelihood=likelihood,
+            mixture_space=mixture_space,
         )
 
     def fit(
