@@ -163,6 +163,57 @@ def _nndsvd_h_init(X: csr_matrix, k: int, init_ncells: int = 10000) -> np.ndarra
     return np.log(H_norm).astype(np.float32)
 
 
+def _kmeans_component_init(
+    X: csr_matrix,
+    v_init: np.ndarray,
+    n_components: int,
+    mixture_space: str,
+    init_ncells: int = 10000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Data-driven seed for the latent GMM components.
+
+    The default random seed (randn·0.1 near the origin) bears no relation to
+    where cells actually sit in the mixture space, which can trap the clustering
+    in a bad basin. Here we build a cheap proxy for the cell loadings by
+    projecting a sample of cells onto the NNDSVD metagenes (W ≈ X·Hᵀ), map it
+    into the same space the GMM lives in (CLR for "clr", raw for "u"), and
+    k-means it. Centroids seed component_means; within-cluster variances seed
+    component_log_vars so components start appropriately sized rather than all at
+    σ²=1. This is only an initialization -- the projection need not match the
+    trained encoder exactly, just place the components near real data structure.
+    """
+    from sklearn.cluster import KMeans
+
+    m = int(X.shape[0])  # type: ignore[arg-type]
+    rng = np.random.default_rng(42)
+    if m > init_ncells:
+        idx = np.sort(rng.choice(m, init_ncells, replace=False))
+        X_s = X[idx]
+    else:
+        X_s = X
+    # v_init = log(H_norm); H_norm rows sum to 1. W ≈ X·Hᵀ is a rough per-cell
+    # loading (nonnegative), enough to locate cluster centers.
+    H_norm = np.exp(v_init)  # [k, n]
+    W = np.asarray(X_s @ H_norm.T, dtype=np.float64)  # [n_sample, k]
+    W = np.maximum(W, 0.0)
+
+    if mixture_space == "clr":
+        log_w = np.log(np.clip(W, 1e-3, None))
+        feats = log_w - log_w.mean(axis=1, keepdims=True)
+    else:
+        feats = W
+
+    km = KMeans(n_clusters=n_components, n_init=10, random_state=42).fit(feats)
+    means = km.cluster_centers_.astype(np.float32)  # [n_components, k]
+    log_vars = np.zeros((n_components, feats.shape[1]), dtype=np.float32)
+    for c in range(n_components):
+        sel = km.labels_ == c
+        if sel.sum() > 1:
+            var = feats[sel].var(axis=0) + 1e-4
+            log_vars[c] = np.log(var).astype(np.float32)
+    return means, log_vars
+
+
 class SparseLinear(nn.Module):
     """
     Linear layer that handles both sparse CSR and dense input.
@@ -306,6 +357,8 @@ class FactorizationVAE(nn.Module):
         resp_temperature: float = 2.0,
         likelihood: str = "poisson",
         mixture_space: str = "clr",
+        component_means_init: np.ndarray | None = None,
+        component_log_vars_init: np.ndarray | None = None,
     ):
         super().__init__()
         self.resp_temperature = resp_temperature
@@ -429,12 +482,25 @@ class FactorizationVAE(nn.Module):
         # that instability and the extra parameters.
         self.n_components = n_components
         if n_components is not None:
-            # Component means in factor space
-            self.component_means = nn.Parameter(torch.randn(n_components, k) * 0.1)
-            # Component log-variances (learnable, initialized to log(1) = 0, i.e.
-            # σ²=1, matching the var_reg prior's center so components start
+            # Component means in the mixture space (CLR or u). Seeded from k-means
+            # on projected cell loadings when a data-driven init is supplied (see
+            # _kmeans_component_init), else a random blob near the origin.
+            if component_means_init is not None:
+                self.component_means = nn.Parameter(
+                    torch.from_numpy(component_means_init.astype(np.float32))
+                )
+            else:
+                self.component_means = nn.Parameter(torch.randn(n_components, k) * 0.1)
+            # Component log-variances (learnable). Seeded from within-cluster
+            # variance when a data-driven init is supplied, else log(1)=0 (σ²=1,
+            # matching the var_reg prior's center so components start
             # well-conditioned rather than as narrow spikes).
-            self.component_log_vars = nn.Parameter(torch.zeros(n_components, k))
+            if component_log_vars_init is not None:
+                self.component_log_vars = nn.Parameter(
+                    torch.from_numpy(component_log_vars_init.astype(np.float32))
+                )
+            else:
+                self.component_log_vars = nn.Parameter(torch.zeros(n_components, k))
             # Global log mixing weights π_k. Fixed uniform (a buffer, not a
             # Parameter): the load-balancing term already governs aggregate usage,
             # and leaving the mixing weights learnable just gives collapse another
@@ -775,6 +841,7 @@ class FactorizationModel:
         resp_temperature: float = 2.0,
         likelihood: str = "poisson",
         mixture_space: str = "clr",
+        component_init: str = "random",
     ):
         # NOTE on the GMM-prior hyperparameters (only active when n_components is
         # set). The per-cell prior terms in loss_fn are *summed* over the batch to
@@ -833,6 +900,17 @@ class FactorizationModel:
         if init_method == "nndsvd":
             v_init = _nndsvd_h_init(self.X, n_factors)
 
+        if component_init not in ("kmeans", "random"):
+            raise ValueError(
+                f"Unknown component_init: {component_init}. Must be 'kmeans' or 'random'."
+            )
+        component_means_init = None
+        component_log_vars_init = None
+        if n_components is not None and component_init == "kmeans" and v_init is not None:
+            component_means_init, component_log_vars_init = _kmeans_component_init(
+                self.X, v_init, n_components, mixture_space
+            )
+
         self.model = FactorizationVAE(
             self.n,
             n_factors,
@@ -850,6 +928,8 @@ class FactorizationModel:
             resp_temperature=resp_temperature,
             likelihood=likelihood,
             mixture_space=mixture_space,
+            component_means_init=component_means_init,
+            component_log_vars_init=component_log_vars_init,
         )
 
     def fit(
