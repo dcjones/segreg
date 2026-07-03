@@ -1245,34 +1245,53 @@ class FactorizationModel:
             device=self.device,
         )
 
-    def get_corrected_expression(
-        self, threshold: float = 1e-4, batch_size: int = 4096
-    ) -> csr_matrix:
-        """Returns the decontaminated latent rate lambda(theta) = u @ v_norm(),
-        i.e. the cell's own rate *before* the retention/inflow adjustment -- matching
-        the paper's notation and RegressionModel.get_corrected_expression. This is
-        NOT the same as the model's reconstruction target (retention*lambda + delta),
-        which is fit to match the raw, contaminated counts and so is not decontaminated
-        at all; use FactorizationVAE.forward directly if the reconstruction is wanted."""
+    def get_corrected_expression(self, batch_size: int = 4096, eps: float = 1e-8) -> csr_matrix:
+        """Residual (responsibility-weighted) decontaminated expression: X * λ/μ.
+
+        λ = u @ v_norm() is the cell's own (contamination-free) rate; μ =
+        retention*λ + α*inflow is the model's reconstruction of the *observed*
+        rate. Multiplying the raw counts X by λ/μ keeps the raw data's full
+        per-cell resolution and its genuine zeros (the output has X's exact
+        sparsity pattern), reweighting each observed count by the model's estimate
+        that it is own signal rather than inflow, and dividing by retention to
+        restore signal lost to outflow.
+
+        This replaces the earlier product (the bare low-rank rate λ). λ manufactures
+        cross-type signal -- softmax over factors gives every cell a nonzero dose of
+        every metagene, smearing markers across cell types -- and over-smooths, so
+        it scored WORST on the honest metrics (probe separability, Leiden ARI, and a
+        scale-invariant marker-leakage ratio: λ's leakage was ~3x raw). The residual
+        Pareto-dominates it. See examples/correction-benchmark/eval-harness.py /
+        segreg.evaluation. Without diffusion, μ=λ and this reduces to X (no
+        contamination model -> nothing to correct). The low-rank λ is still
+        available as get_factor_loadings() @ get_factor_programs()."""
         self.model.eval()
 
         rows, cols, data = [], [], []
-        current_row = 0
         with torch.no_grad():
+            vnorm = self.model.v_norm()
             α = torch.exp(self.model.log_α) if self.model.include_diffusion else None
             for start_idx in range(0, self.m, batch_size):
                 end_idx = min(start_idx + batch_size, self.m)
 
                 u_chunk = self._encode_chunk(start_idx, end_idx, α)
-                λ = u_chunk @ self.model.v_norm()
-                λ_np = λ.cpu().numpy()
+                λ = u_chunk @ vnorm  # [c, n] own rate
+                X = self._chunk_csr_tensor(self.X, start_idx, end_idx).to_dense()
+                if self.model.include_diffusion:
+                    assert α is not None and self.inflow is not None and self.φ is not None
+                    φ = self._chunk_csr_tensor(self.φ, start_idx, end_idx).to_dense()
+                    inflow = self._chunk_csr_tensor(self.inflow, start_idx, end_idx).to_dense()
+                    retention = torch.exp(-α.unsqueeze(0) * φ)
+                    μ = retention * λ + α.unsqueeze(0) * inflow
+                else:
+                    μ = λ
+                # X's zeros stay zero; nonzeros are reweighted by own-signal fraction.
+                corrected = (X * λ / μ.clamp(min=eps)).cpu().numpy()
 
-                λ_np[λ_np < threshold] = 0.0
-                r, c = np.nonzero(λ_np)
-                rows.append(r + current_row)
+                r, c = np.nonzero(corrected)
+                rows.append(r + start_idx)
                 cols.append(c)
-                data.append(λ_np[r, c])
-                current_row += end_idx - start_idx
+                data.append(corrected[r, c])
 
         return csr_matrix(
             (np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
