@@ -1116,7 +1116,7 @@ class FactorizationModel:
         compile: bool = False,
         quiet: bool = False,
         grad_clip: float | None = 1.0,
-        lr_schedule: str = "cosine",
+        lr_schedule: str = "reduce_on_plateau",
         patience: int = 80,
         min_delta: float = 1e-5,
         sparsity_annealing: bool = True,
