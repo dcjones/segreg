@@ -245,10 +245,14 @@ class SparseFactorizationEncoder(nn.Module):
     so the encoder starts out identical to the X-only baseline.
     """
 
-    def __init__(self, n: int, k: int, use_diffusion_input: bool = False):
+    def __init__(
+        self, n: int, k: int, use_diffusion_input: bool = False,
+        diffusion_input_mode: str = "additive",
+    ):
         super().__init__()
         self.layer = SparseLinear(n, k)
         self.use_diffusion_input = use_diffusion_input
+        self.diffusion_input_mode = diffusion_input_mode
         if use_diffusion_input:
             self.inflow_layer = SparseLinear(n, k)
             self.phi_layer = SparseLinear(n, k)
@@ -266,7 +270,16 @@ class SparseFactorizationEncoder(nn.Module):
         h = self.layer(X)
         if self.use_diffusion_input:
             assert inflow is not None and φ is not None
-            h = h + self.inflow_layer(inflow) + self.phi_layer(φ)
+            if self.diffusion_input_mode == "subtractive":
+                # Inflow (contamination) can only DISCOUNT factor loadings, never
+                # inflate them -- relu(·)>=0 subtracted, zero-init so it starts at 0
+                # (baseline). This is the inductive bias the free additive form
+                # lacked: on the honest metrics the additive encoder "leaned into"
+                # inflow as a generic feature and over-removed signal. Outflow φ
+                # stays free-additive (it should *recover* signal lost to outflow).
+                h = h - F.relu(self.inflow_layer(inflow)) + self.phi_layer(φ)
+            else:
+                h = h + self.inflow_layer(inflow) + self.phi_layer(φ)
         return F.softplus(h)
 
 
@@ -346,8 +359,10 @@ class FactorizationVAE(nn.Module):
         k: int,
         v_init: np.ndarray | None,
         include_diffusion: bool,
-        diffusion_aware_encoder: bool = False,
+        diffusion_aware_encoder: bool = True,
         decontaminate_encoder: bool = False,
+        diffusion_input_mode: str = "subtractive",
+        per_cell_alpha: bool = False,
         include_retention: bool = True,
         include_delta: bool = True,
         metagene_activation: str = "entmax15",
@@ -484,7 +499,8 @@ class FactorizationVAE(nn.Module):
             )
         else:
             self.encoder = SparseFactorizationEncoder(
-                n, k, use_diffusion_input=self.diffusion_aware_encoder
+                n, k, use_diffusion_input=self.diffusion_aware_encoder,
+                diffusion_input_mode=diffusion_input_mode,
             )
         if include_diffusion:
             # alpha = exp(log_alpha) >= 0, unbounded above: the paper's model (see
@@ -501,6 +517,25 @@ class FactorizationVAE(nn.Module):
                 self.register_buffer("gene_expression", gene_expression)
             else:
                 self.gene_expression = None
+
+            # Per-cell alpha: α_cg = α_g · exp(head(inflow_c) + head(φ_c)). The
+            # global α_g removes the same inflow fraction from every cell, which is
+            # too blunt -- a tumor-adjacent immune cell has more real contamination
+            # than an interior one, and a single α_g can't be both ≈1 (interior)
+            # and >1 (boundary). The per-cell modulation reads the cell's own
+            # inflow/φ (the signal for how contaminated it is) and scales α up/down.
+            # Gene-specificity still comes from inflow_cg (data); the head supplies
+            # the cell-level factor. Zero-init -> modulation ≡ 1, so training starts
+            # at the global-α model and learns the per-cell adjustment.
+            self.per_cell_alpha = per_cell_alpha and include_diffusion
+            if self.per_cell_alpha:
+                self.alpha_inflow_head = SparseLinear(n, 1)
+                self.alpha_phi_head = SparseLinear(n, 1)
+                for h in (self.alpha_inflow_head, self.alpha_phi_head):
+                    nn.init.zeros_(h.weight)
+                    nn.init.zeros_(h.bias)
+        else:
+            self.per_cell_alpha = False
 
         # GMM prior on U (VaDE/GMVAE-style). Cluster responsibilities are computed
         # *analytically* from the Gaussian components (see compute_gmm_loss), not by
@@ -544,6 +579,21 @@ class FactorizationVAE(nn.Module):
         if self.metagene_activation == "entmax15":
             return entmax15(self.v, dim=1)
         return F.softmax(self.v, dim=1)
+
+    def alpha(
+        self, inflow: torch.Tensor | None = None, φ: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Per-gene α_g = exp(log_α), shape [n]; or, if per_cell_alpha, the per-cell
+        α_cg = α_g · exp(head(inflow_c) + head(φ_c)), shape [B, n]. Both broadcast
+        against [B, n] inflow/φ in the reconstruction. Shared by forward() and
+        get_corrected_expression() so they stay consistent."""
+        a = torch.exp(self.log_α)  # [n]
+        if self.per_cell_alpha and inflow is not None:
+            logit = self.alpha_inflow_head(inflow)  # [B, 1]
+            if φ is not None:
+                logit = logit + self.alpha_phi_head(φ)
+            return a.unsqueeze(0) * torch.exp(logit)  # [B, n]
+        return a
 
     def encode(
         self,
@@ -669,8 +719,10 @@ class FactorizationVAE(nn.Module):
     def forward(
         self, X: torch.Tensor, inflow: torch.Tensor | None, φ: torch.Tensor | None
     ):
-        α = torch.exp(self.log_α) if self.include_diffusion else None
-        u = self.encode(X, inflow, φ, α)
+        # Per-gene α for the encoder's contamination discount (decontaminate_encoder);
+        # the reconstruction below uses alpha() which may be per-cell.
+        α_enc = torch.exp(self.log_α) if self.include_diffusion else None
+        u = self.encode(X, inflow, φ, α_enc)
 
         aux = None
         if self.mixture_prior == "generative" and self.n_components is not None:
@@ -696,7 +748,8 @@ class FactorizationVAE(nn.Module):
         λ = u @ self.v_norm()
 
         if self.include_diffusion:
-            assert inflow is not None and φ is not None and α is not None
+            assert inflow is not None and φ is not None
+            α = self.alpha(inflow, φ)  # [n] or [B, n]
             δ = α * inflow.to_dense() if self.include_delta else 0.0
             if self.include_retention:
                 retention = torch.exp(-α * φ.to_dense())
@@ -925,8 +978,10 @@ class FactorizationModel:
         data: SpatialData | AnnData,
         n_factors: int,
         include_diffusion: bool = True,
-        diffusion_aware_encoder: bool = False,
+        diffusion_aware_encoder: bool = True,
         decontaminate_encoder: bool = False,
+        diffusion_input_mode: str = "subtractive",
+        per_cell_alpha: bool = False,
         include_retention: bool = True,
         include_delta: bool = True,
         metagene_activation: str = "entmax15",
@@ -936,12 +991,12 @@ class FactorizationModel:
         sparsity_reg: float = 0.0,
         metagene_reg_type: str = "none",
         metagene_reg_strength: float = 0.0,
-        gene_floor_reg: float = 10.0,
+        gene_floor_reg: float = 0.0,
         gene_floor_margin: float = -3.0,
         dirichlet_reg: float = 0.0,
         dirichlet_alpha: float = 0.5,
         init_method: str = "nndsvd",
-        n_components: int | None = 10,
+        n_components: int | None = None,
         mixture_strength: float = 1.0,
         entropy_weight: float = 0.05,
         balance_weight: float = 1.0,
@@ -952,17 +1007,19 @@ class FactorizationModel:
         mixture_prior: str = "generative",
         component_init: str = "random",
     ):
-        # NOTE on the GMM-prior hyperparameters (only active when n_components is
-        # set). The default is the generative (VaDE-style) mixture prior, which
-        # couples cluster assignment to reconstruction and reproduces proseg's
-        # cell-type separation (see the mixture_prior arg). For it, mixture_strength
-        # is the β on the VaDE KL and 1.0 (the proper ELBO weight) is correct; the
-        # KL and reconstruction are both summed over the batch, so they sit on the
-        # same scale. balance_weight drives the marginal-entropy load-balancing term
-        # (keeps all components in use); var_reg keeps per-component variances
-        # well-conditioned. entropy_weight and resp_temperature only affect the
-        # older mixture_prior="regularizer" path. Defaults come from the sweeps in
-        # examples/correction-benchmark/sweep-gmm.py.
+        # NOTE on the latent GMM (only active when n_components is set; OFF by
+        # default). The mixture was introduced to give the decontamination a
+        # cell-type inductive bias, but on the honest metrics (probe separability +
+        # Leiden ARI on the residual corrected expression) it made the product
+        # *worse* -- it pulls u toward cluster prototypes, which makes the
+        # correction over-aggressive (removes ~2x more mass) and over-fragments
+        # Leiden, for no leakage benefit -- so it is no longer on by default. It
+        # remains available (set n_components) and, when used, the generative
+        # (VaDE) prior is the good version: mixture_strength=1.0 is the proper ELBO
+        # β; balance_weight drives load-balancing; var_reg conditions the component
+        # variances; entropy_weight/resp_temperature only affect the older
+        # mixture_prior="regularizer" path. See examples/correction-benchmark and
+        # segreg.evaluation.
         if dirichlet_reg > 0 and encoder_architecture != "composition_abundance":
             raise ValueError(
                 "dirichlet_reg > 0 requires encoder_architecture="
@@ -1033,6 +1090,8 @@ class FactorizationModel:
             include_diffusion=include_diffusion,
             diffusion_aware_encoder=diffusion_aware_encoder,
             decontaminate_encoder=decontaminate_encoder,
+            diffusion_input_mode=diffusion_input_mode,
+            per_cell_alpha=per_cell_alpha,
             include_retention=include_retention,
             include_delta=include_delta,
             metagene_activation=metagene_activation,
@@ -1270,19 +1329,20 @@ class FactorizationModel:
         rows, cols, data = [], [], []
         with torch.no_grad():
             vnorm = self.model.v_norm()
-            α = torch.exp(self.model.log_α) if self.model.include_diffusion else None
+            α_enc = torch.exp(self.model.log_α) if self.model.include_diffusion else None
             for start_idx in range(0, self.m, batch_size):
                 end_idx = min(start_idx + batch_size, self.m)
 
-                u_chunk = self._encode_chunk(start_idx, end_idx, α)
+                u_chunk = self._encode_chunk(start_idx, end_idx, α_enc)
                 λ = u_chunk @ vnorm  # [c, n] own rate
                 X = self._chunk_csr_tensor(self.X, start_idx, end_idx).to_dense()
                 if self.model.include_diffusion:
-                    assert α is not None and self.inflow is not None and self.φ is not None
-                    φ = self._chunk_csr_tensor(self.φ, start_idx, end_idx).to_dense()
-                    inflow = self._chunk_csr_tensor(self.inflow, start_idx, end_idx).to_dense()
-                    retention = torch.exp(-α.unsqueeze(0) * φ)
-                    μ = retention * λ + α.unsqueeze(0) * inflow
+                    assert self.inflow is not None and self.φ is not None
+                    inflow_s = self._chunk_csr_tensor(self.inflow, start_idx, end_idx)
+                    φ_s = self._chunk_csr_tensor(self.φ, start_idx, end_idx)
+                    α = self.model.alpha(inflow_s, φ_s)  # [n] or [c, n]
+                    retention = torch.exp(-α * φ_s.to_dense())
+                    μ = retention * λ + α * inflow_s.to_dense()
                 else:
                     μ = λ
                 # X's zeros stay zero; nonzeros are reweighted by own-signal fraction.
