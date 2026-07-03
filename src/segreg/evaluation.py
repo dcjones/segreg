@@ -70,13 +70,23 @@ def _as_dense(X) -> np.ndarray:
 
 def probe_separability(
     X, labels: np.ndarray, mask: np.ndarray | None = None,
+    exclude_cols: np.ndarray | None = None,
     subsample: int = 30000, seed: int = 0, max_iter: int = 300,
 ) -> float:
     """Macro-F1 of a logistic-regression probe predicting `labels` from log1p(X).
 
     Scale-robust to overall count level via the model's own fitting, and macro
     averaging weights every cell type equally (so a rare type can't be ignored).
-    Subsamples for speed; densifies only the subsample."""
+    Subsamples for speed; densifies only the subsample.
+
+    IMPORTANT -- label circularity: `labels` are marker-argmax, so a probe that
+    sees the marker genes just echoes them (including their noise), and *any* edit
+    to markers -- including correct denoising of noisy low-count reads -- reads as
+    "less separable". Pass `exclude_cols` = the marker column indices to drop them
+    from the features; the probe then predicts cell type from OTHER genes, which
+    measures preserved biology rather than marker fidelity. `evaluate()` does this
+    by default. Confirmed on xenium-nsclc: all-genes shows raw≫corrected, but
+    non-marker shows corrected ≥ raw."""
     y = labels
     idx = np.arange(len(y))
     if mask is not None:
@@ -85,7 +95,11 @@ def probe_separability(
     if len(idx) > subsample:
         sub, _ = train_test_split(np.arange(len(idx)), train_size=subsample, stratify=y, random_state=seed)
         idx, y = idx[sub], y[sub]
-    Xd = np.log1p(_as_dense(X[idx]))
+    Xsel = X[idx]
+    if exclude_cols is not None:
+        keep = np.setdiff1d(np.arange(Xsel.shape[1]), exclude_cols)
+        Xsel = Xsel[:, keep]
+    Xd = np.log1p(_as_dense(Xsel))
     Xtr, Xte, ytr, yte = train_test_split(Xd, y, test_size=0.3, stratify=y, random_state=seed)
     clf = LogisticRegression(max_iter=max_iter).fit(Xtr, ytr)
     return float(f1_score(yte, clf.predict(Xte), average="macro"))
@@ -156,14 +170,19 @@ def evaluate(
     mask = None
     if subset_exclude is not None:
         mask = labels != celltypes.index(subset_exclude)
+    # Marker columns are excluded from the probe features to break label
+    # circularity (see probe_separability). "probe" = non-marker (primary, honest);
+    # "probe_all" = all genes (circular, diagnostic only).
+    marker_cols = np.array(sorted({c for cols in marker_idx.values() for c in cols}))
 
     raw_mass = float(np.asarray(products["raw"].sum())) if "raw" in products else None
     rows = []
     for name, X in products.items():
         rec = {"product": name}
-        rec["probe"] = probe_separability(X, labels, seed=seed)
+        rec["probe"] = probe_separability(X, labels, exclude_cols=marker_cols, seed=seed)
+        rec["probe_all"] = probe_separability(X, labels, seed=seed)
         if mask is not None:
-            rec["probe_sub"] = probe_separability(X, labels, mask=mask, seed=seed)
+            rec["probe_sub"] = probe_separability(X, labels, mask=mask, exclude_cols=marker_cols, seed=seed)
         if run_leiden:
             nc, ari, ari_sub = leiden_ari(X, labels, mask=mask, seed=seed)
             rec["n_clust"], rec["ari"] = nc, ari
