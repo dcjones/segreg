@@ -20,6 +20,7 @@ from .losses import (
     min_volume_loss,
 )
 
+
 def sparsemax(z: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Sparsemax projection onto the simplex (Martins & Astudillo, 2016).
 
@@ -424,9 +425,11 @@ class FactorizationVAE(nn.Module):
             )
         self.mixture_prior = mixture_prior
         if mixture_prior == "generative":
-            # Global (cell-independent) encoder log-variance for q(z|x). A
-            # per-cell amortized head is the natural next step; a shared σ² is a
-            # smaller first change and still supplies the stochastic coupling.
+            # Global (cell-independent) encoder log-variance for q(z|x). A per-cell
+            # amortized head was tried and was a wash-to-slightly-worse (no gain on
+            # homogeneity/recall, worse inter_jac, and it did NOT reduce the
+            # run-to-run resolution spread it was meant to), so the shared σ²
+            # stays. Learns to ~σ²≈1 in practice.
             self.encoder_log_var = nn.Parameter(torch.full((k,), math.log(0.1)))
 
         if v_init is None:
@@ -555,7 +558,9 @@ class FactorizationVAE(nn.Module):
         if self.decontaminate_encoder:
             assert inflow is not None and α is not None
             X_dense = X.to_dense() if X.layout == torch.sparse_csr else X
-            inflow_dense = inflow.to_dense() if inflow.layout == torch.sparse_csr else inflow
+            inflow_dense = (
+                inflow.to_dense() if inflow.layout == torch.sparse_csr else inflow
+            )
             inflow_frac = inflow_dense / (X_dense + 1e-6)
             encoder_input = X_dense * torch.exp(-α.unsqueeze(0) * inflow_frac)
             return self.encoder(encoder_input)
@@ -760,7 +765,7 @@ def loss_fn(
         loss = loss + dirichlet_purity_loss(
             model.encoder.last_composition, dirichlet_reg, alpha=dirichlet_alpha
         )
-    
+
     # GMM prior on u, as a "regularized information maximization" clustering
     # objective (Krause et al. 2010; Hu et al. IMSAT 2017) plus the Gaussian
     # fit. All per-cell terms are *summed* over the batch so they sit on the
@@ -776,7 +781,7 @@ def loss_fn(
         # responsibilities evaluated at the sampled z.
         assert aux is not None
         B = π.shape[0]
-        z_mean, enc_log_var = aux  # [B,k], [k]
+        z_mean, enc_log_var = aux  # [B,k], [k] (global)
         enc_var = torch.exp(enc_log_var)  # [k]
         var_c = torch.exp(model.component_log_vars) + 1e-6  # [K,k]
         diff = z_mean.unsqueeze(1) - model.component_means.unsqueeze(0)  # [B,K,k]
@@ -827,7 +832,9 @@ def loss_fn(
         π_bar = π.mean(dim=0)
         marg_entropy = -(π_bar * torch.log(π_bar + 1e-8)).sum()
 
-        gmm_loss = nll + entropy_weight * cond_entropy - balance_weight * B * marg_entropy
+        gmm_loss = (
+            nll + entropy_weight * cond_entropy - balance_weight * B * marg_entropy
+        )
         loss = loss + mixture_strength * gmm_loss
 
         # (d) Anti-catch-all variance prior: log-normal on σ² centered at 1
@@ -925,11 +932,11 @@ class FactorizationModel:
         metagene_activation: str = "entmax15",
         encoder_architecture: str = "joint",
         composition_activation: str = "softmax",
-        alpha_reg: float = 100.0,
+        alpha_reg: float = 0.0,
         sparsity_reg: float = 0.0,
         metagene_reg_type: str = "none",
-        metagene_reg_strength: float = 0.01,
-        gene_floor_reg: float = 0.0,
+        metagene_reg_strength: float = 0.0,
+        gene_floor_reg: float = 10.0,
         gene_floor_margin: float = -3.0,
         dirichlet_reg: float = 0.0,
         dirichlet_alpha: float = 0.5,
@@ -1010,7 +1017,11 @@ class FactorizationModel:
             )
         component_means_init = None
         component_log_vars_init = None
-        if n_components is not None and component_init == "kmeans" and v_init is not None:
+        if (
+            n_components is not None
+            and component_init == "kmeans"
+            and v_init is not None
+        ):
             component_means_init, component_log_vars_init = _kmeans_component_init(
                 self.X, v_init, n_components, mixture_space
             )
@@ -1143,7 +1154,9 @@ class FactorizationModel:
                         gene_floor_margin=self.gene_floor_margin,
                         dirichlet_reg=self.dirichlet_reg,
                         dirichlet_alpha=self.dirichlet_alpha,
-                        mixture_strength=current_mixture_strength if self.n_components is not None else 0.0,
+                        mixture_strength=current_mixture_strength
+                        if self.n_components is not None
+                        else 0.0,
                         entropy_weight=self.entropy_weight,
                         balance_weight=self.balance_weight,
                         var_reg=self.var_reg,
@@ -1197,7 +1210,9 @@ class FactorizationModel:
         φ_chunk_tensor = None
         if self.model.diffusion_aware_encoder or self.model.decontaminate_encoder:
             assert self.inflow is not None and self.φ is not None
-            inflow_chunk_tensor = self._chunk_csr_tensor(self.inflow, start_idx, end_idx)
+            inflow_chunk_tensor = self._chunk_csr_tensor(
+                self.inflow, start_idx, end_idx
+            )
             φ_chunk_tensor = self._chunk_csr_tensor(self.φ, start_idx, end_idx)
         return self.model.encode(X_chunk_tensor, inflow_chunk_tensor, φ_chunk_tensor, α)
 
@@ -1268,19 +1283,21 @@ class FactorizationModel:
         """Returns the non-negative cell factor loadings W (after softplus)."""
         return self.get_factor_loadings()
 
-    def get_cluster_assignments(self, batch_size: int = 4096) -> tuple[np.ndarray, np.ndarray]:
+    def get_cluster_assignments(
+        self, batch_size: int = 4096
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Returns cluster assignments from the GMM prior on U.
-        
+
         Returns:
             assignments: Array of shape (n_cells,) with cluster indices (argmax of π)
             π: Array of shape (n_cells, n_components) with mixture weights
         """
         if self.n_components is None:
             raise ValueError("Model was not initialized with n_components")
-        
+
         self.model.eval()
         π_list = []
-        
+
         with torch.no_grad():
             α = torch.exp(self.model.log_α) if self.model.include_diffusion else None
             for start_idx in range(0, self.m, batch_size):
@@ -1289,8 +1306,8 @@ class FactorizationModel:
                 _, γ = self.model.compute_gmm_loss(u_chunk)
                 assert γ is not None
                 π_list.append(γ.cpu().numpy())
-        
+
         π_all = np.concatenate(π_list, axis=0)
         assignments = np.argmax(π_all, axis=-1)
-        
+
         return assignments, π_all
