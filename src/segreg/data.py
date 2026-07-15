@@ -5,7 +5,6 @@ import numpy.typing as npt
 import torch
 from anndata import AnnData
 from scipy.sparse import csr_matrix
-from scipy.sparse import csr_matrix as make_csr
 from spatialdata import SpatialData
 
 
@@ -68,6 +67,44 @@ def estimate_phi(X: np.ndarray, inflow: np.ndarray, outflow: np.ndarray) -> np.n
     mask = T > 0
     phi[mask] = outflow[mask] / T[mask]
     return np.clip(phi, 0.0, 1.0)
+
+
+def clip_phi(phi: csr_matrix) -> csr_matrix:
+    """Clip a raw phi = outflow/T matrix to [0, 1] and drop the resulting zeros.
+
+    load_proseg_data returns phi = outflow * (1/T) without the T <= 0 guard or the
+    [0, 1] cap that estimate_phi applies. Clipping the stored values reproduces
+    estimate_phi exactly: entries with T < 0 are negative -> clip to 0, entries
+    with outflow > T exceed 1 -> clip to 1, and T == 0 entries are already 0.
+    eliminate_zeros() then restores a minimal sparsity pattern.
+    """
+    phi = phi.copy()
+    np.clip(phi.data, 0.0, 1.0, out=phi.data)
+    phi.eliminate_zeros()
+    return phi.tocsr()
+
+
+def slice_csr_to_sparse_tensor(
+    M: csr_matrix,
+    batch_idx: npt.NDArray[np.int64],
+    n: int,
+    device: torch.device,
+    use_pin: bool,
+    non_blocking: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather the given rows of a CSR matrix and return them as a sparse CSR
+    tensor on the target device, together with the row index of every nonzero.
+
+    Keeps the batch sparse end-to-end: the host->device transfer moves only the
+    nonzeros, and downstream code (sparse encoder matmul, sparse NB likelihood)
+    never materializes the dense block. Row order follows batch_idx exactly (no
+    sorting). The returned row_idx is reused by the likelihood and the encoder's
+    per-row size-factor scaling so neither has to recompute it.
+    """
+    batch = CSRMatrixBatch(M, batch_idx, use_pin)
+    sparse = batch.to_csr_tensor(n, non_blocking, device)
+    row_idx = batch.row_idx.to(device, non_blocking=non_blocking)
+    return sparse, row_idx
 
 
 def ols_init_beta(

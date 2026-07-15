@@ -13,7 +13,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch_geometric.data import Data
 from tqdm import tqdm
 
-from .data import estimate_phi, load_proseg_data, ols_init_beta
+from .data import (
+    clip_phi,
+    load_proseg_data,
+    ols_init_beta,
+    slice_csr_to_sparse_tensor,
+)
 from .nn import SegregVAE
 from .training import SegregTrainingWrapper
 
@@ -44,13 +49,19 @@ class RegressionModel:
         beta_prior_scale: float = 1.0,
         alpha_reg: float = 1.0,
     ):
-        adata, self.X, self.inflow, self.outflow, _phi = load_proseg_data(
+        adata, self.X, self.inflow, self.outflow, phi = load_proseg_data(
             data, include_diffusion
         )
 
         self.m, self.n = adata.shape
         self.var_names = adata.var_names
         self.obs_names = adata.obs_names
+
+        # phi_cg is a fixed function of the (fixed) counts/inflow/outflow, so use
+        # the sparse phi load_proseg_data already computed rather than re-deriving
+        # it per batch. clip_phi applies estimate_phi's [0,1] / T<=0 semantics to
+        # the raw outflow/T values. Kept sparse; sliced per batch during training.
+        self.phi = clip_phi(phi) if include_diffusion else None
 
         design_df = dmatrix(formula, adata.obs, return_type="dataframe")
         self.design = cast(DesignMatrix, design_df)
@@ -140,10 +151,15 @@ class RegressionModel:
             torch.cuda.manual_seed_all(seed)
             np.random.seed(seed)
 
+        use_pin = self.device.type == "cuda"
+        nb = use_pin  # non-blocking transfers only help alongside pinned memory
+
         dataset = TensorDataset(
             torch.arange(self.m), self.data.x, self.data.log_sf_prior
         )
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=True, pin_memory=use_pin
+        )
 
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.model.to(self.device)
@@ -180,28 +196,23 @@ class RegressionModel:
             total_loss = 0.0
             for batch_idx, batch_x, batch_log_sf_prior in loader:
                 optimizer.zero_grad()
-                batch_idx = batch_idx.to(self.device)
-                batch_x = batch_x.to(self.device)
-                batch_log_sf_prior = batch_log_sf_prior.to(self.device)
+                idx_np = batch_idx.numpy()
+                batch_idx = batch_idx.to(self.device, non_blocking=nb)
+                batch_x = batch_x.to(self.device, non_blocking=nb)
+                batch_log_sf_prior = batch_log_sf_prior.to(self.device, non_blocking=nb)
 
-                x_sub = self.X[batch_idx.cpu().numpy()].toarray().astype(np.float32)
-                x_sub_tensor = torch.from_numpy(x_sub).to(self.device)
+                x_sub_tensor, row_idx = slice_csr_to_sparse_tensor(
+                    self.X, idx_np, self.n, self.device, use_pin, nb
+                )
 
                 if self.model.include_diffusion:
-                    inflow_sub = (
-                        self.inflow[batch_idx.cpu().numpy()]
-                        .toarray()
-                        .astype(np.float32)
+                    assert self.inflow is not None and self.phi is not None
+                    inflow_sub_tensor, _ = slice_csr_to_sparse_tensor(
+                        self.inflow, idx_np, self.n, self.device, use_pin, nb
                     )
-                    outflow_sub = (
-                        self.outflow[batch_idx.cpu().numpy()]
-                        .toarray()
-                        .astype(np.float32)
+                    phi_sub_tensor, _ = slice_csr_to_sparse_tensor(
+                        self.phi, idx_np, self.n, self.device, use_pin, nb
                     )
-                    phi_sub = estimate_phi(x_sub, inflow_sub, outflow_sub)
-
-                    inflow_sub_tensor = torch.from_numpy(inflow_sub).to(self.device)
-                    phi_sub_tensor = torch.from_numpy(phi_sub).to(self.device)
                 else:
                     inflow_sub_tensor = None
                     phi_sub_tensor = None
@@ -216,6 +227,7 @@ class RegressionModel:
                         x_sub_tensor,
                         inflow_sub_tensor,
                         phi_sub_tensor,
+                        row_idx,
                         current_beta_kl_t,
                     )
 
@@ -267,11 +279,10 @@ class RegressionModel:
         current_row = 0
         with torch.no_grad():
             for batch_idx, batch_x in loader:
+                idx_np = batch_idx.numpy()
                 batch_idx, batch_x = batch_idx.to(self.device), batch_x.to(self.device)
-                x_sub_tensor = torch.tensor(
-                    self.X[batch_idx.cpu().numpy()].toarray(),
-                    dtype=torch.float32,
-                    device=self.device,
+                x_sub_tensor, _ = slice_csr_to_sparse_tensor(
+                    self.X, idx_np, self.n, self.device, use_pin=False, non_blocking=False
                 )
                 encoder_in, log_sf = self.model.prepare_encoder_input(
                     x_sub_tensor, batch_idx
@@ -310,11 +321,10 @@ class RegressionModel:
         all_z_mu = []
         with torch.no_grad():
             for batch_idx, batch_x in loader:
+                idx_np = batch_idx.numpy()
                 batch_idx, batch_x = batch_idx.to(self.device), batch_x.to(self.device)
-                x_sub_tensor = torch.tensor(
-                    self.X[batch_idx.cpu().numpy()].toarray(),
-                    dtype=torch.float32,
-                    device=self.device,
+                x_sub_tensor, _ = slice_csr_to_sparse_tensor(
+                    self.X, idx_np, self.n, self.device, use_pin=False, non_blocking=False
                 )
                 encoder_in, _ = self.model.prepare_encoder_input(
                     x_sub_tensor, batch_idx

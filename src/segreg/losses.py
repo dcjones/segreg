@@ -34,6 +34,45 @@ def nb_loss(x_sub_tensor, mu, log_r):
     )
 
 
+def nb_loss_sparse(x_sparse, mu, log_r, row_idx=None):
+    """Sparse-input equivalent of nb_loss: identical value, but the observed
+    counts stay a sparse CSR tensor instead of being densified.
+
+    The NB log-pmf's x=0 contribution, r*log(r/(r+mu)), is nonzero for every
+    cell x gene, so it is summed densely over mu (which is dense regardless --
+    the log-linear decoder predicts a rate for every gene). Only the x>0
+    correction -- lgamma(x+r) - lgamma(r) - lgamma(x+1) + x*log(mu/(r+mu)) -- is
+    gathered over the nonzeros of x. Summing the dense baseline and the sparse
+    correction reproduces nb_loss's full sum over cells x genes; dividing by the
+    batch size matches its .sum(dim=-1).mean() reduction.
+    """
+    r = torch.exp(log_r).clamp(min=1e-3)  # [n_genes]
+    mu_nb = mu.float()
+    eps = 1e-8
+    r_plus_mu = r + mu_nb + eps  # [B, n_genes]
+
+    # x=0 baseline over every cell x gene entry.
+    baseline = (r * torch.log(r / r_plus_mu)).sum()
+
+    col_idx = x_sparse.col_indices()
+    if row_idx is None:
+        crow = x_sparse.crow_indices()
+        row_idx = torch.repeat_interleave(
+            torch.arange(x_sparse.shape[0], device=mu.device), crow[1:] - crow[:-1]
+        )
+    x = x_sparse.values().float()
+    r_nz = r[col_idx]
+    mu_nz = mu_nb[row_idx, col_idx]
+    correction = (
+        torch.lgamma(x + r_nz)
+        - torch.lgamma(r_nz)
+        - torch.lgamma(x + 1)
+        + x * torch.log((mu_nz + eps) / (r_nz + mu_nz + eps))
+    ).sum()
+
+    return -(baseline + correction) / mu.shape[0]
+
+
 def kl_z(mu, logstd):
     """KL divergence from N(mu, exp(logstd)^2) to N(0, 1), averaged over cells."""
     return -0.5 * torch.sum(1 + 2 * logstd - mu.pow(2) - (2 * logstd).exp(), dim=-1).mean()

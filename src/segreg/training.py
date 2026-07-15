@@ -6,7 +6,7 @@ import torch.nn as nn
 from .losses import (
     alpha_loss,
     kl_z,
-    nb_loss,
+    nb_loss_sparse,
     size_factor_loss,
 )
 from .nn import SegregVAE
@@ -33,12 +33,13 @@ class SegregTrainingWrapper(nn.Module):
         batch_idx,
         batch_x,
         batch_log_sf_prior,
-        x_sub_tensor,
+        x_sparse,
         inflow_sub,
         phi_sub,
+        row_idx,
         current_beta_kl: torch.Tensor,
     ):
-        encoder_in, log_sf = self.model.prepare_encoder_input(x_sub_tensor, batch_idx)
+        encoder_in, log_sf = self.model.prepare_encoder_input(x_sparse, batch_idx)
 
         mu_hat, z_mu, z_logstd, beta = self.model(
             encoder_in,
@@ -48,7 +49,7 @@ class SegregTrainingWrapper(nn.Module):
             log_size_factor=log_sf,
         )
 
-        loss_recon = nb_loss(x_sub_tensor, mu_hat, self.model.log_r)
+        loss_recon = nb_loss_sparse(x_sparse, mu_hat, self.model.log_r, row_idx=row_idx)
         kl_z_val = kl_z(z_mu, z_logstd)
 
         beta_f = beta.float()
