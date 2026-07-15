@@ -1,7 +1,7 @@
 [project]
 name = "segreg"
 version = "0.1.0"
-description = "Add your description here"
+description = "Segmentation-aware regression for spatial transcriptomics"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -13,15 +13,12 @@ dependencies = [
     # "pyg-lib>=0.5.0",
     "tqdm>=4.67.1",
     "squidpy>=1.8.1",
-    "spanmisc",
     "mapbox-earcut>=2.0.0",
     "igraph>=1.0.0",
 ]
 
 [tool.uv.sources]
 # pyg-lib = { url = "https://data.pyg.org/whl/torch-2.8.0%2Bcu128/pyg_lib-0.5.0%2Bpt28cu128-cp313-cp313-linux_x86_64.whl" }
-dapple = { path = "../dapple_py", editable = true }
-spanmisc = { path = "../spanmisc", editable = true }
 
 [tool.pyright]
 venvPath = "."
@@ -29,7 +26,6 @@ venv = ".venv"
 
 [dependency-groups]
 debug = [
-    "dapple",
     "marimo>=0.20.4",
     "umap-learn>=0.5.11",
 ]
