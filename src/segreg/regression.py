@@ -44,7 +44,7 @@ class RegressionModel:
         beta_prior_scale: float = 1.0,
         alpha_reg: float = 1.0,
     ):
-        adata, self.X, self.inflow, self.outflow = load_proseg_data(
+        adata, self.X, self.inflow, self.outflow, _phi = load_proseg_data(
             data, include_diffusion
         )
 

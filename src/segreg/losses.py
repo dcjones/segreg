@@ -43,13 +43,13 @@ def size_factor_loss(log_sf, batch_log_sf_prior, sf_sigma):
     return (log_sf - batch_log_sf_prior).pow(2).mean() / (2 * sf_sigma**2)
 
 
-def alpha_loss(log_alpha, alpha_reg, gene_expression=None):
-    """Penalty on sigmoid(alpha), optionally weighted by inverse expression."""
-    alpha = torch.sigmoid(log_alpha)
-    if gene_expression is not None:
-        weight = 1.0 / torch.sqrt(gene_expression + 1.0)
-        return alpha_reg * (alpha ** 2 * weight).sum()
-    return alpha_reg * (alpha ** 2).sum()
+def alpha_loss(log_alpha, alpha_reg):
+    """L2 penalty on log(alpha), i.e. a log-normal prior on alpha = exp(log_alpha)
+    pulling the shared inflow/outflow leak coefficient toward 1 -- the paper's
+    "trust proseg's estimates at face value" reference point, with alpha free to
+    move above or below 1 as the data demands. Used by the regression path;
+    the factorization path uses the expression-weighted alpha_log_prior_loss."""
+    return alpha_reg * log_alpha.pow(2).mean()
 
 
 def alpha_log_prior_loss(log_alpha, alpha_reg, gene_expression=None):
