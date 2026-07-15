@@ -5,23 +5,23 @@ import torch.nn as nn
 class Encoder(nn.Module):
     """
     Stochastic encoder for SegregVAE.
-    Takes normalized gene counts and outputs parameters for the latent normal
-    distribution (mu, logstd).
+    Takes normalized gene counts (dense [B, n_genes]) and outputs parameters for
+    the latent normal distribution (mu, logstd).
 
-    Only the first linear layer touches the [B, n_genes] input, so it is the one
-    place worth keeping sparse: when given a sparse CSR input it runs that layer
-    as torch.sparse.mm (against the same nn.Linear weight, so numerics and
-    parameters are identical to the dense path), avoiding densification of the
-    92%-zero count batch. Every downstream layer operates on the dense
-    [B, hidden] activations as before.
+    The first layer's [B, n_genes] input is densified upstream rather than fed as a
+    sparse CSR tensor: benchmarking across 500-18,006 genes showed a bf16
+    tensor-core GEMM beats torch.sparse.mm at every panel size in this range (the
+    ~6%-dense CSR SpMM never recovers the tensor-core throughput it gives up). The
+    sparse batch is still transferred compactly and reused by the sparse NB
+    likelihood, where sparsity does pay off; only the encoder matmul is dense.
     """
 
     def __init__(
         self, in_channels: int, hidden_channels: int = 128, latent_dim: int = 64
     ):
         super().__init__()
-        self.lin1 = nn.Linear(in_channels, hidden_channels)
-        self.rest = nn.Sequential(
+        self.lin = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
             nn.LayerNorm(hidden_channels),
             nn.ReLU(),
             nn.Linear(hidden_channels, hidden_channels),
@@ -33,17 +33,7 @@ class Encoder(nn.Module):
         self.logstd_head = nn.Linear(hidden_channels, latent_dim)
 
     def forward(self, x):
-        if x.layout == torch.sparse_csr:
-            # torch.sparse.mm(x, W) with W = weight.t() reproduces nn.Linear's
-            # x @ weight.t() + bias exactly, but consumes the sparse batch directly.
-            # Forced to fp32: sparse CSR matmul (and its sampled_addmm backward) does
-            # not support the mixed bf16/fp32 operands autocast would introduce.
-            with torch.autocast(device_type=x.device.type, enabled=False):
-                w = self.lin1.weight.t().float()
-                h = torch.sparse.mm(x.float(), w) + self.lin1.bias.float()
-        else:
-            h = self.lin1(x)
-        h = self.rest(h)
+        h = self.lin(x)
         mu = self.mu_head(h)
         logstd = self.logstd_head(h)
         return mu, logstd
@@ -140,42 +130,25 @@ class SegregVAE(nn.Module):
     def prepare_encoder_input(
         self, x_sub_tensor: torch.Tensor, batch_idx: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Normalize counts and compute size factor. Returns (encoder_in, log_sf).
+        """Normalize counts and compute size factor. Returns (dense encoder_in, log_sf).
 
-        Accepts either a dense [B, n_genes] tensor or a sparse CSR batch. For
-        sparse input the per-cell size-factor rescale and log1p are applied to the
-        nonzero values only (log1p(0) = 0, so zeros are unaffected), keeping the
-        result sparse for the encoder's first layer.
+        Accepts either a dense [B, n_genes] tensor or a sparse CSR batch; a sparse
+        batch is densified here for the (dense) encoder. The sparse handle is not
+        consumed by the encoder -- it is passed separately to nb_loss_sparse, which
+        is the one place sparsity wins at these panel sizes.
         """
-        log_sf = (
-            self.log_sf_embed(batch_idx).squeeze(-1)
-            if self.include_size_factor
-            else None
+        x_dense = (
+            x_sub_tensor.to_dense()
+            if x_sub_tensor.layout == torch.sparse_csr
+            else x_sub_tensor
         )
-
-        if x_sub_tensor.layout == torch.sparse_csr:
-            values = x_sub_tensor.values()
-            if log_sf is not None:
-                crow = x_sub_tensor.crow_indices()
-                row = torch.repeat_interleave(
-                    torch.arange(x_sub_tensor.shape[0], device=x_sub_tensor.device),
-                    crow[1:] - crow[:-1],
-                )
-                scale = 1000.0 / (torch.exp(log_sf) + 1e-8)  # [B]
-                values = values * scale[row]
-            encoder_in = torch.sparse_csr_tensor(
-                x_sub_tensor.crow_indices(),
-                x_sub_tensor.col_indices(),
-                torch.log1p(values),
-                size=x_sub_tensor.shape,
-                device=x_sub_tensor.device,
-            )
+        if self.include_size_factor:
+            log_sf = self.log_sf_embed(batch_idx).squeeze(-1)
+            x_norm = x_dense / (torch.exp(log_sf).unsqueeze(-1) + 1e-8) * 1000.0
+            encoder_in = torch.log1p(x_norm)
         else:
-            if log_sf is not None:
-                x_norm = x_sub_tensor / (torch.exp(log_sf).unsqueeze(-1) + 1e-8) * 1000.0
-                encoder_in = torch.log1p(x_norm)
-            else:
-                encoder_in = torch.log1p(x_sub_tensor)
+            log_sf = None
+            encoder_in = torch.log1p(x_dense)
         return encoder_in, log_sf
 
     def forward(self, x, covariates, inflow, phi, log_size_factor=None):
