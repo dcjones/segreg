@@ -181,7 +181,12 @@ class RegressionModel:
 
         use_amp = self.device.type == "cuda"
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        scaler = torch.amp.GradScaler(enabled=use_amp)
+        # GradScaler is only needed for fp16; bf16 has the dynamic range to train
+        # without loss scaling. Skipping it for bf16 also removes a per-step
+        # inf-check that reads a GPU flag back to the CPU (a sync), which would
+        # otherwise serialize CPU batch-prep against GPU compute.
+        use_scaler = use_amp and amp_dtype == torch.float16
+        scaler = torch.amp.GradScaler(enabled=use_scaler)
 
         pbar = tqdm(range(nepochs), desc="Training Segreg", disable=quiet)
         for epoch in pbar:
@@ -193,9 +198,13 @@ class RegressionModel:
 
             current_beta_kl_t = torch.tensor(current_beta_kl, device=self.device)
 
-            total_loss = 0.0
+            # Accumulate on-device and sync once per epoch (below) rather than
+            # calling loss.item() every batch, so the CPU can run ahead and prepare
+            # the next batch while the GPU is still computing this one.
+            total_loss = torch.zeros((), device=self.device)
+            last_recon = torch.zeros((), device=self.device)
             for batch_idx, batch_x, batch_log_sf_prior in loader:
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 idx_np = batch_idx.numpy()
                 batch_idx = batch_idx.to(self.device, non_blocking=nb)
                 batch_x = batch_x.to(self.device, non_blocking=nb)
@@ -231,13 +240,19 @@ class RegressionModel:
                         current_beta_kl_t,
                     )
 
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                total_loss += loss.item()
+                if use_scaler:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
+                total_loss += loss.detach()
+                last_recon = loss_recon.detach()
 
             pbar.set_description(
-                f"Loss: {total_loss / len(loader):.4f} (Recon: {loss_recon:.2f})"
+                f"Loss: {(total_loss / len(loader)).item():.4f} "
+                f"(Recon: {last_recon.item():.2f})"
             )
 
         self.model.eval()
