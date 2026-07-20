@@ -40,6 +40,16 @@ class RegressionModel:
         formula: str,
         batch_size: int | None = 4096,
         include_diffusion: bool = True,
+        # Retention (multiplicative outflow correction exp(-alpha*phi)) is off by
+        # default: A/B testing across 5 cell types -- with and without a decoupled
+        # retention alpha -- showed it is inert for decontamination (retention-only
+        # tracks no-diffusion) and does not recover own-signal attenuation either,
+        # while the additive inflow term (delta) carries the entire correction.
+        include_retention: bool = False,
+        include_delta: bool = True,
+        separate_retention_alpha: bool = False,
+        stochastic_alpha: bool = False,
+        component_alpha: bool = False,
         include_size_factor: bool = True,
         sf_sigma: float = 0.5,
         rate_offset: float = 1e-2,
@@ -56,6 +66,21 @@ class RegressionModel:
         self.m, self.n = adata.shape
         self.var_names = adata.var_names
         self.obs_names = adata.obs_names
+
+        # Per-cell proseg component (its point-estimate mixture assignment) for
+        # component_alpha. Factorized to contiguous 0..C-1 codes.
+        self.component_alpha = component_alpha
+        if component_alpha:
+            if "component" not in adata.obs.columns:
+                raise ValueError(
+                    "component_alpha=True requires a 'component' column in adata.obs"
+                )
+            comp_codes = pd.factorize(np.asarray(adata.obs["component"]))[0]
+            self.component = torch.tensor(comp_codes, dtype=torch.long)
+            self.n_components = int(comp_codes.max()) + 1
+        else:
+            self.component = None
+            self.n_components = 1
 
         # phi_cg is a fixed function of the (fixed) counts/inflow/outflow, so use
         # the sparse phi load_proseg_data already computed rather than re-deriving
@@ -127,6 +152,12 @@ class RegressionModel:
             kappa=kappa,
             rate_offset=rate_offset,
             include_diffusion=include_diffusion,
+            include_retention=include_retention,
+            include_delta=include_delta,
+            separate_retention_alpha=separate_retention_alpha,
+            stochastic_alpha=stochastic_alpha,
+            component_alpha=component_alpha,
+            n_components=self.n_components,
             include_size_factor=include_size_factor,
             log_mean_expr=log_mean_expr,
             log_sf_prior=torch.tensor(log_size_factors, dtype=torch.float32),
@@ -214,17 +245,31 @@ class RegressionModel:
                     self.X, idx_np, self.n, self.device, use_pin, nb
                 )
 
-                if self.model.include_diffusion:
-                    assert self.inflow is not None and self.phi is not None
+                # Only slice the batch for terms the model actually uses, so an
+                # inflow-only or outflow-only ablation skips the unneeded transfer.
+                if self.model.include_diffusion and self.model.include_delta:
+                    assert self.inflow is not None
                     inflow_sub_tensor, _ = slice_csr_to_sparse_tensor(
                         self.inflow, idx_np, self.n, self.device, use_pin, nb
                     )
+                else:
+                    inflow_sub_tensor = None
+
+                if self.model.include_diffusion and self.model.include_retention:
+                    assert self.phi is not None
                     phi_sub_tensor, _ = slice_csr_to_sparse_tensor(
                         self.phi, idx_np, self.n, self.device, use_pin, nb
                     )
                 else:
-                    inflow_sub_tensor = None
                     phi_sub_tensor = None
+
+                if self.component_alpha:
+                    assert self.component is not None
+                    batch_component = self.component[batch_idx.cpu()].to(
+                        self.device, non_blocking=nb
+                    )
+                else:
+                    batch_component = None
 
                 with torch.autocast(
                     device_type=self.device.type, dtype=amp_dtype, enabled=use_amp
@@ -238,6 +283,7 @@ class RegressionModel:
                         phi_sub_tensor,
                         row_idx,
                         current_beta_kl_t,
+                        batch_component,
                     )
 
                 if use_scaler:

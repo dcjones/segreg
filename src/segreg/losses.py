@@ -91,6 +91,25 @@ def alpha_loss(log_alpha, alpha_reg):
     return alpha_reg * log_alpha.pow(2).mean()
 
 
+def alpha_kl(log_alpha_mu, log_alpha_logstd, m, prior_sigma=1.0):
+    """KL from the variational posterior q(log_alpha)=N(mu, exp(logstd)^2) to the
+    prior p(log_alpha)=N(0, prior_sigma^2) (alpha centered at 1). Summed over genes
+    and divided by m (n_cells) to match kl_beta's per-cell scaling. Replaces the
+    point-estimate alpha_loss when alpha is stochastic; propagates the
+    contamination-vs-DE identifiability uncertainty into beta's posterior."""
+    logstd = log_alpha_logstd.clamp(max=4.0)
+    sigma2 = torch.exp(2.0 * logstd)
+    tau2 = prior_sigma**2
+    kl = 0.5 * (
+        sigma2 / tau2
+        + log_alpha_mu.pow(2) / tau2
+        - 1.0
+        + math.log(tau2)
+        - 2.0 * logstd
+    )
+    return kl.sum() / m
+
+
 def alpha_log_prior_loss(log_alpha, alpha_reg, gene_expression=None):
     """L2 penalty on log(alpha), i.e. a log-normal prior on alpha = exp(log_alpha)
     centered at 1 -- the paper's "trust Proseg's estimates at face value" reference

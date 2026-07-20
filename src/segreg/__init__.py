@@ -7,6 +7,7 @@ from .evaluation import (
     probe_separability,
 )
 from .factorization import FactorizationModel
+from .niche import add_niche_covariates, build_niche_features
 from .nn import Encoder, NodeDecoder, SegregVAE
 from .regression import RegressionModel
 from .training import SegregTrainingWrapper
@@ -14,6 +15,8 @@ from .training import SegregTrainingWrapper
 __all__ = [
     "RegressionModel",
     "FactorizationModel",
+    "build_niche_features",
+    "add_niche_covariates",
     "SegregVAE",
     "Encoder",
     "NodeDecoder",
