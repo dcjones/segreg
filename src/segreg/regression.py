@@ -50,6 +50,8 @@ class RegressionModel:
         separate_retention_alpha: bool = False,
         stochastic_alpha: bool = False,
         component_alpha: bool = False,
+        likelihood: str = "nb_mean",
+        conv_max: int | None = None,
         include_size_factor: bool = True,
         sf_sigma: float = 0.5,
         rate_offset: float = 1e-2,
@@ -66,6 +68,22 @@ class RegressionModel:
         self.m, self.n = adata.shape
         self.var_names = adata.var_names
         self.obs_names = adata.obs_names
+
+        # conv_max only needs to cover the Poisson(delta) tail (delta = inflow at
+        # alpha=1), not the max count -- the j <= x constraint is masked in. Size it
+        # from the data's max inflow so a whole-transcriptome panel (max inflow ~64)
+        # gets an exact convolution without the caller tuning it; entries below it
+        # are exact regardless. Floored so tiny datasets still get a sane window.
+        if likelihood == "nb_conv" and conv_max is None:
+            if self.inflow is not None and self.inflow.nnz > 0:
+                imax = float(self.inflow.data.max())
+                conv_max = int(np.ceil(imax + 8.0 * np.sqrt(imax)))
+            else:
+                conv_max = 64
+            conv_max = int(np.clip(conv_max, 32, 512))
+        elif conv_max is None:
+            conv_max = 64
+        self.conv_max = conv_max
 
         # Per-cell proseg component (its point-estimate mixture assignment) for
         # component_alpha. Factorized to contiguous 0..C-1 codes.
@@ -158,6 +176,8 @@ class RegressionModel:
             stochastic_alpha=stochastic_alpha,
             component_alpha=component_alpha,
             n_components=self.n_components,
+            likelihood=likelihood,
+            conv_max=self.conv_max,
             include_size_factor=include_size_factor,
             log_mean_expr=log_mean_expr,
             log_sf_prior=torch.tensor(log_size_factors, dtype=torch.float32),

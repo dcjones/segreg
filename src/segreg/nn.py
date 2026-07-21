@@ -80,6 +80,8 @@ class SegregVAE(nn.Module):
         stochastic_alpha: bool = False,
         component_alpha: bool = False,
         n_components: int = 1,
+        likelihood: str = "nb_mean",
+        conv_max: int = 64,
         include_size_factor: bool = True,
         log_mean_expr: torch.Tensor | None = None,
         log_sf_prior: torch.Tensor | None = None,
@@ -87,6 +89,27 @@ class SegregVAE(nn.Module):
         beta_logstd_init: torch.Tensor | None = None,
     ):
         super().__init__()
+        # likelihood: "nb_mean" is the phenomenological NB placed on the combined
+        # mean mu = retention*lam + delta (the paper's default, closed only in the
+        # mean). "nb_conv" is the exact generative marginal of the augmented model
+        # (next-step-generative-model.md, Option B): Xhat = A + C with A ~ NB(lam,
+        # psi) signal and C ~ Poisson(delta) contamination, so the likelihood is the
+        # convolution NB(lam,psi) (+) Poisson(delta) rather than an NB on their sum.
+        # In nb_conv mode alpha is FIXED at 1 (delta = inflow taken at face value):
+        # with delta a known Poisson rate there is no alpha-vs-beta competition, the
+        # structural degeneracy that biases beta negative for contamination-dominated
+        # should-be-null genes. Retention and the alpha variational/component/separate
+        # machinery are therefore all disabled in nb_conv mode.
+        if likelihood not in ("nb_mean", "nb_conv"):
+            raise ValueError(f"unknown likelihood {likelihood!r}")
+        self.likelihood = likelihood
+        self.conv_max = conv_max
+        self.fix_alpha = likelihood == "nb_conv"
+        if self.fix_alpha:
+            include_retention = False
+            separate_retention_alpha = False
+            stochastic_alpha = False
+            component_alpha = False
         self.include_diffusion = include_diffusion
         # Independent ablation of the two diffusion terms (mirrors the toggles on
         # FactorizationVAE): include_retention gates the multiplicative outflow
@@ -123,7 +146,13 @@ class SegregVAE(nn.Module):
 
         self.log_r = nn.Parameter(torch.full((n_genes,), 9.3))
 
-        if include_diffusion:
+        self.stochastic_alpha = stochastic_alpha
+        if include_diffusion and self.fix_alpha:
+            # nb_conv: alpha is fixed at 1, so no leak parameter is trained.
+            self.log_alpha = None
+            self.log_alpha_logstd = None
+            self.log_alpha_ret = None
+        elif include_diffusion:
             # alpha_g: shared per-gene leak coefficient calibrating how far to trust
             # proseg's inflow/outflow estimates. alpha_g = 1 takes them at face value;
             # it's identifiable because contamination genes are under-fitted by
@@ -218,19 +247,24 @@ class SegregVAE(nn.Module):
             log_rate = log_rate + log_size_factor.unsqueeze(-1)
         lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
 
+        delta = None
         if self.include_diffusion:
             # retention = exp(-alpha*phi) is 1 wherever phi=0, so mu is dense
             # regardless; densify the (sparse) inflow/phi batches here to build it.
-            if self.training and self.log_alpha_logstd is not None:
-                a_std = torch.exp(self.log_alpha_logstd.clamp(max=4.0))
-                log_alpha = self.log_alpha + torch.randn_like(a_std) * a_std
+            if self.fix_alpha:
+                # nb_conv: alpha == 1, contamination taken at proseg's face value.
+                alpha = 1.0
             else:
-                log_alpha = self.log_alpha
-            if self.component_alpha:
-                # log_alpha is [n_components, n_genes]; gather this batch's rows.
-                assert component is not None
-                log_alpha = log_alpha[component]  # -> [B, n_genes]
-            alpha = torch.exp(log_alpha.clamp(-10.0, 10.0))
+                if self.training and self.log_alpha_logstd is not None:
+                    a_std = torch.exp(self.log_alpha_logstd.clamp(max=4.0))
+                    log_alpha = self.log_alpha + torch.randn_like(a_std) * a_std
+                else:
+                    log_alpha = self.log_alpha
+                if self.component_alpha:
+                    # log_alpha is [n_components, n_genes]; gather this batch's rows.
+                    assert component is not None
+                    log_alpha = log_alpha[component]  # -> [B, n_genes]
+                alpha = torch.exp(log_alpha.clamp(-10.0, 10.0))
             mu = lam
             if self.include_retention:
                 assert phi is not None
@@ -246,9 +280,15 @@ class SegregVAE(nn.Module):
                 assert inflow is not None
                 if inflow.layout == torch.sparse_csr:
                     inflow = inflow.to_dense()
-                mu = mu + alpha * inflow
+                delta = alpha * inflow
+                mu = mu + delta
             mu = mu + self.rate_offset
         else:
             mu = lam + self.rate_offset
 
-        return mu, z_mu, z_logstd, beta
+        # lam (own-signal rate) and delta (contamination rate) are returned
+        # separately -- the nb_conv likelihood convolves them rather than using
+        # their sum mu. In nb_mean mode lam excludes the rate_offset that mu carries;
+        # the offset is a numerical floor for the combined-mean NB and is not part of
+        # the generative signal rate.
+        return mu, lam, delta, z_mu, z_logstd, beta

@@ -8,6 +8,7 @@ from .losses import (
     alpha_loss,
     kl_z,
     nb_loss_sparse,
+    nbconv_loss_sparse,
     size_factor_loss,
 )
 from .nn import SegregVAE
@@ -43,7 +44,7 @@ class SegregTrainingWrapper(nn.Module):
     ):
         encoder_in, log_sf = self.model.prepare_encoder_input(x_sparse, batch_idx)
 
-        mu_hat, z_mu, z_logstd, beta = self.model(
+        mu_hat, lam, delta, z_mu, z_logstd, beta = self.model(
             encoder_in,
             batch_x,
             inflow=inflow_sub,
@@ -52,7 +53,15 @@ class SegregTrainingWrapper(nn.Module):
             component=batch_component,
         )
 
-        loss_recon = nb_loss_sparse(x_sparse, mu_hat, self.model.log_r, row_idx=row_idx)
+        if self.model.likelihood == "nb_conv":
+            loss_recon = nbconv_loss_sparse(
+                x_sparse, lam, delta, self.model.log_r,
+                row_idx=row_idx, conv_max=self.model.conv_max,
+            )
+        else:
+            loss_recon = nb_loss_sparse(
+                x_sparse, mu_hat, self.model.log_r, row_idx=row_idx
+            )
         kl_z_val = kl_z(z_mu, z_logstd)
 
         beta_f = beta.float()
@@ -73,7 +82,10 @@ class SegregTrainingWrapper(nn.Module):
         else:
             loss_sf = torch.tensor(0.0, device=mu_hat.device)
 
-        if self.model.include_diffusion:
+        if self.model.include_diffusion and getattr(self.model, "log_alpha", None) is None:
+            # nb_conv fixes alpha == 1: no leak parameter, no alpha prior term.
+            loss_alpha = torch.tensor(0.0, device=mu_hat.device)
+        elif self.model.include_diffusion:
             if getattr(self.model, "log_alpha_logstd", None) is not None:
                 # Variational alpha: KL to N(0, 1) prior (alpha centered at 1),
                 # scaled by alpha_reg. Propagates alpha uncertainty into beta.

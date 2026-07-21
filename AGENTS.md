@@ -35,6 +35,14 @@ Some important components, all under `src/segreg/`:
     alpha variants exist as flags (`stochastic_alpha`, `component_alpha`,
     `separate_retention_alpha`) but are ineffective for the known spurious-DE
     failure mode and default off — see `next-step-generative-model.md`.
+    The `likelihood` flag selects the count model: `"nb_mean"` (default) is the
+    phenomenological NB on the combined mean `mu = lam + delta`; `"nb_conv"` is the
+    paper's exact generative marginal (Option B) — signal `A ~ NB(lam, psi)` plus
+    independent contamination `C ~ Poisson(delta)`, so the likelihood is their
+    convolution and alpha is fixed at 1. `nb_conv` roughly halves the residual
+    spurious-DE bias while preserving real-DE power (see the auto-memory
+    `project_generative_decontamination_model`); the remaining overshoot is a
+    mean-structure artifact, not a likelihood one.
   * `losses.py`: Loss terms (NB reconstruction, latent KL, size-factor prior,
     alpha prior) used by the training wrappers.
   * `training.py`: `SegregTrainingWrapper` / `FactorizationTrainingWrapper`,

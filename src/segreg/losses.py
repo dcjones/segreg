@@ -73,6 +73,131 @@ def nb_loss_sparse(x_sparse, mu, log_r, row_idx=None):
     return -(baseline + correction) / mu.shape[0]
 
 
+# Element budget for one chunk of the [nnz, conv_max+1] convolution tensor. Peak
+# device memory for the correction is ~this many floats times a small constant
+# (a handful of live intermediates + their gradients), independent of batch size
+# and gene-panel width -- so a whole-transcriptome batch is processed in pieces
+# rather than materializing one multi-GB tensor. ~8M elements keeps the peak well
+# under 1 GB while amortizing Python/kernel-launch overhead over large chunks.
+_CONV_CHUNK_ELEMENTS = 8_000_000
+
+
+def _nbconv_logpx_chunk(x, r_nz, lam_nz, d_nz, conv_max, eps):
+    """log P(Xhat = x) for a chunk of nonzeros, via the finite convolution
+        P(Xhat = x) = sum_{j=0}^{min(x, conv_max)} NB(x - j; r, lam) * Poisson(j; delta),
+    with j the contamination count and k = x - j the signal count. Shapes: all
+    inputs [c]; returns [c]. Builds a [c, conv_max+1] grid."""
+    j = torch.arange(conv_max + 1, device=x.device, dtype=x.dtype)  # [J+1]
+    k = x.unsqueeze(1) - j.unsqueeze(0)  # [c, J+1]
+    valid = k >= 0
+    k_c = k.clamp(min=0.0)
+
+    r_b = r_nz.unsqueeze(1)
+    lam_b = lam_nz.unsqueeze(1)
+    d_b = d_nz.unsqueeze(1)
+
+    log_r_frac = torch.log(r_b / (r_b + lam_b + eps))
+    log_lam_frac = torch.log(lam_b / (r_b + lam_b + eps))
+    log_nb = (
+        torch.lgamma(k_c + r_b)
+        - torch.lgamma(r_b)
+        - torch.lgamma(k_c + 1.0)
+        + r_b * log_r_frac
+        + k_c * log_lam_frac
+    )
+    log_pois = (
+        -d_b
+        + j.unsqueeze(0) * torch.log(d_b.clamp(min=eps))
+        - torch.lgamma(j + 1.0).unsqueeze(0)
+    )
+    term = (log_nb + log_pois).masked_fill(~valid, float("-inf"))
+    return torch.logsumexp(term, dim=1)  # [c]
+
+
+def nbconv_loss_sparse(x_sparse, lam, delta, log_r, row_idx=None, conv_max=64):
+    """Exact generative decontamination likelihood (paper's Option B / augmented
+    model, marginalized in closed form).
+
+    Models the observed count as a sum of two independent streams -- a negative-
+    binomial signal and a Poisson contamination:
+
+        u_cg   ~ Gamma(lam_cg, psi_g)              # latent true-signal rate
+        A_cg   ~ Poisson(u_cg)          => A_cg ~ NB(mean=lam_cg, r)   (r = 1/psi_g)
+        C_cg   ~ Poisson(delta_cg)                 # contamination (delta = alpha*inflow)
+        Xhat_cg = A_cg + C_cg
+
+    so the likelihood of the observed count is the convolution
+        P(Xhat = x) = sum_{j=0}^{x} NB(x - j; r, lam) * Poisson(j; delta),
+    which -- unlike NB(lam + delta, psi) -- keeps signal and contamination as
+    distinct count processes. This is what lets the model reason about the latent
+    split of each count (mechanisms 2-3 of next-step-generative-model.md): when
+    contamination explains the counts, the signal posterior concentrates near 0
+    and lam is genuinely unidentified, so its evidence for a nonzero beta is weak
+    and the credible interval covers 0 rather than manufacturing a spurious call.
+    The Poisson contamination carries no over-dispersion, so a count stream that
+    looks Poisson is attributed to contamination, not signal.
+
+    Structured exactly like nb_loss_sparse: a dense baseline over every cell x gene
+    (the x=0 log-probability) plus a sparse correction gathered over the nonzeros of
+    x. Because proseg guarantees inflow <= X elementwise, delta > 0 implies x > 0, so
+    the entire correction lives on the nonzeros of x -- delta never contributes a
+    dense correction of its own beyond the -delta term folded into the x=0 baseline.
+
+    lam and delta are the *separate* signal and contamination rates (NOT their sum);
+    lam must be strictly positive (exp of a clamped log-rate). delta may be None
+    (no diffusion), in which case this reduces exactly to nb_loss_sparse.
+
+    conv_max caps the convolution length, i.e. the number of counts attributable to
+    contamination. It only needs to cover the Poisson(delta) tail (delta + a few sqrt
+    (delta)) -- NOT the max observed count -- because the j <= x constraint is
+    enforced by masking, so any entry with x <= conv_max is summed exactly regardless
+    of conv_max. RegressionModel sizes it from the data's max inflow; the default 64
+    is exact for inflow up to ~40 per entry. The [nnz, conv_max+1] correction is
+    processed in nonzero chunks (see _CONV_CHUNK_ELEMENTS) so peak memory stays
+    bounded on whole-transcriptome panels regardless of batch size.
+    """
+    r = torch.exp(log_r).clamp(min=1e-3)  # [n_genes]
+    lam = lam.float()
+    eps = 1e-8
+
+    # x=0 baseline over every cell x gene entry:
+    #   log P(X=0) = log NB(0; r, lam) + log Poisson(0; delta)
+    #             = r*log(r/(r+lam))   +   (-delta)
+    baseline = (r * torch.log(r / (r + lam + eps))).sum()
+    if delta is not None:
+        delta = delta.float()
+        baseline = baseline - delta.sum()
+
+    col_idx = x_sparse.col_indices()
+    if row_idx is None:
+        crow = x_sparse.crow_indices()
+        row_idx = torch.repeat_interleave(
+            torch.arange(x_sparse.shape[0], device=lam.device), crow[1:] - crow[:-1]
+        )
+    x = x_sparse.values().float()  # [nnz]
+    r_nz = r[col_idx]  # [nnz]
+    lam_nz = lam[row_idx, col_idx]  # [nnz]
+    d_nz = (
+        delta[row_idx, col_idx] if delta is not None else torch.zeros_like(x)
+    )  # [nnz]
+
+    # The correction replaces each nonzero's x=0 baseline term with its true
+    # log-prob. Chunk over nonzeros so the [chunk, conv_max+1] grid never grows
+    # with batch size or panel width.
+    base_nz = r_nz * torch.log(r_nz / (r_nz + lam_nz + eps)) - d_nz
+    nnz = x.shape[0]
+    chunk = max(1, _CONV_CHUNK_ELEMENTS // (conv_max + 1))
+    correction = lam.new_zeros(())
+    for s in range(0, nnz, chunk):
+        e = min(s + chunk, nnz)
+        log_px = _nbconv_logpx_chunk(
+            x[s:e], r_nz[s:e], lam_nz[s:e], d_nz[s:e], conv_max, eps
+        )
+        correction = correction + (log_px - base_nz[s:e]).sum()
+
+    return -(baseline + correction) / lam.shape[0]
+
+
 def kl_z(mu, logstd):
     """KL divergence from N(mu, exp(logstd)^2) to N(0, 1), averaged over cells."""
     return -0.5 * torch.sum(1 + 2 * logstd - mu.pow(2) - (2 * logstd).exp(), dim=-1).mean()
