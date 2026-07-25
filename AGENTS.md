@@ -101,6 +101,22 @@ spurious changes**. Evaluate accordingly — and prefer these over ad-hoc probes
 (inferring "truth" through additional log-linear fits and reading point estimates
 is fragile and has misled repeatedly):
 
+  * **`simple-seg-sim/eval/score_de_panel.py` — the primary DE benchmark.** Scores
+    EVERY (cell type, gene) pair from one fit (~4000 on the breast run) rather
+    than ~10 hand-picked markers, against a per-gene truth calibrated from the
+    simulator's ground-truth counts. Reports `FP = P(CI excludes 0 | truth null)`
+    and `FN = P(CI covers 0 | truth real)`. Use this to judge any model change.
+    Three things to know before reading its output, all learned the hard way:
+    (a) truth must be labelled with QUASI-POISSON standard errors — with plain
+    Poisson errors, overdispersion lets null genes leak into the effect set and
+    the FN rate becomes meaningless (it read 0.87 when the truth was 0.17);
+    (b) FN is NOT estimable on `out/full`, which plants only 7 coefficients — a
+    config planting many more effects is needed before FN means anything;
+    (c) nominal truths (`sign*strength`, 0 for should-be-null) are only valid
+    under total-count normalization — `eval/truth_calibration.py` explains why,
+    and turned up a "should-be-null" marker with a real +0.26 slope.
+    This benchmark is what validates the project's central claim: disabling
+    diffusion modeling quadruples the false-positive rate (0.14 -> 0.60).
   * `segreg.evaluation`: fit-free, un-gameable honest metrics. `marker_leakage`
     (scale-invariant, label-robust cross-type contamination ratio — the primary
     decontamination metric), plus `probe_separability`, `leiden_ari`, and the
@@ -120,5 +136,16 @@ is fragile and has misled repeatedly):
     evaluation is driven by assumed mutually-exclusive / cell-type-specific
     markers in real data.
 
-See `next-step-generative-model.md` for the current open problem (a spurious-DE
-degeneracy in the contamination-dominated regime) and the planned fix.
+Beware of the benchmark itself. Over one session three separate scoring defects
+each produced a confident, wrong conclusion about the model: a collinear design
+(r = 0.998 between exposure covariates) that split effects arbitrarily between
+coefficients, truth values stated in a normalization the model does not use, and
+Poisson standard errors that mislabelled noise as real effects. When a result
+looks like a model defect, check the instrument first.
+
+See `archive/next-step-generative-model.md` for the older open problem (a
+spurious-DE degeneracy in the contamination-dominated regime). The current one is
+narrower: the correction occasionally OVER-corrects into a larger spurious call
+rather than removing one (Macrophages-1 PECAM1, truth +0.05, reads +0.71), and
+this survives even with exactly correct inflow — see the auto-memories
+`project_encoder_contamination_leak` and `project_panel_benchmark`.
