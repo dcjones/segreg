@@ -9,6 +9,7 @@ from .losses import (
     kl_z,
     nb_loss_sparse,
     nbconv_loss_sparse,
+    nbmm_loss_sparse,
     size_factor_loss,
 )
 from .nn import SegregVAE
@@ -41,22 +42,31 @@ class SegregTrainingWrapper(nn.Module):
         row_idx,
         current_beta_kl: torch.Tensor,
         batch_component=None,
+        inflow_var_sub=None,
     ):
         encoder_in, log_sf = self.model.prepare_encoder_input(x_sparse, batch_idx)
 
-        mu_hat, lam, delta, z_mu, z_logstd, beta = self.model(
+        mu_hat, lam, delta, contam_var, z_mu, z_logstd, beta = self.model(
             encoder_in,
             batch_x,
             inflow=inflow_sub,
             phi=phi_sub,
             log_size_factor=log_sf,
             component=batch_component,
+            inflow_var=inflow_var_sub,
         )
 
         if self.model.likelihood == "nb_conv":
             loss_recon = nbconv_loss_sparse(
                 x_sparse, lam, delta, self.model.log_r,
                 row_idx=row_idx, conv_max=self.model.conv_max,
+                contam_var=contam_var, contam_family=self.model.contam_family,
+            )
+        elif self.model.likelihood == "nb_mm":
+            loss_recon = nbmm_loss_sparse(
+                x_sparse, lam, delta, self.model.log_r,
+                row_idx=row_idx,
+                contam_var=contam_var, contam_family=self.model.contam_family,
             )
         else:
             loss_recon = nb_loss_sparse(

@@ -82,9 +82,107 @@ def nb_loss_sparse(x_sparse, mu, log_r, row_idx=None):
 _CONV_CHUNK_ELEMENTS = 8_000_000
 
 
-def _nbconv_logpx_chunk(x, r_nz, lam_nz, d_nz, conv_max, eps):
+# The contamination count C_cg is given a two-parameter distribution matched to
+# proseg's posterior mean (delta) and a target variance (var). Which family can
+# represent a given (mean, variance) pair depends on the sign of var - delta, so
+# each mode commits to one family rather than branching per entry:
+#
+#   "poisson"  var == delta        -- the original nb_conv: proseg's inflow is a
+#                                     Poisson rate, its uncertainty ignored.
+#   "binomial" var <  delta        -- proseg's expected_inflow_var, which is the
+#                                     posterior variance of the contaminant COUNT
+#                                     (a Poisson-binomial over the cell's own
+#                                     observed transcripts: C = sum_t Bern(p_t),
+#                                     so var = sum p(1-p) <= sum p = delta). This
+#                                     is sub-Poisson: empirically var/delta has
+#                                     median ~0.52 and var < delta on ~97% of
+#                                     entries, and the implied trial count
+#                                     delta^2/(delta-var) matches the observed
+#                                     count X to within a few percent, confirming
+#                                     the Poisson-binomial reading.
+#   "nb"       var >  delta        -- the Gamma-rate reading: f ~ Gamma(delta, .)
+#                                     with Var[f] = V_f and C ~ Poisson(f), giving
+#                                     Var[C] = delta + V_f. Treats proseg's
+#                                     variance as epistemic uncertainty ABOUT the
+#                                     rate, stacked on top of Poisson sampling
+#                                     noise, rather than as the variance of the
+#                                     count itself.
+_BINOM_VAR_MARGIN = 1e-3
+
+
+def _binom_n_p(delta, var, eps):
+    """Binomial (n, p) with mean delta and variance <= var, elementwise.
+
+    n = delta^2 / (delta - var) >= delta, so p = delta/n <= 1. Rounding n up keeps
+    p <= 1 and makes the realized variance delta*(1 - delta/n) >= var, i.e. errs
+    toward the (wider) Poisson rather than overstating our certainty. Entries with
+    delta == 0 get n = p = 0, a point mass at zero.
+    """
+    v = var.clamp(min=0.0).minimum((1.0 - _BINOM_VAR_MARGIN) * delta)
+    n = torch.ceil(delta.pow(2) / (delta - v).clamp(min=eps))
+    n = torch.where(delta > 0, n.clamp(min=1.0), torch.zeros_like(n))
+    p = torch.where(n > 0, delta / n.clamp(min=1.0), torch.zeros_like(n))
+    return n, p.clamp(0.0, 1.0 - 1e-6)
+
+
+def _nb_contam_r(delta, var, eps):
+    """NB shape with mean delta and variance var > delta: Var = delta + delta^2/r_f."""
+    r_f = delta.pow(2) / (var - delta).clamp(min=eps)
+    return r_f.clamp(min=eps, max=1e8)
+
+
+def _contam_log_p0(delta, var, family, eps):
+    """log P(C = 0), elementwise, for the dense x = 0 baseline."""
+    if family == "poisson":
+        return -delta
+    if family == "binomial":
+        n, p = _binom_n_p(delta, var, eps)
+        return n * torch.log1p(-p)
+    if family != "nb":
+        raise ValueError(f"unknown contamination family {family!r}")
+    r_f = _nb_contam_r(delta, var, eps)
+    return r_f * torch.log(r_f / (r_f + delta + eps))
+
+
+def _contam_log_pmf(j, delta, var, family, eps):
+    """log P(C = j) over a [c, J+1] grid: j is [J+1], delta/var are [c].
+    Returns (log_pmf [c, J+1], valid mask [c, J+1] or None)."""
+    j_row = j.unsqueeze(0)
+    d_b = delta.unsqueeze(1)
+    if family == "poisson":
+        log_pmf = (
+            -d_b
+            + j_row * torch.log(d_b.clamp(min=eps))
+            - torch.lgamma(j + 1.0).unsqueeze(0)
+        )
+        return log_pmf, None
+    if family == "binomial":
+        n, p = _binom_n_p(delta, var, eps)
+        n_b, p_b = n.unsqueeze(1), p.unsqueeze(1)
+        log_pmf = (
+            torch.lgamma(n_b + 1.0)
+            - torch.lgamma(j_row + 1.0)
+            - torch.lgamma((n_b - j_row).clamp(min=0.0) + 1.0)
+            + j_row * torch.log(p_b.clamp(min=eps))
+            + (n_b - j_row) * torch.log1p(-p_b)
+        )
+        return log_pmf, j_row <= n_b
+    if family != "nb":
+        raise ValueError(f"unknown contamination family {family!r}")
+    r_b = _nb_contam_r(delta, var, eps).unsqueeze(1)
+    log_pmf = (
+        torch.lgamma(j_row + r_b)
+        - torch.lgamma(r_b)
+        - torch.lgamma(j_row + 1.0)
+        + r_b * torch.log(r_b / (r_b + d_b + eps))
+        + j_row * torch.log((d_b + eps) / (r_b + d_b + eps))
+    )
+    return log_pmf, None
+
+
+def _nbconv_logpx_chunk(x, r_nz, lam_nz, d_nz, v_nz, family, conv_max, eps):
     """log P(Xhat = x) for a chunk of nonzeros, via the finite convolution
-        P(Xhat = x) = sum_{j=0}^{min(x, conv_max)} NB(x - j; r, lam) * Poisson(j; delta),
+        P(Xhat = x) = sum_{j=0}^{min(x, conv_max)} NB(x - j; r, lam) * P(C = j),
     with j the contamination count and k = x - j the signal count. Shapes: all
     inputs [c]; returns [c]. Builds a [c, conv_max+1] grid."""
     j = torch.arange(conv_max + 1, device=x.device, dtype=x.dtype)  # [J+1]
@@ -94,7 +192,6 @@ def _nbconv_logpx_chunk(x, r_nz, lam_nz, d_nz, conv_max, eps):
 
     r_b = r_nz.unsqueeze(1)
     lam_b = lam_nz.unsqueeze(1)
-    d_b = d_nz.unsqueeze(1)
 
     log_r_frac = torch.log(r_b / (r_b + lam_b + eps))
     log_lam_frac = torch.log(lam_b / (r_b + lam_b + eps))
@@ -105,16 +202,23 @@ def _nbconv_logpx_chunk(x, r_nz, lam_nz, d_nz, conv_max, eps):
         + r_b * log_r_frac
         + k_c * log_lam_frac
     )
-    log_pois = (
-        -d_b
-        + j.unsqueeze(0) * torch.log(d_b.clamp(min=eps))
-        - torch.lgamma(j + 1.0).unsqueeze(0)
-    )
-    term = (log_nb + log_pois).masked_fill(~valid, float("-inf"))
+    log_contam, contam_valid = _contam_log_pmf(j, d_nz, v_nz, family, eps)
+    if contam_valid is not None:
+        valid = valid & contam_valid
+    term = (log_nb + log_contam).masked_fill(~valid, float("-inf"))
     return torch.logsumexp(term, dim=1)  # [c]
 
 
-def nbconv_loss_sparse(x_sparse, lam, delta, log_r, row_idx=None, conv_max=64):
+def nbconv_loss_sparse(
+    x_sparse,
+    lam,
+    delta,
+    log_r,
+    row_idx=None,
+    conv_max=64,
+    contam_var=None,
+    contam_family="poisson",
+):
     """Exact generative decontamination likelihood (paper's Option B / augmented
     model, marginalized in closed form).
 
@@ -147,6 +251,11 @@ def nbconv_loss_sparse(x_sparse, lam, delta, log_r, row_idx=None, conv_max=64):
     lam must be strictly positive (exp of a clamped log-rate). delta may be None
     (no diffusion), in which case this reduces exactly to nb_loss_sparse.
 
+    contam_family / contam_var generalize the contamination arm beyond Poisson:
+    C is given the distribution in that family with mean delta and variance
+    contam_var (see the family notes above). contam_family="poisson" ignores
+    contam_var and recovers the original likelihood exactly.
+
     conv_max caps the convolution length, i.e. the number of counts attributable to
     contamination. It only needs to cover the Poisson(delta) tail (delta + a few sqrt
     (delta)) -- NOT the max observed count -- because the j <= x constraint is
@@ -161,12 +270,17 @@ def nbconv_loss_sparse(x_sparse, lam, delta, log_r, row_idx=None, conv_max=64):
     eps = 1e-8
 
     # x=0 baseline over every cell x gene entry:
-    #   log P(X=0) = log NB(0; r, lam) + log Poisson(0; delta)
-    #             = r*log(r/(r+lam))   +   (-delta)
+    #   log P(X=0) = log NB(0; r, lam) + log P(C=0)
+    #             = r*log(r/(r+lam))   +   (-delta, for Poisson contamination)
     baseline = (r * torch.log(r / (r + lam + eps))).sum()
-    if delta is not None:
+    if delta is None:
+        family = "poisson"
+        var = None
+    else:
+        family = contam_family
         delta = delta.float()
-        baseline = baseline - delta.sum()
+        var = delta if contam_var is None else contam_var.float()
+        baseline = baseline + _contam_log_p0(delta, var, family, eps).sum()
 
     col_idx = x_sparse.col_indices()
     if row_idx is None:
@@ -177,23 +291,115 @@ def nbconv_loss_sparse(x_sparse, lam, delta, log_r, row_idx=None, conv_max=64):
     x = x_sparse.values().float()  # [nnz]
     r_nz = r[col_idx]  # [nnz]
     lam_nz = lam[row_idx, col_idx]  # [nnz]
-    d_nz = (
-        delta[row_idx, col_idx] if delta is not None else torch.zeros_like(x)
-    )  # [nnz]
+    if delta is not None and var is not None:
+        d_nz = delta[row_idx, col_idx]  # [nnz]
+        v_nz = var[row_idx, col_idx]  # [nnz]
+    else:
+        d_nz = torch.zeros_like(x)
+        v_nz = d_nz
 
     # The correction replaces each nonzero's x=0 baseline term with its true
     # log-prob. Chunk over nonzeros so the [chunk, conv_max+1] grid never grows
     # with batch size or panel width.
-    base_nz = r_nz * torch.log(r_nz / (r_nz + lam_nz + eps)) - d_nz
+    base_nz = r_nz * torch.log(r_nz / (r_nz + lam_nz + eps)) + _contam_log_p0(
+        d_nz, v_nz, family, eps
+    )
     nnz = x.shape[0]
     chunk = max(1, _CONV_CHUNK_ELEMENTS // (conv_max + 1))
     correction = lam.new_zeros(())
     for s in range(0, nnz, chunk):
         e = min(s + chunk, nnz)
         log_px = _nbconv_logpx_chunk(
-            x[s:e], r_nz[s:e], lam_nz[s:e], d_nz[s:e], conv_max, eps
+            x[s:e],
+            r_nz[s:e],
+            lam_nz[s:e],
+            d_nz[s:e],
+            v_nz[s:e],
+            family,
+            conv_max,
+            eps,
         )
         correction = correction + (log_px - base_nz[s:e]).sum()
+
+    return -(baseline + correction) / lam.shape[0]
+
+
+def nbmm_loss_sparse(
+    x_sparse,
+    lam,
+    delta,
+    log_r,
+    row_idx=None,
+    contam_var=None,
+    contam_family="poisson",
+    r_eff_max=1e3,
+):
+    """Moment-matched approximation to the two-stream likelihood: a single NB
+    whose mean and variance match those of signal + contamination.
+
+        mean  mu  = lam + delta
+        var   V   = (lam + lam^2 psi) + var[C]
+        =>  psi_eff = (V - mu) / mu^2 = (lam^2 psi + var[C] - delta) / mu^2
+
+    With var[C] = delta (Poisson contamination) this reproduces nbconv_loss_sparse's
+    first two moments exactly while costing one NB evaluation instead of a
+    convolution -- so running it against nb_conv isolates how much the *shape* of
+    the exact convolution (beyond its mean and variance) is worth.
+
+    The catch is that an NB cannot be under-dispersed. Proseg's inflow variance is
+    sub-Poisson (var[C] < delta on ~97% of entries), so lam^2 psi + var[C] - delta
+    goes negative wherever the contamination is a large share of the count and the
+    signal's own over-dispersion is small -- i.e. exactly the entries the
+    uncertainty is supposed to inform. Those entries are floored at the Poisson
+    limit (psi_eff = mu^2/r_eff_max, controlled by r_eff_max), so this likelihood
+    can only ever express PART of the tightening the binomial convolution gets.
+    r_eff_max also bounds a real numerical limit: the NB log-pmf's
+    lgamma(x + r) - lgamma(r) is a difference of two ~r log r sized terms, so in
+    fp32 its absolute error grows with r -- at r = 1e4 the pmf no longer sums to 1
+    to better than ~0.2%. The default 1e3 keeps that under ~0.02% while sitting
+    close enough to the Poisson limit (excess variance mu^2/1000) for the floor to
+    be indistinguishable from equidispersion in practice.
+
+    Structured like nb_loss_sparse (dense x=0 baseline + sparse correction), but
+    the dispersion r_eff is per cell x gene rather than per gene.
+    """
+    r = torch.exp(log_r).clamp(min=1e-3)  # [n_genes]
+    lam = lam.float()
+    eps = 1e-8
+
+    if delta is None:
+        mu = lam
+        excess = lam.pow(2) / r
+    else:
+        delta = delta.float()
+        if contam_var is None or contam_family == "poisson":
+            contam_var = delta
+        contam_var = contam_var.float()
+        mu = lam + delta
+        excess = lam.pow(2) / r + contam_var - delta
+    # Flooring excess at mu^2/r_eff_max is equivalent to capping r_eff there, and
+    # keeps the NB well-defined where the matched variance falls below the mean.
+    excess = excess.clamp(min=mu.pow(2) / r_eff_max + eps)
+    r_eff = mu.pow(2) / excess  # [B, n_genes]
+
+    r_plus_mu = r_eff + mu + eps
+    baseline = (r_eff * torch.log(r_eff / r_plus_mu)).sum()
+
+    col_idx = x_sparse.col_indices()
+    if row_idx is None:
+        crow = x_sparse.crow_indices()
+        row_idx = torch.repeat_interleave(
+            torch.arange(x_sparse.shape[0], device=lam.device), crow[1:] - crow[:-1]
+        )
+    x = x_sparse.values().float()
+    r_nz = r_eff[row_idx, col_idx]
+    mu_nz = mu[row_idx, col_idx]
+    correction = (
+        torch.lgamma(x + r_nz)
+        - torch.lgamma(r_nz)
+        - torch.lgamma(x + 1)
+        + x * torch.log((mu_nz + eps) / (r_nz + mu_nz + eps))
+    ).sum()
 
     return -(baseline + correction) / lam.shape[0]
 

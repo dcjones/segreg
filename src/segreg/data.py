@@ -55,6 +55,30 @@ def load_proseg_data(
     return adata, X, inflow, outflow, φ
 
 
+def load_inflow_var(adata: AnnData) -> csr_matrix:
+    """Posterior variance of the expected inflow, proseg's layer of the same name.
+
+    This is the variance of the contaminant *count*, not of a rate: proseg computes
+    it over MCMC samples of the per-transcript assignments, so with
+    C_cg = sum_{t in X_cg} 1[transcript t is misassigned] it is sum_t p_t (1 - p_t),
+    which is bounded above by the mean sum_t p_t. Empirically (breast simulation,
+    ~720k nonzero entries) Var/mean has median 0.52 and is below 1 on 97% of
+    entries, and the implied Poisson-binomial trial count mean^2/(mean - var) tracks
+    the observed count X to within a few percent. Modelling it therefore calls for a
+    sub-Poisson (binomial) contamination arm, not the super-Poisson one a
+    Gamma-distributed inflow rate would give -- see the family notes in losses.py.
+
+    Returned on the same sparsity pattern as expected_inflow.
+    """
+    if "expected_inflow_var" not in adata.layers:
+        raise ValueError(
+            "adata has no 'expected_inflow_var' layer; contam_var='poisson' is the "
+            "only option without it (needs a proseg run that emits flow variances)"
+        )
+    var = adata.layers["expected_inflow_var"]
+    return var.tocsr() if not isinstance(var, csr_matrix) else var
+
+
 def estimate_phi(X: np.ndarray, inflow: np.ndarray, outflow: np.ndarray) -> np.ndarray:
     """Estimate phi_cg, the fraction of a cell's true transcripts lost to neighbors.
 
@@ -117,12 +141,35 @@ def ols_init_beta(
     m: int,
     n: int,
     beta_prior_scale: float,
+    interaction_prior_scale: float | None = None,
+    interaction_suspect_shrinkage: bool = True,
+    interaction_columns: list[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """OLS-based initialization for beta, beta_prior_scale_matrix, and beta_logstd.
 
     Processes genes in chunks to avoid materializing the full dense m×n matrix.
     Returns (beta_init_np, beta_prior_scale_matrix, beta_logstd_init).
+
+    interaction_prior_scale overrides the base width of the interaction terms'
+    Cauchy prior, which otherwise defaults to the power-balanced 10/sqrt(m).
+    interaction_suspect_shrinkage toggles the extra 1/(1 + 50*inflow/obs) factor
+    applied on top of it. Both exist to test whether the interaction prior is
+    itself responsible for shrinking real effects to zero: on the 159k-cell
+    benchmark the default base is 0.025 and suspect shrinkage takes it to ~0.002
+    for contaminated marker genes, i.e. ~300x tighter than a planted effect of
+    0.7, and the resulting beta_logstd_init clips at -5 (posterior sd 0.0067).
+
+    interaction_columns names the covariates to treat as interactions. It defaults
+    to the ones patsy spells with a colon, but that is only a naming convention:
+    a design built with pre-multiplied per-group columns (`expo_Endothelial`
+    rather than `C(type):exposure`) is just as much an interaction and would
+    otherwise silently get the ~500x wider main-effect prior AND an OLS init
+    instead of zero. Pass the list explicitly whenever the design is built that way.
     """
+    if interaction_columns is None:
+        interaction_set = {name for name in covariate_names if ":" in name}
+    else:
+        interaction_set = set(interaction_columns)
     mean_rate_1d = np.asarray(X.mean(axis=0)).squeeze().astype(np.float32) / float(
         sf_col.mean()
     )
@@ -157,11 +204,13 @@ def ols_init_beta(
 
     # Power-Balanced Prior: scale interaction prior width by 1/sqrt(m) to maintain
     # consistent discipline as statistical power to fit spurious betas grows with m.
-    interaction_base_scale = 10.0 / np.sqrt(m)
+    interaction_base_scale = (
+        10.0 / np.sqrt(m) if interaction_prior_scale is None else interaction_prior_scale
+    )
 
     # Suspect-Specific Shrinkage: genes where inflow dominates have high contamination
     # potential and should be shrunk more aggressively. Only applies with proseg data.
-    if inflow is not None:
+    if inflow is not None and interaction_suspect_shrinkage:
         avg_obs = np.asarray(X.mean(axis=0)).squeeze()
         avg_inflow = np.asarray(inflow.mean(axis=0)).squeeze()
         suspect_score = avg_inflow / (avg_obs + 1e-8)
@@ -171,7 +220,7 @@ def ols_init_beta(
 
     beta_prior_scale_matrix = np.zeros((len(covariate_names), n), dtype=np.float32)
     for i, name in enumerate(covariate_names):
-        if ":" in name:
+        if name in interaction_set:
             beta_prior_scale_matrix[i, :] = (
                 interaction_base_scale * suspect_shrinkage * gene_scale
             )
@@ -188,7 +237,7 @@ def ols_init_beta(
     beta_init_np = beta_init_np * shrink
 
     for i, name in enumerate(covariate_names):
-        if ":" in name:
+        if name in interaction_set:
             beta_init_np[i, :] = 0.0
 
     post_var = sigma_ols_sq * gamma_sq / (sigma_ols_sq + gamma_sq + 1e-10)

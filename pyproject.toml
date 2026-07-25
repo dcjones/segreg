@@ -29,3 +29,6 @@ debug = [
     "marimo>=0.20.4",
     "umap-learn>=0.5.11",
 ]
+dev = [
+    "pytest>=9.1.1",
+]

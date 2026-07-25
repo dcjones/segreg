@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from .data import (
     clip_phi,
+    load_inflow_var,
     load_proseg_data,
     ols_init_beta,
     slice_csr_to_sparse_tensor,
@@ -51,6 +52,8 @@ class RegressionModel:
         stochastic_alpha: bool = False,
         component_alpha: bool = False,
         likelihood: str = "nb_mean",
+        contam_var: str = "poisson",
+        retention_form: str | None = None,
         conv_max: int | None = None,
         include_size_factor: bool = True,
         sf_sigma: float = 0.5,
@@ -59,11 +62,21 @@ class RegressionModel:
         latent_dim: int = 64,
         kappa: float = 1000.0,
         beta_prior_scale: float = 1.0,
+        interaction_prior_scale: float | None = None,
+        interaction_suspect_shrinkage: bool = True,
+        interaction_columns: list[str] | None = None,
         alpha_reg: float = 1.0,
     ):
         adata, self.X, self.inflow, self.outflow, phi = load_proseg_data(
             data, include_diffusion
         )
+
+        # Posterior variance of the inflow, needed only by the non-Poisson
+        # contamination arms (see load_inflow_var / the family notes in losses.py).
+        if include_diffusion and contam_var != "poisson":
+            self.inflow_var = load_inflow_var(adata)
+        else:
+            self.inflow_var = None
 
         self.m, self.n = adata.shape
         self.var_names = adata.var_names
@@ -74,7 +87,7 @@ class RegressionModel:
         # from the data's max inflow so a whole-transcriptome panel (max inflow ~64)
         # gets an exact convolution without the caller tuning it; entries below it
         # are exact regardless. Floored so tiny datasets still get a sane window.
-        if likelihood == "nb_conv" and conv_max is None:
+        if likelihood in ("nb_conv", "nb_mm") and conv_max is None:
             if self.inflow is not None and self.inflow.nnz > 0:
                 imax = float(self.inflow.data.max())
                 conv_max = int(np.ceil(imax + 8.0 * np.sqrt(imax)))
@@ -155,6 +168,9 @@ class RegressionModel:
             self.m,
             self.n,
             beta_prior_scale,
+            interaction_prior_scale=interaction_prior_scale,
+            interaction_suspect_shrinkage=interaction_suspect_shrinkage,
+            interaction_columns=interaction_columns,
         )
 
         self.beta_prior_scale_t = torch.tensor(
@@ -177,6 +193,8 @@ class RegressionModel:
             component_alpha=component_alpha,
             n_components=self.n_components,
             likelihood=likelihood,
+            contam_var=contam_var,
+            retention_form=retention_form,
             conv_max=self.conv_max,
             include_size_factor=include_size_factor,
             log_mean_expr=log_mean_expr,
@@ -275,6 +293,13 @@ class RegressionModel:
                 else:
                     inflow_sub_tensor = None
 
+                if inflow_sub_tensor is not None and self.inflow_var is not None:
+                    inflow_var_sub_tensor, _ = slice_csr_to_sparse_tensor(
+                        self.inflow_var, idx_np, self.n, self.device, use_pin, nb
+                    )
+                else:
+                    inflow_var_sub_tensor = None
+
                 if self.model.include_diffusion and self.model.include_retention:
                     assert self.phi is not None
                     phi_sub_tensor, _ = slice_csr_to_sparse_tensor(
@@ -304,6 +329,7 @@ class RegressionModel:
                         row_idx,
                         current_beta_kl_t,
                         batch_component,
+                        inflow_var_sub_tensor,
                     )
 
                 if use_scaler:

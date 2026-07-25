@@ -81,6 +81,8 @@ class SegregVAE(nn.Module):
         component_alpha: bool = False,
         n_components: int = 1,
         likelihood: str = "nb_mean",
+        contam_var: str = "poisson",
+        retention_form: str | None = None,
         conv_max: int = 64,
         include_size_factor: bool = True,
         log_mean_expr: torch.Tensor | None = None,
@@ -95,21 +97,63 @@ class SegregVAE(nn.Module):
         # (next-step-generative-model.md, Option B): Xhat = A + C with A ~ NB(lam,
         # psi) signal and C ~ Poisson(delta) contamination, so the likelihood is the
         # convolution NB(lam,psi) (+) Poisson(delta) rather than an NB on their sum.
-        # In nb_conv mode alpha is FIXED at 1 (delta = inflow taken at face value):
-        # with delta a known Poisson rate there is no alpha-vs-beta competition, the
-        # structural degeneracy that biases beta negative for contamination-dominated
-        # should-be-null genes. Retention and the alpha variational/component/separate
-        # machinery are therefore all disabled in nb_conv mode.
-        if likelihood not in ("nb_mean", "nb_conv"):
+        # "nb_mm" is the moment-matched approximation to nb_conv: one NB whose mean
+        # and variance match the two-stream model's (see nbmm_loss_sparse). It costs
+        # an NB evaluation instead of a convolution, but cannot represent
+        # under-dispersion, so it only partially captures a sub-Poisson contamination
+        # variance.
+        #
+        # In nb_conv/nb_mm mode alpha is FIXED at 1 (delta = inflow taken at face
+        # value): with delta a known contamination rate there is no alpha-vs-beta
+        # competition, the structural degeneracy that biases beta negative for
+        # contamination-dominated should-be-null genes. A free alpha would also make
+        # the variance bookkeeping ill-defined (scaling a count rate by alpha scales
+        # its variance by alpha^2, which proseg's estimate does not track). The alpha
+        # variational/component/separate machinery is therefore disabled in these
+        # modes. Retention is NOT: in nb_conv/nb_mm it multiplies the signal rate
+        # inside the two-stream model, mean(A) = r_cg * lam_cg, exactly as the paper
+        # writes it. (Retention was previously benchmarked as inert, but only under
+        # nb_mean, where it competed with a free alpha_g for the same outflow signal.)
+        if likelihood not in ("nb_mean", "nb_conv", "nb_mm"):
             raise ValueError(f"unknown likelihood {likelihood!r}")
+        # contam_var selects what variance the contamination count C is given, i.e.
+        # how proseg's expected_inflow_var (V_f) is read:
+        #   "poisson"     Var[C] = delta            -- ignore V_f (original nb_conv).
+        #   "proseg"      Var[C] = V_f              -- V_f is the posterior variance
+        #                 of the contaminant COUNT (a Poisson-binomial over the
+        #                 cell's own transcripts), which is sub-Poisson; represented
+        #                 by a binomial contamination arm.
+        #   "proseg_rate" Var[C] = delta + V_f      -- V_f is epistemic uncertainty
+        #                 about the contamination RATE (f ~ Gamma), stacked on
+        #                 Poisson sampling noise; an NB contamination arm.
+        if contam_var not in ("poisson", "proseg", "proseg_rate"):
+            raise ValueError(f"unknown contam_var {contam_var!r}")
         self.likelihood = likelihood
+        self.contam_var = contam_var
+        self.contam_family = {
+            "poisson": "poisson",
+            "proseg": "binomial",
+            "proseg_rate": "nb",
+        }[contam_var]
         self.conv_max = conv_max
-        self.fix_alpha = likelihood == "nb_conv"
+        self.fix_alpha = likelihood in ("nb_conv", "nb_mm")
         if self.fix_alpha:
-            include_retention = False
             separate_retention_alpha = False
             stochastic_alpha = False
             component_alpha = False
+        # retention_form picks how phi_cg (the estimated fraction of the cell's true
+        # transcripts lost to outflow) becomes a retention factor r_cg:
+        #   "exp"    r = exp(-alpha_g * phi)  -- the original soft form; alpha_g
+        #            rescales how far to trust phi, and r stays positive for any phi.
+        #   "linear" r = 1 - phi              -- phi at face value, the same "trust
+        #            proseg's estimate" stance that fixing alpha = 1 takes for inflow.
+        # Defaults follow that logic: "linear" wherever alpha is pinned at 1, "exp"
+        # otherwise (which preserves nb_mean's existing behaviour exactly).
+        if retention_form is None:
+            retention_form = "linear" if self.fix_alpha else "exp"
+        if retention_form not in ("exp", "linear"):
+            raise ValueError(f"unknown retention_form {retention_form!r}")
+        self.retention_form = retention_form
         self.include_diffusion = include_diffusion
         # Independent ablation of the two diffusion terms (mirrors the toggles on
         # FactorizationVAE): include_retention gates the multiplicative outflow
@@ -231,7 +275,16 @@ class SegregVAE(nn.Module):
             encoder_in = torch.log1p(x_dense)
         return encoder_in, log_sf
 
-    def forward(self, x, covariates, inflow, phi, log_size_factor=None, component=None):
+    def forward(
+        self,
+        x,
+        covariates,
+        inflow,
+        phi,
+        log_size_factor=None,
+        component=None,
+        inflow_var=None,
+    ):
         z_mu, z_logstd = self.encoder(x)
         z = self.reparameterize(z_mu, z_logstd)
         z_offset = self.node_decoder(z)
@@ -248,6 +301,7 @@ class SegregVAE(nn.Module):
         lam = torch.exp(torch.clamp(log_rate, min=-15.0, max=15.0))
 
         delta = None
+        contam_var = None
         if self.include_diffusion:
             # retention = exp(-alpha*phi) is 1 wherever phi=0, so mu is dense
             # regardless; densify the (sparse) inflow/phi batches here to build it.
@@ -265,30 +319,53 @@ class SegregVAE(nn.Module):
                     assert component is not None
                     log_alpha = log_alpha[component]  # -> [B, n_genes]
                 alpha = torch.exp(log_alpha.clamp(-10.0, 10.0))
-            mu = lam
             if self.include_retention:
                 assert phi is not None
                 if phi.layout == torch.sparse_csr:
                     phi = phi.to_dense()
-                alpha_ret = (
-                    torch.exp(self.log_alpha_ret)
-                    if self.log_alpha_ret is not None
-                    else alpha
-                )
-                mu = torch.exp(-alpha_ret * phi) * mu
+                if self.retention_form == "linear":
+                    retention = (1.0 - phi).clamp(min=1e-3)
+                else:
+                    alpha_ret = (
+                        torch.exp(self.log_alpha_ret)
+                        if self.log_alpha_ret is not None
+                        else alpha
+                    )
+                    retention = torch.exp(-alpha_ret * phi)
+                # Fold retention into the signal rate itself rather than only into
+                # the combined mean: under nb_conv/nb_mm the signal stream is
+                # A ~ NB(r*lam, psi), so the convolution must be handed r*lam. For
+                # nb_mean this is equivalent -- mu is r*lam + delta either way.
+                lam = retention * lam
+            mu = lam
             if self.include_delta:
                 assert inflow is not None
                 if inflow.layout == torch.sparse_csr:
                     inflow = inflow.to_dense()
                 delta = alpha * inflow
                 mu = mu + delta
+                if self.contam_family != "poisson":
+                    assert inflow_var is not None, (
+                        f"contam_var={self.contam_var!r} needs proseg's "
+                        "expected_inflow_var layer"
+                    )
+                    if inflow_var.layout == torch.sparse_csr:
+                        inflow_var = inflow_var.to_dense()
+                    # alpha == 1 whenever a non-Poisson contamination arm is in use
+                    # (fix_alpha), so V_f needs no rescaling here.
+                    contam_var = (
+                        inflow_var
+                        if self.contam_family == "binomial"
+                        else delta + inflow_var
+                    )
             mu = mu + self.rate_offset
         else:
             mu = lam + self.rate_offset
 
         # lam (own-signal rate) and delta (contamination rate) are returned
-        # separately -- the nb_conv likelihood convolves them rather than using
-        # their sum mu. In nb_mean mode lam excludes the rate_offset that mu carries;
-        # the offset is a numerical floor for the combined-mean NB and is not part of
-        # the generative signal rate.
-        return mu, lam, delta, z_mu, z_logstd, beta
+        # separately -- the nb_conv/nb_mm likelihoods keep the two streams distinct
+        # rather than using their sum mu. contam_var is the target variance of the
+        # contamination count (None means "Poisson", i.e. equal to delta). In nb_mean
+        # mode lam excludes the rate_offset that mu carries; the offset is a numerical
+        # floor for the combined-mean NB and is not part of the generative signal rate.
+        return mu, lam, delta, contam_var, z_mu, z_logstd, beta

@@ -42,7 +42,17 @@ Some important components, all under `src/segreg/`:
     convolution and alpha is fixed at 1. `nb_conv` roughly halves the residual
     spurious-DE bias while preserving real-DE power (see the auto-memory
     `project_generative_decontamination_model`); the remaining overshoot is a
-    mean-structure artifact, not a likelihood one.
+    mean-structure artifact, not a likelihood one. `"nb_mm"` is the moment-matched
+    single-NB approximation to `nb_conv` — cheaper, but benchmarked WORSE (planted
+    |bias| 0.41 vs 0.25, credible intervals ~2.5x too narrow, 0/7 covering truth vs
+    4/7). Don't use it; the convolution's shape matters beyond its moments.
+    The `contam_var` flag sets the variance of the contamination count `C`:
+    `"poisson"` (default) `Var=delta`; `"proseg"` `Var=V_f` (binomial arm);
+    `"proseg_rate"` `Var=delta+V_f` (NB arm, the Gamma-inflow-rate reading).
+    **Both non-default modes were tested and rejected — keep `"poisson"`**; see
+    the auto-memory `project_inflow_variance_rejected` for the numbers and the
+    mechanism (sub-Poisson contamination caps the count that can be attributed to
+    contamination at high counts, pushing it onto lambda near contaminating types).
   * `losses.py`: Loss terms (NB reconstruction, latent KL, size-factor prior,
     alpha prior) used by the training wrappers.
   * `training.py`: `SegregTrainingWrapper` / `FactorizationTrainingWrapper`,
