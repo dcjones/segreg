@@ -67,6 +67,7 @@ class RegressionModel:
         interaction_suspect_shrinkage: bool = True,
         interaction_columns: list[str] | None = None,
         alpha_reg: float = 1.0,
+        init_seed: int | None = 42,
     ):
         adata, self.X, self.inflow, self.outflow, phi = load_proseg_data(
             data, include_diffusion
@@ -177,6 +178,18 @@ class RegressionModel:
         self.beta_prior_scale_t = torch.tensor(
             beta_prior_scale_matrix, dtype=torch.float32
         ).to(self.device)
+
+        # Seed BEFORE constructing the network. SegregVAE's nn.Linear layers draw
+        # from the global RNG at construction time, but fit() only seeds once
+        # training starts -- so without this the weights depend on how many draws
+        # happened earlier in the process, i.e. on a model's position in a
+        # benchmark loop. Two identical configs then diverge: on the 159k-cell
+        # simulation the same nb_conv setup gave null coefficients of +0.001,
+        # +0.028 and +0.053 across runs, a spread comparable to the effects being
+        # measured. Pass init_seed=None to opt out and inherit ambient RNG state.
+        if init_seed is not None:
+            torch.manual_seed(init_seed)
+            torch.cuda.manual_seed_all(init_seed)
 
         self.model = SegregVAE(
             self.m,
