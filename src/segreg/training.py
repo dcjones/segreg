@@ -44,7 +44,9 @@ class SegregTrainingWrapper(nn.Module):
         batch_component=None,
         inflow_var_sub=None,
     ):
-        encoder_in, log_sf = self.model.prepare_encoder_input(x_sparse, batch_idx)
+        encoder_in, log_sf = self.model.prepare_encoder_input(
+            x_sparse, batch_idx, inflow=inflow_sub
+        )
 
         mu_hat, lam, delta, contam_var, z_mu, z_logstd, beta = self.model(
             encoder_in,

@@ -83,6 +83,7 @@ class SegregVAE(nn.Module):
         likelihood: str = "nb_mean",
         contam_var: str = "poisson",
         retention_form: str | None = None,
+        encoder_input: str = "raw",
         conv_max: int = 64,
         include_size_factor: bool = True,
         log_mean_expr: torch.Tensor | None = None,
@@ -154,6 +155,9 @@ class SegregVAE(nn.Module):
         if retention_form not in ("exp", "linear"):
             raise ValueError(f"unknown retention_form {retention_form!r}")
         self.retention_form = retention_form
+        if encoder_input not in ("raw", "decontaminated"):
+            raise ValueError(f"unknown encoder_input {encoder_input!r}")
+        self.encoder_input = encoder_input
         self.include_diffusion = include_diffusion
         # Independent ablation of the two diffusion terms (mirrors the toggles on
         # FactorizationVAE): include_retention gates the multiplicative outflow
@@ -252,7 +256,10 @@ class SegregVAE(nn.Module):
         return mu.clamp(-40.0, 40.0)
 
     def prepare_encoder_input(
-        self, x_sub_tensor: torch.Tensor, batch_idx: torch.Tensor
+        self,
+        x_sub_tensor: torch.Tensor,
+        batch_idx: torch.Tensor,
+        inflow: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Normalize counts and compute size factor. Returns (dense encoder_in, log_sf).
 
@@ -260,12 +267,28 @@ class SegregVAE(nn.Module):
         batch is densified here for the (dense) encoder. The sparse handle is not
         consumed by the encoder -- it is passed separately to nb_loss_sparse, which
         is the one place sparsity wins at these panel sizes.
+
+        encoder_input="decontaminated" subtracts the inflow estimate from the counts
+        before normalizing. The likelihood already knows which counts are
+        contamination -- delta enters it as a separate stream -- but the ENCODER does
+        not: it sees raw X, so a near-tumor macrophage full of leaked EPCAM looks to
+        it like a cell that expresses EPCAM, and z_offset reconstructs it. Since the
+        likelihood then wants that gene's own-signal rate to stay low, beta has to
+        move to compensate, and because contamination is spatially structured the
+        compensation is correlated with the design. Feeding the encoder X - delta
+        removes the input that drives this, and tests whether the residual
+        false-positive survives when z can no longer see the contamination.
         """
         x_dense = (
             x_sub_tensor.to_dense()
             if x_sub_tensor.layout == torch.sparse_csr
             else x_sub_tensor
         )
+        if self.encoder_input == "decontaminated" and inflow is not None:
+            inflow_dense = (
+                inflow.to_dense() if inflow.layout == torch.sparse_csr else inflow
+            )
+            x_dense = (x_dense - inflow_dense).clamp(min=0.0)
         if self.include_size_factor:
             log_sf = self.log_sf_embed(batch_idx).squeeze(-1)
             x_norm = x_dense / (torch.exp(log_sf).unsqueeze(-1) + 1e-8) * 1000.0

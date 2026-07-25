@@ -54,6 +54,7 @@ class RegressionModel:
         likelihood: str = "nb_mean",
         contam_var: str = "poisson",
         retention_form: str | None = None,
+        encoder_input: str = "raw",
         conv_max: int | None = None,
         include_size_factor: bool = True,
         sf_sigma: float = 0.5,
@@ -195,6 +196,7 @@ class RegressionModel:
             likelihood=likelihood,
             contam_var=contam_var,
             retention_form=retention_form,
+            encoder_input=encoder_input,
             conv_max=self.conv_max,
             include_size_factor=include_size_factor,
             log_mean_expr=log_mean_expr,
@@ -349,6 +351,17 @@ class RegressionModel:
 
         self.model.eval()
 
+    def _eval_inflow(self, idx_np):
+        """Inflow batch for the encoder at eval time, so get_corrected_expression /
+        get_latent_representation normalize their input exactly as training did.
+        None whenever the encoder does not consume it."""
+        if self.model.encoder_input != "decontaminated" or self.inflow is None:
+            return None
+        sub, _ = slice_csr_to_sparse_tensor(
+            self.inflow, idx_np, self.n, self.device, use_pin=False, non_blocking=False
+        )
+        return sub
+
     def get_regression_coefficients(
         self, credible_interval: float | None = None
     ) -> pd.DataFrame:
@@ -392,7 +405,7 @@ class RegressionModel:
                     self.X, idx_np, self.n, self.device, use_pin=False, non_blocking=False
                 )
                 encoder_in, log_sf = self.model.prepare_encoder_input(
-                    x_sub_tensor, batch_idx
+                    x_sub_tensor, batch_idx, inflow=self._eval_inflow(idx_np)
                 )
                 z_mu, z_logstd = self.model.encoder(encoder_in)
                 std = torch.exp(z_logstd)
@@ -434,7 +447,7 @@ class RegressionModel:
                     self.X, idx_np, self.n, self.device, use_pin=False, non_blocking=False
                 )
                 encoder_in, _ = self.model.prepare_encoder_input(
-                    x_sub_tensor, batch_idx
+                    x_sub_tensor, batch_idx, inflow=self._eval_inflow(idx_np)
                 )
                 z_mu, _ = self.model.encoder(encoder_in)
                 all_z_mu.append(z_mu.cpu().numpy())
