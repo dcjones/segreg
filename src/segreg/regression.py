@@ -59,6 +59,22 @@ class RegressionModel:
         # that pinning exists to avoid. See SegregVAE for the full argument.
         global_contam_alpha: bool = False,
         contam_alpha_max: float = 2.0,
+        # proseg's expected_inflow_var is measurably OVERCONFIDENT: scored against
+        # simulated ground truth it is ~4x too small in variance (~2x in sd) on BOTH
+        # a 310-gene breast panel and a 16.7k-gene WTA panel -- sd(z) 1.66 and 2.00
+        # where 1.0 is calibrated (simple-seg-sim eval/check_inflow_calibration.py).
+        # Unlike the size-factor anchor and unlike alpha, that factor TRANSFERS across
+        # the two datasets, so scaling it is a defensible default rather than a
+        # per-dataset knob. It is not uniform though: 2-4x at low inflow rising to
+        # 5.6-8.4x for inflow >= 10, so a single scale under-corrects the tail.
+        inflow_var_scale: float = 1.0,
+        # Floor on the (scaled) variance. 7.6% of breast and 22.1% of Atera entries
+        # have V_f == 0 with a nonzero residual -- proseg certain AND wrong -- which no
+        # multiplicative scale repairs. Applied to the STORED entries of V_f, whose
+        # sparsity pattern matches expected_inflow's; entries where proseg records no
+        # inflow at all lie outside that pattern and cannot be floored without
+        # densifying a cells x genes matrix, so those remain unreachable.
+        inflow_var_floor: float = 0.0,
         # Pin alpha at 1 REGARDLESS of likelihood, so that "which likelihood" and
         # "is alpha free" can be varied independently. Without this the two are
         # confounded in every nb_mean-vs-nb_conv comparison.
@@ -109,6 +125,15 @@ class RegressionModel:
         # contamination arms (see load_inflow_var / the family notes in losses.py).
         if include_diffusion and contam_var != "poisson":
             self.inflow_var = load_inflow_var(adata)
+            if self.inflow_var is not None and (
+                inflow_var_scale != 1.0 or inflow_var_floor > 0.0
+            ):
+                # Rescale once at load rather than per batch: V_f is fixed data.
+                v = self.inflow_var.tocsr(copy=True)
+                v.data = np.maximum(
+                    v.data * float(inflow_var_scale), float(inflow_var_floor)
+                )
+                self.inflow_var = v
         else:
             self.inflow_var = None
 
