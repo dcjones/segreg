@@ -56,7 +56,29 @@ class RegressionModel:
         retention_form: str | None = None,
         encoder_input: str = "raw",
         conv_max: int | None = None,
-        include_size_factor: bool = True,
+        # Off by default. The per-cell log_sf was effectively inert: initialised at
+        # log(obs["volume"]) and given only one Adam step per cell per epoch
+        # (batch_size=1024, so each cell appears in one batch), it could travel
+        # ~0.2 log units at lr=1e-3 -- against a 2.6-unit gap between plausible
+        # anchors -- so the anchor, not the data, decided it. Freeing it (lr=0.05)
+        # is worse, not better: it is unidentified against rho(z), since
+        # log_rate = design@beta + rho(z) + log_sf with an unconstrained
+        # NodeDecoder, so any per-cell constant sits equally well in either. Two
+        # anchors 2.6 units apart then diverge to a centred correlation of 0.171.
+        #
+        # Dropping the term removes that degeneracy and, with it, the choice of
+        # anchor -- which has no universal answer: measured residual exposure
+        # gradient is best on volume for the 313-gene breast panel (+0.160) and
+        # catastrophic there for total counts (-0.506), while the reverse holds on
+        # an 18k-gene WTA panel (volume +1.975, total -0.113). z absorbs the
+        # per-cell shift instead; ablating latent_dim confirms z is doing useful
+        # work rather than stealing signal from beta.
+        #
+        # Measured effect on mean |bias| against calibrated truth, correction ON:
+        # WTA 1.11 -> 0.43, breast 0.54 -> 0.42; detection metrics unchanged on
+        # breast. Caveat: on the correction-OFF baseline breast is worse
+        # (0.21 -> 0.37), since volume is a well-specified anchor there.
+        include_size_factor: bool = False,
         sf_sigma: float = 0.5,
         rate_offset: float = 1e-2,
         hidden_channels: int = 128,

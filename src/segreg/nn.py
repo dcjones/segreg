@@ -178,7 +178,13 @@ class SegregVAE(nn.Module):
         self.include_size_factor = include_size_factor
         self.rate_offset = rate_offset
 
-        encoder_in_channels = n_genes if include_size_factor else n_genes + n_covariates
+        # prepare_encoder_input returns an [B, n_genes] tensor in BOTH branches --
+        # the covariates are never concatenated -- so sizing this as
+        # n_genes + n_covariates made include_size_factor=False raise a shape
+        # error on the first batch (that path had never run). If a conditional
+        # encoder is wanted, concatenate the design in prepare_encoder_input and
+        # restore the wider input here.
+        encoder_in_channels = n_genes
         self.encoder = Encoder(encoder_in_channels, hidden_channels, latent_dim)
         self.node_decoder = NodeDecoder(latent_dim, hidden_channels, n_genes)
 
