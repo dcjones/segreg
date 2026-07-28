@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 
@@ -82,6 +84,9 @@ class SegregVAE(nn.Module):
         n_components: int = 1,
         likelihood: str = "nb_mean",
         contam_var: str = "poisson",
+        global_contam_alpha: bool = False,
+        contam_alpha_max: float = 2.0,
+        pin_contam_alpha: bool = False,
         retention_form: str | None = None,
         encoder_input: str = "raw",
         conv_max: int = 64,
@@ -129,6 +134,42 @@ class SegregVAE(nn.Module):
         #                 Poisson sampling noise; an NB contamination arm.
         if contam_var not in ("poisson", "proseg", "proseg_rate"):
             raise ValueError(f"unknown contam_var {contam_var!r}")
+        # global_contam_alpha: ONE scalar rescaling delta = alpha*inflow under the
+        # otherwise-pinned nb_conv/nb_mm likelihoods. The reason alpha is pinned there
+        # is the per-gene alpha-vs-beta degeneracy -- a free alpha_g can attribute a
+        # contaminated gene's counts either to contamination or to a real effect. A
+        # single GLOBAL scalar cannot do that: it has one degree of freedom against
+        # thousands of genes, so it can only correct a systematic mis-calibration of
+        # proseg's inflow magnitude, which is exactly what is measured -- the
+        # expected_inflow total is 97% of truth on breast but 76% on Atera, and
+        # nb_conv (alpha == 1) recovers the breast down arm near-exactly while
+        # inverting Atera's.
+        #
+        # This is variance-coherent for contam_var="poisson" and ONLY there: scaling
+        # the RATE gives C ~ Poisson(alpha*inflow) with Var[C] = alpha*inflow = delta,
+        # self-consistent. The non-Poisson arms read proseg's V_f as a variance of the
+        # contaminant COUNT, which a rate rescale would need to scale by alpha^2 --
+        # the bookkeeping objection that motivated pinning alpha. Those arms are
+        # already benchmarked and rejected, so refuse the combination rather than
+        # silently mis-scale.
+        if global_contam_alpha and contam_var != "poisson":
+            raise ValueError(
+                f"global_contam_alpha needs contam_var='poisson' (got "
+                f"{contam_var!r}): scaling the contamination rate is only "
+                "variance-coherent for the Poisson arm")
+        if contam_alpha_max <= 1.0:
+            raise ValueError(f"contam_alpha_max must exceed 1 (got {contam_alpha_max})")
+        if global_contam_alpha and pin_contam_alpha:
+            raise ValueError(
+                "global_contam_alpha and pin_contam_alpha are contradictory: one "
+                "learns the contamination scale, the other fixes it at 1")
+        self.global_contam_alpha = global_contam_alpha
+        # Bounding alpha is not cosmetic: conv_max must cover the Poisson(delta) tail,
+        # and RegressionModel sizes it from max(inflow) * contam_alpha_max. An
+        # unbounded alpha could push delta past the convolution window and bias the
+        # likelihood silently. 2.0 covers the ~1.3 correction the Atera calibration
+        # implies with room to spare, at 2x the convolution cost.
+        self.contam_alpha_max = float(contam_alpha_max)
         self.likelihood = likelihood
         self.contam_var = contam_var
         self.contam_family = {
@@ -137,7 +178,16 @@ class SegregVAE(nn.Module):
             "proseg_rate": "nb",
         }[contam_var]
         self.conv_max = conv_max
-        self.fix_alpha = likelihood in ("nb_conv", "nb_mm")
+        # Whether alpha is pinned at 1 is CONFOUNDED with the likelihood unless it can
+        # be set independently: nb_conv/nb_mm pin it and nb_mean leaves it free per
+        # gene, so any nb_mean-vs-nb_conv comparison moves both at once. pin_contam_alpha
+        # decouples them, making the 2x2 (likelihood x alpha treatment) reachable and
+        # letting the convolution's contribution be separated from the pinning's. This
+        # matters because the docs credit nb_conv's benefit to the pinning ("no
+        # alpha-vs-beta competition"), and a global free alpha under nb_conv reproduces
+        # nb_mean's failure mode almost exactly -- which suggests the likelihood itself
+        # may be doing much less than the pinning.
+        self.fix_alpha = likelihood in ("nb_conv", "nb_mm") or pin_contam_alpha
         if self.fix_alpha:
             # Pinning alpha = 1 is an argument about the ADDITIVE contamination term
             # only, so it disables the machinery that varies THAT alpha. It does not
@@ -240,6 +290,11 @@ class SegregVAE(nn.Module):
             self.log_alpha_ret = (
                 nn.Parameter(torch.zeros(n_genes))
                 if (separate_retention_alpha and include_retention) else None
+            )
+            # One scalar, initialised at alpha = 1 so the default path is recovered
+            # exactly when it is not enabled.
+            self.log_alpha_global = (
+                nn.Parameter(torch.zeros(())) if global_contam_alpha else None
             )
         elif include_diffusion:
             # alpha_g: shared per-gene leak coefficient calibrating how far to trust
@@ -370,8 +425,16 @@ class SegregVAE(nn.Module):
             # retention = exp(-alpha*phi) is 1 wherever phi=0, so mu is dense
             # regardless; densify the (sparse) inflow/phi batches here to build it.
             if self.fix_alpha:
-                # nb_conv: alpha == 1, contamination taken at proseg's face value.
-                alpha = 1.0
+                # nb_conv: alpha == 1, contamination taken at proseg's face value,
+                # unless a single global scale is being learned to absorb a systematic
+                # mis-calibration of proseg's inflow magnitude. Bounded to
+                # [1/contam_alpha_max, contam_alpha_max] so delta stays inside the
+                # convolution window conv_max was sized for.
+                if self.log_alpha_global is not None:
+                    bound = math.log(self.contam_alpha_max)
+                    alpha = torch.exp(self.log_alpha_global.clamp(-bound, bound))
+                else:
+                    alpha = 1.0
             else:
                 if self.training and self.log_alpha_logstd is not None:
                     a_std = torch.exp(self.log_alpha_logstd.clamp(max=4.0))

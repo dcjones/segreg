@@ -102,6 +102,14 @@ class SegregTrainingWrapper(nn.Module):
             loss_alpha = torch.tensor(0.0, device=mu_hat.device)
             if getattr(self.model, "log_alpha_ret", None) is not None:
                 loss_alpha = alpha_loss(self.model.log_alpha_ret, self.alpha_reg)
+            if getattr(self.model, "log_alpha_global", None) is not None:
+                # Shrink the global contamination scale toward alpha = 1. One scalar
+                # against millions of counts, so this prior is nearly irrelevant to
+                # the fit -- it is here for symmetry and to keep the term anchored if
+                # the data is uninformative, not to constrain a well-identified value.
+                loss_alpha = loss_alpha + alpha_loss(
+                    self.model.log_alpha_global, self.alpha_reg
+                )
         elif self.model.include_diffusion:
             if getattr(self.model, "log_alpha_logstd", None) is not None:
                 # Variational alpha: KL to N(0, 1) prior (alpha centered at 1),

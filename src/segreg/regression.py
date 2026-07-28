@@ -53,6 +53,16 @@ class RegressionModel:
         component_alpha: bool = False,
         likelihood: str = "nb_mean",
         contam_var: str = "poisson",
+        # Learn ONE scalar rescaling delta = alpha*inflow under the otherwise-pinned
+        # nb_conv/nb_mm likelihoods, to absorb a systematic mis-calibration of
+        # proseg's inflow magnitude without the per-gene alpha-vs-beta degeneracy
+        # that pinning exists to avoid. See SegregVAE for the full argument.
+        global_contam_alpha: bool = False,
+        contam_alpha_max: float = 2.0,
+        # Pin alpha at 1 REGARDLESS of likelihood, so that "which likelihood" and
+        # "is alpha free" can be varied independently. Without this the two are
+        # confounded in every nb_mean-vs-nb_conv comparison.
+        pin_contam_alpha: bool = False,
         retention_form: str | None = None,
         encoder_input: str = "raw",
         conv_max: int | None = None,
@@ -113,7 +123,14 @@ class RegressionModel:
         # are exact regardless. Floored so tiny datasets still get a sane window.
         if likelihood in ("nb_conv", "nb_mm") and conv_max is None:
             if self.inflow is not None and self.inflow.nnz > 0:
+                # With a learnable global contamination scale, delta can reach
+                # contam_alpha_max * inflow, so the window has to be sized for the
+                # tail at the BOUND -- otherwise a fitted alpha > 1 would silently
+                # truncate the convolution. Costs proportionally more compute, which
+                # is why the bound is modest.
                 imax = float(self.inflow.data.max())
+                if global_contam_alpha:
+                    imax *= float(contam_alpha_max)
                 conv_max = int(np.ceil(imax + 8.0 * np.sqrt(imax)))
             else:
                 conv_max = 64
@@ -230,6 +247,9 @@ class RegressionModel:
             n_components=self.n_components,
             likelihood=likelihood,
             contam_var=contam_var,
+            global_contam_alpha=global_contam_alpha,
+            contam_alpha_max=contam_alpha_max,
+            pin_contam_alpha=pin_contam_alpha,
             retention_form=retention_form,
             encoder_input=encoder_input,
             conv_max=self.conv_max,
