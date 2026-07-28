@@ -59,6 +59,17 @@ class RegressionModel:
         # that pinning exists to avoid. See SegregVAE for the full argument.
         global_contam_alpha: bool = False,
         contam_alpha_max: float = 2.0,
+        # Prior sd (log scale) of a MARGINALIZED contamination scale: alpha ~
+        # LogNormal(0, sigma), resampled per batch, no learnable parameter. Widens beta
+        # instead of shifting it, which is the opposite of what contam_var does. 0 = off.
+        contam_alpha_sigma: float = 0.0,
+        # Design-space contamination uncertainty: {design column name: prior sd}, or a
+        # float applied to every column. Only the projection of contamination error onto
+        # the design's column space can bias beta (error orthogonal to it averages out
+        # at 1/sqrt(n_cells)), so this is the form that can express a wrong exposure
+        # GRADIENT -- which is measurably the dominant error here, not the scale. Names
+        # are matched against the patsy design columns; unmatched names raise.
+        contam_design_sigma: "dict[str, float] | float | None" = None,
         # proseg's expected_inflow_var is measurably OVERCONFIDENT: scored against
         # simulated ground truth it is ~4x too small in variance (~2x in sd) on BOTH
         # a 310-gene breast panel and a 16.7k-gene WTA panel -- sd(z) 1.66 and 2.00
@@ -154,7 +165,8 @@ class RegressionModel:
                 # truncate the convolution. Costs proportionally more compute, which
                 # is why the bound is modest.
                 imax = float(self.inflow.data.max())
-                if global_contam_alpha:
+                if (global_contam_alpha or contam_alpha_sigma > 0.0
+                        or contam_design_sigma is not None):
                     imax *= float(contam_alpha_max)
                 conv_max = int(np.ceil(imax + 8.0 * np.sqrt(imax)))
             else:
@@ -187,6 +199,27 @@ class RegressionModel:
 
         design_df = dmatrix(formula, adata.obs, return_type="dataframe")
         self.design = cast(DesignMatrix, design_df)
+
+        # Map contam_design_sigma onto design columns now that they are known.
+        design_sigma_vec = None
+        if contam_design_sigma is not None:
+            cols = list(design_df.columns)
+            vec = np.zeros(len(cols), dtype=np.float32)
+            if isinstance(contam_design_sigma, (int, float)):
+                vec[:] = float(contam_design_sigma)
+            else:
+                unknown = set(contam_design_sigma) - set(cols)
+                if unknown:
+                    raise ValueError(
+                        f"contam_design_sigma names not in the design: {sorted(unknown)}; "
+                        f"available columns are {cols}")
+                for k, v in contam_design_sigma.items():
+                    vec[cols.index(k)] = float(v)
+            if not vec.any():
+                raise ValueError("contam_design_sigma is all zeros — nothing to perturb")
+            design_sigma_vec = torch.from_numpy(vec)
+            print(f"contamination design-space sigma: "
+                  + ", ".join(f"{c}={v:.3g}" for c, v in zip(cols, vec) if v > 0))
 
         if design_df.shape[0] < self.m:
             design_df = design_df.reindex(adata.obs.index, fill_value=0.0)
@@ -274,6 +307,8 @@ class RegressionModel:
             contam_var=contam_var,
             global_contam_alpha=global_contam_alpha,
             contam_alpha_max=contam_alpha_max,
+            contam_alpha_sigma=contam_alpha_sigma,
+            contam_design_sigma=design_sigma_vec,
             pin_contam_alpha=pin_contam_alpha,
             retention_form=retention_form,
             encoder_input=encoder_input,

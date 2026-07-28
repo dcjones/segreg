@@ -86,6 +86,8 @@ class SegregVAE(nn.Module):
         contam_var: str = "poisson",
         global_contam_alpha: bool = False,
         contam_alpha_max: float = 2.0,
+        contam_alpha_sigma: float = 0.0,
+        contam_design_sigma: torch.Tensor | None = None,
         pin_contam_alpha: bool = False,
         retention_form: str | None = None,
         encoder_input: str = "raw",
@@ -159,6 +161,86 @@ class SegregVAE(nn.Module):
                 "variance-coherent for the Poisson arm")
         if contam_alpha_max <= 1.0:
             raise ValueError(f"contam_alpha_max must exceed 1 (got {contam_alpha_max})")
+        # contam_alpha_sigma: MARGINALIZE over the contamination scale instead of
+        # fitting it. alpha ~ LogNormal(0, sigma) is RESAMPLED each batch and has NO
+        # learnable parameter, which is the whole point -- a fitted scale (per gene or
+        # even one global scalar) runs to whatever maximizes the likelihood, which is
+        # measurably not the DE-correct value: freeing it improves reconstruction by
+        # ~11 units while degrading DE bias 2-5x, and a global scalar saturates at its
+        # bound on BOTH datasets. Maximizing biases; marginalizing widens.
+        #
+        # The effect on inference is the opposite of contam_var's. contam_var says the
+        # contamination COUNT is over-dispersed given a KNOWN rate, which reshapes the
+        # likelihood and re-allocates the mean split between the signal and
+        # contamination arms -- measured on breast it moves point estimates by 0.3-0.6
+        # while widening credible intervals only ~9%, and it attenuates a genuine
+        # down-regulation back toward zero. Sampling alpha instead makes the RATE
+        # itself uncertain, so beta must fit under a range of contamination levels and
+        # any effect that could be contamination gets an honestly wide interval.
+        #
+        # sigma is a prior width, not a fitted quantity: set it from what is actually
+        # known about proseg's calibration (expected_inflow totals 97% of truth on
+        # breast, 76.5% on Atera -> ~0.15-0.25 in log units for the scale alone; the
+        # posterior is also ~2x overconfident in sd, arguing for more). At eval time
+        # alpha collapses to the prior mean of 1.
+        if contam_alpha_sigma < 0.0:
+            raise ValueError("contam_alpha_sigma must be >= 0")
+        self.contam_alpha_sigma = float(contam_alpha_sigma)
+        if contam_design_sigma is not None:
+            if contam_design_sigma.numel() != n_covariates:
+                raise ValueError(
+                    f'contam_design_sigma has {contam_design_sigma.numel()} entries '
+                    f'but the design has {n_covariates} columns')
+            if bool((contam_design_sigma < 0).any()):
+                raise ValueError('contam_design_sigma must be >= 0')
+            self.register_buffer(
+                'contam_design_sigma', contam_design_sigma.detach().clone().float())
+        else:
+            self.contam_design_sigma = None
+        if contam_alpha_sigma > 0.0 and global_contam_alpha:
+            raise ValueError(
+                "contam_alpha_sigma and global_contam_alpha are contradictory: one "
+                "marginalizes over the contamination scale, the other fits it")
+        # contam_design_sigma: the generalization of contam_alpha_sigma, and the only
+        # form that can express the error that actually biases DE here.
+        #
+        # A regression coefficient averages over thousands of cells, so INDEPENDENT
+        # per-cell contamination error shrinks as 1/sqrt(n) and barely widens beta --
+        # which is why contam_var (per-entry dispersion) left planted intervals
+        # essentially unchanged while a single SHARED draw did widen them. Stated
+        # generally: the only component of contamination error that can bias beta is
+        # its projection onto the DESIGN's column space. Error orthogonal to the design
+        # averages away; error along a design column lands on that column's coefficient.
+        #
+        # So perturb delta inside that space, with one draw per batch (systematic, not
+        # per-cell noise):
+        #
+        #     log delta'_cg = log delta_cg + (D @ eta)_c,   eta_j ~ N(0, sigma_j^2)
+        #
+        # The intercept column reproduces contam_alpha_sigma (a global scale doubt); an
+        # EXPOSURE column supplies the gradient doubt that a global scalar structurally
+        # cannot, because eta on that column is collinear with the coefficient being
+        # estimated. Measured on this benchmark, the gradient error dominates the scale
+        # error -- proseg's inflow exposure gradient is +0.670 against a true +0.407 on
+        # breast and +1.932 vs +1.096 on Atera (errors 0.26 and 0.84), versus scale
+        # errors of only log(0.97) = 0.03 and log(0.765) = 0.27. That is why widening
+        # the scale alone changed nothing.
+        #
+        # Centred PER CELL so E[delta'] = delta: var_c = sum_j (D_cj sigma_j)^2 varies
+        # by cell, so the correction is 0.5*var_c rather than a global constant.
+        # sigma_j = 0 leaves column j unperturbed. Expects a [n_covariates] tensor.
+        if contam_alpha_sigma > 0.0 and math.log(contam_alpha_max) < 2.5 * contam_alpha_sigma:
+            raise ValueError(
+                f"contam_alpha_max={contam_alpha_max} truncates a sigma="
+                f"{contam_alpha_sigma} draw at only "
+                f"{math.log(contam_alpha_max) / contam_alpha_sigma:.1f} sd, so the "
+                "effective spread SHRINKS as sigma grows instead of widening. Raise "
+                f"contam_alpha_max to >= {math.exp(2.5 * contam_alpha_sigma):.2f} "
+                "(this also enlarges conv_max, costing compute).")
+        if contam_alpha_sigma > 0.0 and contam_var != "poisson":
+            raise ValueError(
+                "contam_alpha_sigma needs contam_var='poisson': scaling the "
+                "contamination rate is only variance-coherent for the Poisson arm")
         if global_contam_alpha and pin_contam_alpha:
             raise ValueError(
                 "global_contam_alpha and pin_contam_alpha are contradictory: one "
@@ -430,9 +512,35 @@ class SegregVAE(nn.Module):
                 # mis-calibration of proseg's inflow magnitude. Bounded to
                 # [1/contam_alpha_max, contam_alpha_max] so delta stays inside the
                 # convolution window conv_max was sized for.
+                bound = math.log(self.contam_alpha_max)
                 if self.log_alpha_global is not None:
-                    bound = math.log(self.contam_alpha_max)
                     alpha = torch.exp(self.log_alpha_global.clamp(-bound, bound))
+                elif self.contam_design_sigma is not None and self.training:
+                    # eta: ONE draw per batch over design columns -> a per-cell scale
+                    # that is correlated with the design, hence able to compete with
+                    # beta rather than averaging out.
+                    sd = self.contam_design_sigma
+                    eta = torch.randn_like(sd) * sd
+                    pert = covariates @ eta                      # [B]
+                    var_c = (covariates ** 2) @ (sd ** 2)        # [B]
+                    log_a = (pert - 0.5 * var_c).clamp(-bound, bound)
+                    alpha = torch.exp(log_a).unsqueeze(-1)       # [B, 1], broadcasts
+                elif self.contam_alpha_sigma > 0.0 and self.training:
+                    # One shared draw per batch: the calibration uncertainty being
+                    # represented is a SYSTEMATIC error in proseg's overall inflow
+                    # scale, not independent noise per gene.
+                    #
+                    # CENTRED so that E[alpha] == 1: a LogNormal(0, sigma) has mean
+                    # exp(sigma^2/2) > 1, so drawing uncentred silently subtracts MORE
+                    # contamination on average as sigma grows -- it turns a widening
+                    # knob into a widening-plus-over-subtraction knob. Measured on
+                    # breast, uncentred sigma=0.25 pushed the null residual from -0.413
+                    # to -0.947 while planted bias stayed put, which is exactly this
+                    # artifact. Subtracting sigma^2/2 makes the prior mean-1 in alpha
+                    # rather than in log alpha, so raising sigma only adds spread.
+                    eps = torch.randn((), device=lam.device, dtype=lam.dtype)
+                    log_a = eps * self.contam_alpha_sigma - 0.5 * self.contam_alpha_sigma ** 2
+                    alpha = torch.exp(log_a.clamp(-bound, bound))
                 else:
                     alpha = 1.0
             else:
@@ -455,10 +563,14 @@ class SegregVAE(nn.Module):
                 else:
                     # Clamped like log_alpha above: under fix_alpha this is the only
                     # free leak parameter, so it is the one that can run away.
+                    # Fall back to a SCALAR 1.0 rather than to `alpha` when alpha is
+                    # pinned/perturbed: with a per-cell contamination alpha, reusing it
+                    # here would silently make retention per-cell too, which is a
+                    # different model than "trust phi at face value".
                     alpha_ret = (
                         torch.exp(self.log_alpha_ret.clamp(-10.0, 10.0))
                         if self.log_alpha_ret is not None
-                        else alpha
+                        else (1.0 if self.fix_alpha else alpha)
                     )
                     retention = torch.exp(-alpha_ret * phi)
                 # Fold retention into the signal rate itself rather than only into
