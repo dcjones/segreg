@@ -29,12 +29,31 @@ Some important components, all under `src/segreg/`:
     model lives in `factorization.py`. Per the paper's segmentation-aware count
     model, outflow enters multiplicatively as a retention factor
     `exp(-alpha_g * phi_cg)` and inflow additively as `alpha_g * inflow_cg`.
-    NOTE (empirically established, see the auto-memory `project_niche_de_prototype`):
-    the retention/outflow term is inert-to-harmful, so `include_retention=False`
-    is now the default; the additive inflow term does the decontamination. Several
-    alpha variants exist as flags (`stochastic_alpha`, `component_alpha`,
-    `separate_retention_alpha`) but are ineffective for the known spurious-DE
+    `include_retention=False` is the default and should stay that way, but the
+    REASONING behind it was wrong and has been corrected (2026-07-28; full numbers
+    in `simple-seg-sim/CLAUDE.md`). The old "inert" finding was an INSTRUMENT
+    FAILURE: in the run it was measured on, every scored coefficient sat at ~1e-3
+    in both arms against a planted truth of 0.7, so the two arms agreed to seven
+    decimals because nothing was being estimated (the
+    `interaction_suspect_shrinkage` regime). Retention in fact ACTS, and always
+    pushes coefficients in the correct negative direction; it is excluded because
+    it closes only ~0.1 of a ~0.5 gap on the down arm while consistently costing
+    specificity — harmful-but-not-inert. Its ceiling is structural: `estimate_phi`
+    divides by `T = X + outflow - inflow`, which omits loss to BACKGROUND (41% of
+    all loss on breast, where `1-phi` then exceeds even the background-free
+    ceiling, versus 3% on a dense WTA tissue).
+    `stochastic_alpha` / `component_alpha` remain ineffective for the spurious-DE
     failure mode and default off — see `next-step-generative-model.md`.
+    `separate_retention_alpha` is now reachable under `nb_conv` as well: pinning it
+    there was collateral, since both arguments for `alpha = 1` concern the ADDITIVE
+    term (retention attributes no count to contamination, and it scales the signal
+    MEAN, whose arm `A ~ NB(r*lam, psi)` takes its variance from that mean plus the
+    FREE dispersion `psi`, so no external variance estimate is rescaled). The
+    learned `alpha_ret` is identifiable and lands at median 1.15-1.20 on both
+    datasets — confirming `phi` under-states the loss — but does NOT improve DE,
+    which localizes the remaining problem to the additive term, not to retention.
+    It only acts through `retention_form="exp"`; `r = 1 - phi` carries no alpha and
+    that combination raises.
     The `likelihood` flag selects the count model: `"nb_mean"` (default) is the
     phenomenological NB on the combined mean `mu = lam + delta`; `"nb_conv"` is the
     paper's exact generative marginal (Option B) — signal `A ~ NB(lam, psi)` plus

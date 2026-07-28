@@ -95,8 +95,13 @@ class SegregTrainingWrapper(nn.Module):
             loss_sf = torch.tensor(0.0, device=mu_hat.device)
 
         if self.model.include_diffusion and getattr(self.model, "log_alpha", None) is None:
-            # nb_conv fixes alpha == 1: no leak parameter, no alpha prior term.
+            # nb_conv fixes the CONTAMINATION alpha at 1, so there is no prior term for
+            # it. A separate RETENTION alpha may still be free here (it is not subject
+            # to the argument that pins the contamination one -- see nn.py), and it
+            # needs its prior or it is an unregularized per-gene parameter.
             loss_alpha = torch.tensor(0.0, device=mu_hat.device)
+            if getattr(self.model, "log_alpha_ret", None) is not None:
+                loss_alpha = alpha_loss(self.model.log_alpha_ret, self.alpha_reg)
         elif self.model.include_diffusion:
             if getattr(self.model, "log_alpha_logstd", None) is not None:
                 # Variational alpha: KL to N(0, 1) prior (alpha centered at 1),

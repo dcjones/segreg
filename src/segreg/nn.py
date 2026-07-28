@@ -139,7 +139,25 @@ class SegregVAE(nn.Module):
         self.conv_max = conv_max
         self.fix_alpha = likelihood in ("nb_conv", "nb_mm")
         if self.fix_alpha:
-            separate_retention_alpha = False
+            # Pinning alpha = 1 is an argument about the ADDITIVE contamination term
+            # only, so it disables the machinery that varies THAT alpha. It does not
+            # extend to the multiplicative retention coefficient:
+            #   * the alpha-vs-beta degeneracy is about attributing observed COUNT to
+            #     contamination instead of to a real effect. alpha_ret does not
+            #     attribute any count to contamination; it rescales the signal.
+            #   * the variance-bookkeeping argument does not apply either. Scaling
+            #     delta by alpha would scale Var[C] by alpha^2 while proseg's estimate
+            #     tracks only delta. Retention instead scales the signal mean, and the
+            #     signal arm A ~ NB(r*lam, psi) gets its variance from that mean plus
+            #     the FREE learnable dispersion psi -- no external variance estimate is
+            #     being rescaled.
+            # So separate_retention_alpha stays available here: contamination is still
+            # taken at face value (keeping what nb_conv buys), while how far to trust
+            # proseg's phi is calibrated from the data. This matters because phi is
+            # measurably mis-scaled and by a DATASET-DEPENDENT amount -- 1-phi averages
+            # 0.664 against a true retention of 0.495 on breast and 0.551 vs 0.475 on
+            # Atera (simple-seg-sim's eval/check_retention_phi.py), because phi's
+            # denominator T = X + outflow - inflow omits loss to background.
             stochastic_alpha = False
             component_alpha = False
         # retention_form picks how phi_cg (the estimated fraction of the cell's true
@@ -150,10 +168,21 @@ class SegregVAE(nn.Module):
         #            proseg's estimate" stance that fixing alpha = 1 takes for inflow.
         # Defaults follow that logic: "linear" wherever alpha is pinned at 1, "exp"
         # otherwise (which preserves nb_mean's existing behaviour exactly).
+        # A free retention alpha only acts through the "exp" form -- r = 1 - phi has
+        # no alpha in it at all -- so default to "exp" when one is requested, and
+        # refuse the combination that would silently be a no-op.
         if retention_form is None:
-            retention_form = "linear" if self.fix_alpha else "exp"
+            retention_form = (
+                "exp" if (separate_retention_alpha and include_retention)
+                else ("linear" if self.fix_alpha else "exp")
+            )
         if retention_form not in ("exp", "linear"):
             raise ValueError(f"unknown retention_form {retention_form!r}")
+        if (separate_retention_alpha and include_retention
+                and retention_form == "linear"):
+            raise ValueError(
+                "separate_retention_alpha has no effect with retention_form="
+                "'linear' (r = 1 - phi carries no alpha); use 'exp'")
         self.retention_form = retention_form
         if encoder_input not in ("raw", "decontaminated"):
             raise ValueError(f"unknown encoder_input {encoder_input!r}")
@@ -202,10 +231,16 @@ class SegregVAE(nn.Module):
 
         self.stochastic_alpha = stochastic_alpha
         if include_diffusion and self.fix_alpha:
-            # nb_conv: alpha is fixed at 1, so no leak parameter is trained.
+            # nb_conv: the CONTAMINATION alpha is fixed at 1, so no leak parameter is
+            # trained for the additive term. The retention coefficient is separate
+            # (see the reasoning where stochastic/component alpha are disabled above)
+            # and may still be learned when asked for.
             self.log_alpha = None
             self.log_alpha_logstd = None
-            self.log_alpha_ret = None
+            self.log_alpha_ret = (
+                nn.Parameter(torch.zeros(n_genes))
+                if (separate_retention_alpha and include_retention) else None
+            )
         elif include_diffusion:
             # alpha_g: shared per-gene leak coefficient calibrating how far to trust
             # proseg's inflow/outflow estimates. alpha_g = 1 takes them at face value;
@@ -355,8 +390,10 @@ class SegregVAE(nn.Module):
                 if self.retention_form == "linear":
                     retention = (1.0 - phi).clamp(min=1e-3)
                 else:
+                    # Clamped like log_alpha above: under fix_alpha this is the only
+                    # free leak parameter, so it is the one that can run away.
                     alpha_ret = (
-                        torch.exp(self.log_alpha_ret)
+                        torch.exp(self.log_alpha_ret.clamp(-10.0, 10.0))
                         if self.log_alpha_ret is not None
                         else alpha
                     )
