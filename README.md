@@ -17,7 +17,8 @@ per-cell uncertainty estimates produced by
 
 ## Requirements
 
-- **Python ≥ 3.13**
+- **Python 3.13** — not 3.14: the pinned torch (2.8.x) ships no 3.14 wheels. The
+  checked-in `.python-version` pins this for you.
 - [**uv**](https://docs.astral.sh/uv/) for dependency management (see below —
   all commands are run through `uv`)
 - A **CUDA GPU is strongly recommended.** Training runs on CPU (it is selected

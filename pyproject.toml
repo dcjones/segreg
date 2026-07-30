@@ -3,7 +3,10 @@ name = "segreg"
 version = "0.1.0"
 description = "Segmentation-aware regression for spatial transcriptomics"
 readme = "README.md"
-requires-python = ">=3.13"
+# Upper bound is load-bearing, not caution: torch 2.8 publishes wheels only for
+# cp313/cp313t, so a 3.14 interpreter makes the pinned torch uninstallable. Without
+# it uv picks the newest available interpreter and `uv sync` fails to resolve.
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "anndata>=0.12.7",
     "patsy>=1.0.2",
@@ -16,6 +19,10 @@ dependencies = [
     "mapbox-earcut>=2.0.0",
     "igraph>=1.0.0",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.uv.sources]
 # pyg-lib = { url = "https://data.pyg.org/whl/torch-2.8.0%2Bcu128/pyg_lib-0.5.0%2Bpt28cu128-cp313-cp313-linux_x86_64.whl" }
