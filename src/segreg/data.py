@@ -141,6 +141,7 @@ def ols_init_beta(
     m: int,
     n: int,
     beta_prior_scale: float,
+    interaction_shrinkage: bool = False,
     interaction_prior_scale: float | None = None,
     interaction_suspect_shrinkage: bool = True,
     interaction_columns: list[str] | None = None,
@@ -150,23 +151,54 @@ def ols_init_beta(
     Processes genes in chunks to avoid materializing the full dense m×n matrix.
     Returns (beta_init_np, beta_prior_scale_matrix, beta_logstd_init).
 
-    interaction_prior_scale overrides the base width of the interaction terms'
-    Cauchy prior, which otherwise defaults to the power-balanced 10/sqrt(m).
-    interaction_suspect_shrinkage toggles the extra 1/(1 + 50*inflow/obs) factor
-    applied on top of it. Both exist to test whether the interaction prior is
-    itself responsible for shrinking real effects to zero: on the 159k-cell
-    benchmark the default base is 0.025 and suspect shrinkage takes it to ~0.002
-    for contaminated marker genes, i.e. ~300x tighter than a planted effect of
-    0.7, and the resulting beta_logstd_init clips at -5 (posterior sd 0.0067).
+    `interaction_shrinkage` (default OFF) is the master switch for treating
+    interaction columns differently from main effects. It gates THREE coupled
+    behaviours, which is why it is one switch and not three: a much narrower
+    Cauchy prior, a beta init of exactly zero instead of the shrunk OLS estimate,
+    and -- because beta_logstd_init is derived from that prior -- a credible
+    interval that reports the prior width rather than a posterior.
 
-    interaction_columns names the covariates to treat as interactions. It defaults
-    to the ones patsy spells with a colon, but that is only a naming convention:
-    a design built with pre-multiplied per-group columns (`expo_Endothelial`
-    rather than `C(type):exposure`) is just as much an interaction and would
-    otherwise silently get the ~500x wider main-effect prior AND an OLS init
-    instead of zero. Pass the list explicitly whenever the design is built that way.
+    DEFAULT OFF because the treatment was measured to be the dominant source of
+    error on the simple-seg-sim DE benchmark, and its own justification was never
+    validated. On breast_ladder with ORACLE counts and no contamination
+    correction -- so nothing to do with segmentation -- widening the interaction
+    prior from the power-balanced default to 1.0 moved, monotonically in the width:
+
+        prior width      0.025 (default)    0.1      1.0
+        slope vs truth   0.33               0.48     0.73     (1.0 = unattenuated)
+        corr with truth  0.62               0.78     0.92
+        null-pair z      6.75               3.19     1.76     (1.0 = honest CI)
+        effect coverage  0.39               0.63     0.93
+        false negatives  0.69               0.63     0.44
+
+    against a plain quasi-Poisson GLM on the same counts at slope 1.00, null-pair
+    z 1.01 and FN 0.28. The mechanism is arithmetic: at m = 159,695 cells the
+    power-balanced width is 0.025, i.e. 1/14 of the median planted effect it has
+    to fit. Worse, `10/sqrt(m)` shrinks at exactly the rate the likelihood's own
+    sigma_ols shrinks, so the ridge factor gamma^2/(gamma^2 + sigma^2) is CONSTANT
+    in m -- adding cells never buys detection, and the estimator is not consistent.
+
+    Turning it on restores the previous behaviour exactly. Do that only with a
+    width that has been calibrated against the effect sizes of interest, since the
+    "power-balanced" rationale (discipline the prior as power to fit spurious betas
+    grows with m) is what the constancy argument above contradicts.
+
+    interaction_prior_scale overrides the base width when enabled, which otherwise
+    defaults to the power-balanced 10/sqrt(m). interaction_suspect_shrinkage
+    toggles the extra 1/(1 + 50*inflow/obs) factor applied on top of it; that
+    factor takes the width to ~0.002 for contaminated marker genes, ~300x tighter
+    than a planted effect of 0.7, and clips beta_logstd_init at -5 (sd 0.0067).
+
+    interaction_columns names the covariates to treat as interactions when
+    enabled, and is INERT when disabled. It defaults to the ones patsy spells with
+    a colon, but that is only a naming convention: a design built with
+    pre-multiplied per-group columns (`expo_Endothelial` rather than
+    `C(type):exposure`) is just as much an interaction, so pass the list
+    explicitly whenever the design is built that way.
     """
-    if interaction_columns is None:
+    if not interaction_shrinkage:
+        interaction_set = set()
+    elif interaction_columns is None:
         interaction_set = {name for name in covariate_names if ":" in name}
     else:
         interaction_set = set(interaction_columns)

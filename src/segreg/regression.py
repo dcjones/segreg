@@ -122,6 +122,17 @@ class RegressionModel:
         latent_dim: int = 64,
         kappa: float = 1000.0,
         beta_prior_scale: float = 1.0,
+        # Default OFF: interaction columns are treated exactly like main effects.
+        # This special-casing narrowed their Cauchy prior to 10/sqrt(m) (0.025 at
+        # 159k cells, ~1/14 of the effects the DE benchmark plants), initialised
+        # their beta at exactly zero, and -- because beta_logstd is initialised from
+        # that same width -- made the reported credible interval echo the prior.
+        # Measured cost on breast_ladder/oracle counts: slope-vs-truth 0.33 instead
+        # of 0.73, null-pair z 6.75 instead of 1.76. See ols_init_beta's docstring
+        # for the full dose-response and for why the "power-balanced" 1/sqrt(m)
+        # rationale is self-defeating. Turn it back on only with a width calibrated
+        # against the effect sizes of interest.
+        interaction_shrinkage: bool = False,
         interaction_prior_scale: float | None = None,
         interaction_suspect_shrinkage: bool = True,
         interaction_columns: list[str] | None = None,
@@ -267,6 +278,7 @@ class RegressionModel:
             self.m,
             self.n,
             beta_prior_scale,
+            interaction_shrinkage=interaction_shrinkage,
             interaction_prior_scale=interaction_prior_scale,
             interaction_suspect_shrinkage=interaction_suspect_shrinkage,
             interaction_columns=interaction_columns,
