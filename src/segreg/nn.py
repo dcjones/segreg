@@ -316,8 +316,17 @@ class SegregVAE(nn.Module):
                 "separate_retention_alpha has no effect with retention_form="
                 "'linear' (r = 1 - phi carries no alpha); use 'exp'")
         self.retention_form = retention_form
-        if encoder_input not in ("raw", "decontaminated"):
+        if encoder_input not in ("raw", "decontaminated", "raw+inflow"):
             raise ValueError(f"unknown encoder_input {encoder_input!r}")
+        if encoder_input in ("decontaminated", "raw+inflow") and not include_diffusion:
+            # Both modes read the inflow estimate, which only exists when the
+            # diffusion correction is on (inflow is None otherwise). "decontaminated"
+            # historically degraded to a silent no-op in that case, which made an
+            # OFF-arm A/B look like the option did nothing; raise instead.
+            raise ValueError(
+                f"encoder_input={encoder_input!r} needs include_diffusion=True "
+                "(inflow is None without it)"
+            )
         self.encoder_input = encoder_input
         self.include_diffusion = include_diffusion
         # Independent ablation of the two diffusion terms (mirrors the toggles on
@@ -345,7 +354,10 @@ class SegregVAE(nn.Module):
         # error on the first batch (that path had never run). If a conditional
         # encoder is wanted, concatenate the design in prepare_encoder_input and
         # restore the wider input here.
-        encoder_in_channels = n_genes
+        # "raw+inflow" concatenates the inflow estimate as a SECOND gene block, so
+        # the encoder sees both channels and can learn a function of the pair rather
+        # than the one fixed difference "decontaminated" hard-codes.
+        encoder_in_channels = n_genes * 2 if encoder_input == "raw+inflow" else n_genes
         self.encoder = Encoder(encoder_in_channels, hidden_channels, latent_dim)
         self.node_decoder = NodeDecoder(latent_dim, hidden_channels, n_genes)
 
@@ -456,24 +468,47 @@ class SegregVAE(nn.Module):
         compensation is correlated with the design. Feeding the encoder X - delta
         removes the input that drives this, and tests whether the residual
         false-positive survives when z can no longer see the contamination.
+
+        encoder_input="raw+inflow" instead CONCATENATES the inflow estimate as a
+        second gene block, giving a [B, 2*n_genes] input. This is strictly more
+        informative than either of the other modes: "decontaminated" commits to the
+        single difference x - delta, whereas here the first linear layer can learn
+        any weighting of the two blocks -- including that difference, and including
+        the contaminated FRACTION, since a difference of log1p terms is a log ratio.
+        The motivation is the same as "decontaminated" (the encoder should know which
+        of the counts it is looking at are other cells' spillover) but it does not
+        presuppose how z should use that knowledge.
         """
         x_dense = (
             x_sub_tensor.to_dense()
             if x_sub_tensor.layout == torch.sparse_csr
             else x_sub_tensor
         )
-        if self.encoder_input == "decontaminated" and inflow is not None:
+        inflow_dense = None
+        if self.encoder_input in ("decontaminated", "raw+inflow") and inflow is not None:
             inflow_dense = (
                 inflow.to_dense() if inflow.layout == torch.sparse_csr else inflow
             )
+        if self.encoder_input == "decontaminated" and inflow_dense is not None:
             x_dense = (x_dense - inflow_dense).clamp(min=0.0)
+
+        def _norm(v, log_sf):
+            """Same normalization for both blocks, so they are on one scale."""
+            if log_sf is not None:
+                v = v / (torch.exp(log_sf).unsqueeze(-1) + 1e-8) * 1000.0
+            return torch.log1p(v.clamp(min=0.0))
+
         if self.include_size_factor:
             log_sf = self.log_sf_embed(batch_idx).squeeze(-1)
-            x_norm = x_dense / (torch.exp(log_sf).unsqueeze(-1) + 1e-8) * 1000.0
-            encoder_in = torch.log1p(x_norm)
         else:
             log_sf = None
-            encoder_in = torch.log1p(x_dense)
+        encoder_in = _norm(x_dense, log_sf)
+        if self.encoder_input == "raw+inflow":
+            # inflow is None only at construction-time-invalid configs (rejected in
+            # __init__), but keep the shape stable if a caller omits it.
+            second = (_norm(inflow_dense, log_sf) if inflow_dense is not None
+                      else torch.zeros_like(encoder_in))
+            encoder_in = torch.cat([encoder_in, second], dim=-1)
         return encoder_in, log_sf
 
     def forward(

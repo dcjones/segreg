@@ -482,7 +482,8 @@ class RegressionModel:
         """Inflow batch for the encoder at eval time, so get_corrected_expression /
         get_latent_representation normalize their input exactly as training did.
         None whenever the encoder does not consume it."""
-        if self.model.encoder_input != "decontaminated" or self.inflow is None:
+        if (self.model.encoder_input not in ("decontaminated", "raw+inflow")
+                or self.inflow is None):
             return None
         sub, _ = slice_csr_to_sparse_tensor(
             self.inflow, idx_np, self.n, self.device, use_pin=False, non_blocking=False
