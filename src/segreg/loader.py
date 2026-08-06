@@ -1,10 +1,11 @@
 
-from scipy.sparse import csr_matrix
-from torch import Tensor
+from dataclasses import dataclass
+
 import numpy as np
 import numpy.typing as npt
 import torch
-from dataclasses import dataclass
+from scipy.sparse import csr_matrix
+from torch import Tensor
 
 
 @dataclass

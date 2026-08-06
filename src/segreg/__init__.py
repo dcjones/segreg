@@ -1,8 +1,8 @@
 def hello() -> str:
     return "Hello from segreg!"
 
-from .regression import RegressionModel
+from .regression import Regression
 
 __all__ = [
-    "RegressionModel"
+    "Regression"
 ]
