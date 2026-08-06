@@ -1,0 +1,14 @@
+[project]
+name = "segreg"
+version = "0.1.0"
+description = "Cell segmentation aware regression and metrics for spatial transcriptomics"
+readme = "README.md"
+authors = [
+    { name = "Daniel C. Jones", email = "djones3@fredhutch.org" }
+]
+requires-python = ">=3.13"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13.0"]
+build-backend = "uv_build"
