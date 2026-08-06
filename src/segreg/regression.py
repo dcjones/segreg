@@ -8,8 +8,6 @@ from typing import cast
 import numpy as np
 import numpy.typing as npt
 import torch
-from torch_geometric.data import Data
-from torch_geometric.loader import NeighborLoader
 
 from .loader import RegressionBatchLoader
 
@@ -24,6 +22,8 @@ class RegressionModel:
 
     design: DesignMatrix
 
+    # [ncells, 2] cell centroids, used to form spatially local batches
+    spatial: npt.NDArray[np.floating] | None
 
     def __init__(self, data: SpatialData | AnnData, formula: str):
         if isinstance(data, SpatialData):
@@ -61,28 +61,29 @@ class RegressionModel:
 
         self.bg_mix_rate = (to_bg_trans_count / total_transitions).astype(np.float32)
 
-        # Construct Data object
-        # ncells = self.X.shape[0]
-        # self.data = Data(
-        #     x=torch.from_numpy(np.asarray(self.design, dtype=np.float32)),
-        #     edge_index=torch.from_numpy(
-        #         np.stack([self.A.row, self.A.col]).astype(np.int64)
-        #     ),
-        #     edge_weight=torch.from_numpy(self.A.data),
-        #     num_nodes=ncells,
-        # )
+        self.spatial = np.asarray(adata.obsm["spatial"]) if "spatial" in adata.obsm else None
 
-    def fit(self, nepochs: int=1, batch_size: int=1024, batch_neighbors: int=10):
+    def fit(
+        self,
+        nepochs: int = 1,
+        batch_size: int = 1024,
+        seed: int | None = None,
+        device: torch.device | str | None = None,
+    ):
         loader = RegressionBatchLoader(
-            self.X, self.A, self.bg_mix_rate, np.asarray(self.design, dtype=np.float32), batch_size
+            self.X,
+            self.A,
+            self.bg_mix_rate,
+            np.asarray(self.design, dtype=np.float32),
+            batch_size,
+            spatial=self.spatial,
+            seed=seed,
+            device=device,
         )
 
-        for epoch in range(nepochs):
+        for _epoch in range(nepochs):
             for batch in loader:
-                print(batch)
-
-                # TODO: slice into self.X
-                # Should we pre-convert X to a sparse tensor?
+                pass
 
                 # TODO: training
 
