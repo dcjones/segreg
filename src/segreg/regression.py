@@ -25,8 +25,14 @@ class Regression:
 
     design: DesignMatrix
 
+    # [ncells] log total counts, used as a fixed regression offset
+    log_size: npt.NDArray[np.float32]
+
     # [ncells, 2] cell centroids, used to form spatially local batches
     spatial: npt.NDArray[np.floating] | None
+
+    # set by fit()
+    model: "RegressionModel | None" = None
 
     def __init__(self, data: SpatialData | AnnData, formula: str):
         if isinstance(data, SpatialData):
@@ -41,6 +47,8 @@ class Regression:
         self.X = adata.X
 
         # Construct design matrix
+        # TODO: consider checking if the design has an intercept and
+        # excluding the redundant gene_bias parameter in RegressionModel if so.
         design_df = dmatrix(formula, adata.obs, return_type="dataframe")
         self.design = cast(DesignMatrix, design_df)
 
@@ -64,31 +72,73 @@ class Regression:
 
         self.bg_mix_rate = (to_bg_trans_count / total_transitions).astype(np.float32)
 
+        # Observed totals are very nearly a fixed point of the mixing model
+        # (median relative error of A @ s + bg vs s is -0.2%), so we can use them
+        # as a fixed offset rather than fitting per-cell size factors.
+        counts = np.asarray(self.X.sum(axis=1)).squeeze()
+        self.log_size = np.log(np.maximum(counts, 1)).astype(np.float32)
+
         self.spatial = np.asarray(adata.obsm["spatial"]) if "spatial" in adata.obsm else None
 
     def fit(
         self,
-        nepochs: int = 1,
+        nepochs: int = 10,
         batch_size: int = 1024,
+        lr: float = 0.01,
+        include_mixing: bool = True,
+        β_prior_σ: float = 1.0,
         seed: int | None = None,
         device: torch.device | str | None = None,
-    ):
+        verbose: bool = True,
+    ) -> "RegressionModel":
         loader = RegressionBatchLoader(
             self.X,
             self.A,
             self.bg_mix_rate,
             np.asarray(self.design, dtype=np.float32),
+            self.log_size,
             batch_size,
             spatial=self.spatial,
             seed=seed,
             device=device,
         )
 
-        for _epoch in range(nepochs):
-            for batch in loader:
-                pass
+        # Parameter initialization is otherwise unseeded, which on its own is
+        # enough to move null coefficients run to run.
+        if seed is not None:
+            torch.manual_seed(seed)
 
-                # TODO: training
+        ncells, ngenes = self.X.shape
+        model = RegressionModel(
+            ncells,
+            ngenes,
+            self.design.shape[1],
+            include_mixing=include_mixing,
+            β_prior_σ=β_prior_σ,
+        )
+        if device is not None:
+            model = model.to(device)
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+        model.train()
+        for epoch in range(nepochs):
+            # Accumulated on device; reading it every batch would force a sync.
+            total = torch.zeros((), device=next(model.parameters()).device)
+            for batch in loader:
+                optimizer.zero_grad(set_to_none=True)
+                loss = model(batch)
+                loss.backward()
+                optimizer.step()
+                total += loss.detach()
+
+            if verbose:
+                # Per cell, so it stays comparable across batch sizes.
+                print(f"epoch {epoch + 1}/{nepochs}: loss = {float(total) / ncells:.4f}")
+
+        model.eval()
+        self.model = model
+        return model
 
     def regression_coefficients(self):
         pass
@@ -101,13 +151,28 @@ class RegressionModel(nn.Module):
 
     include_mixing: bool
 
-    def __init__(self, ncells: int, ngenes: int, ncovariates: int, include_mixing: bool = True):
+    def __init__(
+        self,
+        ncells: int,
+        ngenes: int,
+        ncovariates: int,
+        include_mixing: bool = True,
+        β_prior_σ: float = 1.0,
+    ):
         super().__init__()
 
         self.include_mixing = include_mixing
 
-        # per-gene regression intercept
-        self.gene_bias = nn.Parameter(torch.zeros(ngenes))
+        # Needed to weight the KL against a minibatch's share of the likelihood.
+        self.ncells = ncells
+
+        # Prior on the regression coefficients, N(0, β_prior_σ²)
+        self.β_prior_σ = β_prior_σ
+
+        # Per-gene regression intercept. With log_size as an offset this is a log
+        # share of the cell's total, so a uniform panel is the natural starting
+        # point; initializing at 0 would start λ a factor of ngenes too high.
+        self.gene_bias = nn.Parameter(torch.full((ngenes,), -np.log(ngenes)))
 
         # background expression rates
         self.bg_rates = nn.Parameter(torch.zeros(ngenes))
@@ -130,7 +195,11 @@ class RegressionModel(nn.Module):
         # regression
         # TODO: if this proves to be too inflexible, we may have to revive our old scheme of encoding
         # some amount of extra per-cell variation using a VAE term.
-        λ = torch.exp(batch.design @ β + self.gene_bias)
+        #
+        # log_size is a fixed offset, so exp(gene_bias) is a gene's share of a
+        # cell's total and λ is on the absolute count scale, which is what the
+        # mixing below needs in order to redistribute molecules correctly.
+        λ = torch.exp(batch.design @ β + self.gene_bias + batch.log_size.unsqueeze(1))
 
         λ_obs = self.mix(λ, batch)
 
@@ -138,11 +207,28 @@ class RegressionModel(nn.Module):
         # modeled, so the likelihood is over the leading block of the batch.
         X_obs = batch.X[: batch.nreceivers, :]
 
-        # TODO: compute NB log-likelihood
+        # loss
         ll = self.negbinom_likelihood(λ_obs, X_obs)
 
-        # TODO: compute KL term (for beta)
-        return -ll
+        # β is a global parameter but the likelihood only covers this batch, so
+        # the KL is down-weighted by the batch's share of the data. Summed over
+        # an epoch these weights come to exactly 1, i.e. the prior is applied
+        # once per pass. Without this it is applied once per *batch*, which is
+        # ncells/batch_size times too strong.
+        kl = self.β_kl() * (batch.nreceivers / self.ncells)
+
+        return -ll.sum() + kl
+
+    def β_kl(self) -> Tensor:
+        """KL(q(β) || N(0, β_prior_σ²)), summed over all covariates and genes."""
+        β_logσ = self.β_logσ.clamp(max=4.0)
+        prior_var = self.β_prior_σ**2
+        return (
+            np.log(self.β_prior_σ)
+            - β_logσ
+            + (torch.exp(2.0 * β_logσ) + self.β_μ**2) / (2.0 * prior_var)
+            - 0.5
+        ).sum()
 
     def mix(self, λ: Tensor, batch: RegressionBatch) -> Tensor:
         """Corrupt per-cell rates by missegmentation, [nnodes, ngenes] -> [nreceivers, ngenes].
@@ -163,8 +249,12 @@ class RegressionModel(nn.Module):
         λ_obs = torch.zeros((nr, λ.shape[1]), dtype=λ.dtype, device=λ.device)
         λ_obs.index_add_(0, batch.receivers, contrib)
 
-        # background is the remaining mixture component
-        return λ_obs + batch.bg_weight[:nr].unsqueeze(1) * torch.exp(self.bg_rates)
+        # Background is the remaining mixture component. bg_weight[i] is the
+        # fraction of cell i's molecules that came from background, so this has
+        # to be scaled by the cell's own size and bg_rates is a profile over
+        # genes rather than an absolute rate.
+        bg = batch.bg_weight[:nr] * torch.exp(batch.log_size[:nr])
+        return λ_obs + bg.unsqueeze(1) * torch.softmax(self.bg_rates, dim=-1)
 
     def negbinom_likelihood(self, λ: Tensor, X: Tensor) -> Tensor:
         r = torch.exp(self.log_r).clamp(min=1e-3)

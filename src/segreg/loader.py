@@ -16,6 +16,9 @@ class RegressionBatch:
     # [nnodes, ncovariates] design matrix rows, receivers first
     design: Tensor
 
+    # [nnodes] log total counts, used as a fixed regression offset
+    log_size: Tensor
+
     # Number of receivers. Receivers occupy X[:nreceivers], senders-only
     # neighbors occupy X[nreceivers:].
     nreceivers: int
@@ -67,6 +70,7 @@ class RegressionBatchLoader:
     A: csr_matrix
     bg_mix_rate: npt.NDArray[np.float32]
     design: npt.NDArray[np.float32]
+    log_size: npt.NDArray[np.float32]
     batch_size: int
 
     # Cells partitioned into spatially contiguous tiles of (at most) batch_size
@@ -79,6 +83,7 @@ class RegressionBatchLoader:
         A: csr_matrix,
         bg_mix_rate: npt.NDArray[np.float32],
         design: npt.NDArray[np.float32],
+        log_size: npt.NDArray[np.float32],
         batch_size: int,
         spatial: npt.NDArray[np.floating] | None = None,
         seed: int | None = None,
@@ -89,6 +94,7 @@ class RegressionBatchLoader:
         self.A = A
         self.bg_mix_rate = bg_mix_rate
         self.design = design
+        self.log_size = log_size
         self.batch_size = batch_size
         self.device = torch.device(device) if device is not None else None
         self.rng = np.random.default_rng(seed)
@@ -166,6 +172,7 @@ class RegressionBatchLoader:
             yield RegressionBatch(
                 X=self._gather_X(batch_idx),
                 design=self._to_device(torch.from_numpy(self.design[batch_idx, :])),
+                log_size=self._to_device(torch.from_numpy(self.log_size[batch_idx])),
                 nreceivers=nreceivers,
                 receivers=self._to_device(torch.from_numpy(receivers)),
                 senders=self._to_device(torch.from_numpy(senders)),
