@@ -30,6 +30,34 @@ class RegressionBatch:
     bg_weight: Tensor  # [nnodes] mixing weight with bg
 
 
+@dataclass
+class _TilePlan:
+    """Everything about one tile that does not change from epoch to epoch.
+
+    Tiles are fixed at construction and only their order is shuffled, so all of
+    the index arithmetic below is identical on every pass. Doing it once and
+    holding the result in pinned memory leaves the per-batch cost at a handful
+    of async H2D copies.
+    """
+
+    nreceivers: int
+    nnodes: int
+
+    # X as (value, flat row-major index) pairs, scattered into a dense block
+    # after the transfer. The block is only ~7.5% dense, so the sparse triple is
+    # several times less data to move.
+    x_values: Tensor
+    x_flat_idx: Tensor
+
+    design: Tensor
+    log_size: Tensor
+    bg_weight: Tensor
+
+    receivers: Tensor
+    senders: Tensor
+    weights: Tensor
+
+
 def _ragged_gather(
     indptr: npt.NDArray[np.int64], rows: npt.NDArray[np.int64]
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
@@ -77,6 +105,9 @@ class RegressionBatchLoader:
     # cells. Tile order is shuffled each epoch, cells within a tile are not.
     tiles: list[npt.NDArray[np.int64]]
 
+    # One per tile, in `tiles` order. Built once; see _TilePlan.
+    plans: list[_TilePlan]
+
     def __init__(
         self,
         X: csr_matrix,
@@ -110,72 +141,83 @@ class RegressionBatchLoader:
         order = _morton_order(spatial) if spatial is not None else np.arange(ncells, dtype=np.int64)
         self.tiles = [order[fr : fr + batch_size] for fr in range(0, ncells, batch_size)]
 
-        # Scatter buffer for global -> local index mapping, reused across
-        # batches and always left as all -1.
+        # Scatter buffer for global -> local index mapping, reused across tiles
+        # and always left as all -1.
         self._pos = np.full(ncells, -1, dtype=np.int64)
 
+        self._A_indptr = A.indptr.astype(np.int64)
+        self._X_indptr = X.indptr.astype(np.int64)
+        self.plans = [self._plan(t) for t in self.tiles]
+
     def __len__(self) -> int:
-        return len(self.tiles)
+        return len(self.plans)
 
-    def _to_device(self, x: Tensor) -> Tensor:
-        if self.pin_memory:
-            x = x.pin_memory()
-        if self.device is not None:
-            x = x.to(self.device, non_blocking=self.pin_memory)
-        return x
+    def _stage(self, x: npt.NDArray) -> Tensor:
+        t = torch.from_numpy(np.ascontiguousarray(x))
+        return t.pin_memory() if self.pin_memory else t
 
-    def _gather_X(self, batch_idx: npt.NDArray[np.int64]) -> Tensor:
-        """Gather batch rows of X, transferring as CSR and densifying on the device.
+    def _plan(self, receiver_idx: npt.NDArray[np.int64]) -> _TilePlan:
+        nreceivers = len(receiver_idx)
+        ngenes = self.X.shape[1]
 
-        The batch block is ~7.5% dense, so shipping the sparse triple and
-        expanding it after the transfer moves several times less data.
-        """
-        nrows = len(batch_idx)
-        pos, deg = _ragged_gather(self.X.indptr.astype(np.int64), batch_idx)
+        # Edges out of the receivers, in global column space.
+        pos, deg = _ragged_gather(self._A_indptr, receiver_idx)
+        cols = self.A.indices[pos].astype(np.int64)
+        weights = self.A.data[pos]
 
-        values = self._to_device(torch.from_numpy(self.X.data[pos].astype(np.float32)))
-        cols = self._to_device(torch.from_numpy(self.X.indices[pos].astype(np.int64)))
+        # Local relabeling. Receivers are placed first so that they are a slice
+        # rather than a mask, and stay in `receiver_idx` order.
+        self._pos[receiver_idx] = np.arange(nreceivers)
+        extra = np.unique(cols[self._pos[cols] < 0])
+        self._pos[extra] = nreceivers + np.arange(len(extra))
 
-        # Row indices are expanded on the device from the (much smaller) degrees
-        # rather than transferred as one entry per nonzero.
-        deg_t = self._to_device(torch.from_numpy(deg))
-        rows = torch.repeat_interleave(
-            torch.arange(nrows, device=deg_t.device), deg_t
+        batch_idx = np.concatenate([receiver_idx, extra])
+        receivers = np.repeat(np.arange(nreceivers), deg)
+        senders = self._pos[cols]
+
+        self._pos[batch_idx] = -1
+
+        xpos, xdeg = _ragged_gather(self._X_indptr, batch_idx)
+        x_rows = np.repeat(np.arange(len(batch_idx), dtype=np.int64), xdeg)
+        x_flat_idx = x_rows * ngenes + self.X.indices[xpos].astype(np.int64)
+
+        return _TilePlan(
+            nreceivers=nreceivers,
+            nnodes=len(batch_idx),
+            x_values=self._stage(self.X.data[xpos].astype(np.float32)),
+            x_flat_idx=self._stage(x_flat_idx),
+            design=self._stage(self.design[batch_idx, :]),
+            log_size=self._stage(self.log_size[batch_idx]),
+            bg_weight=self._stage(self.bg_mix_rate[batch_idx]),
+            receivers=self._stage(receivers),
+            senders=self._stage(senders),
+            weights=self._stage(weights),
         )
 
-        X = torch.zeros((nrows, self.X.shape[1]), dtype=torch.float32, device=values.device)
-        X[rows, cols] = values
-        return X
+    def _to_device(self, x: Tensor) -> Tensor:
+        if self.device is None:
+            return x
+        return x.to(self.device, non_blocking=self.pin_memory)
+
+    def _materialize(self, plan: _TilePlan) -> RegressionBatch:
+        ngenes = self.X.shape[1]
+
+        values = self._to_device(plan.x_values)
+        flat_idx = self._to_device(plan.x_flat_idx)
+        X = torch.zeros((plan.nnodes * ngenes,), dtype=torch.float32, device=values.device)
+        X.scatter_(0, flat_idx, values)
+
+        return RegressionBatch(
+            X=X.view(plan.nnodes, ngenes),
+            design=self._to_device(plan.design),
+            log_size=self._to_device(plan.log_size),
+            nreceivers=plan.nreceivers,
+            receivers=self._to_device(plan.receivers),
+            senders=self._to_device(plan.senders),
+            weights=self._to_device(plan.weights),
+            bg_weight=self._to_device(plan.bg_weight),
+        )
 
     def __iter__(self):
-        for t in self.rng.permutation(len(self.tiles)):
-            receiver_idx = self.tiles[t]
-            nreceivers = len(receiver_idx)
-
-            # Edges out of the receivers, in global column space.
-            pos, deg = _ragged_gather(self.A.indptr.astype(np.int64), receiver_idx)
-            cols = self.A.indices[pos].astype(np.int64)
-            weights = self.A.data[pos]
-
-            # Local relabeling. Receivers are placed first so that they are a
-            # slice rather than a mask, and stay in `receiver_idx` order.
-            self._pos[receiver_idx] = np.arange(nreceivers)
-            extra = np.unique(cols[self._pos[cols] < 0])
-            self._pos[extra] = nreceivers + np.arange(len(extra))
-
-            batch_idx = np.concatenate([receiver_idx, extra])
-            receivers = np.repeat(np.arange(nreceivers), deg)
-            senders = self._pos[cols]
-
-            self._pos[batch_idx] = -1
-
-            yield RegressionBatch(
-                X=self._gather_X(batch_idx),
-                design=self._to_device(torch.from_numpy(self.design[batch_idx, :])),
-                log_size=self._to_device(torch.from_numpy(self.log_size[batch_idx])),
-                nreceivers=nreceivers,
-                receivers=self._to_device(torch.from_numpy(receivers)),
-                senders=self._to_device(torch.from_numpy(senders)),
-                weights=self._to_device(torch.from_numpy(weights)),
-                bg_weight=self._to_device(torch.from_numpy(self.bg_mix_rate[batch_idx])),
-            )
+        for t in self.rng.permutation(len(self.plans)):
+            yield self._materialize(self.plans[t])

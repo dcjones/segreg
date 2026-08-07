@@ -100,6 +100,7 @@ class Regression:
         seed: int | None = None,
         device: torch.device | str | None = None,
         verbose: bool = True,
+        compile: bool = True,
     ) -> "RegressionModel":
         loader = RegressionBatchLoader(
             self.X,
@@ -129,15 +130,34 @@ class Regression:
         if device is not None:
             model = model.to(device)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        param_device = next(model.parameters()).device
+
+        # The parameters are small enough that a step's worth of unfused Adam
+        # launches costs more than the rest of the batch put together.
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=lr, fused=param_device.type == "cuda"
+        )
+
+        # The likelihood is a long chain of elementwise ops over [ncells, ngenes]
+        # blocks, so a step is bound by kernel launches rather than by the GPU.
+        # Fusing them is worth roughly a factor of two. Batch shapes differ from
+        # tile to tile, hence dynamic.
+        #
+        # Note that this changes fitted coefficients slightly even at a fixed
+        # seed: inductor draws the β reparameterization noise from its own RNG
+        # stream, so a compiled fit follows a different (equally valid) sample
+        # path. With the noise held fixed the two agree to ~1e-7 relative.
+        step = model.forward
+        if compile:
+            step = torch.compile(model.forward, dynamic=True)
 
         model.train()
         for epoch in range(nepochs):
             # Accumulated on device; reading it every batch would force a sync.
-            total = torch.zeros((), device=next(model.parameters()).device)
+            total = torch.zeros((), device=param_device)
             for batch in loader:
                 optimizer.zero_grad(set_to_none=True)
-                loss = model(batch)
+                loss = step(batch)
                 loss.backward()
                 optimizer.step()
                 total += loss.detach()
