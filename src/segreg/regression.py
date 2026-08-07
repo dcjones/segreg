@@ -1,4 +1,5 @@
 
+import warnings
 from typing import cast
 
 from anndata import AnnData
@@ -75,13 +76,32 @@ class Regression:
         to_bg_trans_count = np.asarray(adata.obs["to_bg_trans_count"])
 
         total_transitions = np.asarray(state_transitions.sum(axis=1)).squeeze() + to_bg_trans_count
-        A = state_transitions / total_transitions[:, None]
+
+        # A cell with no transcripts has no recorded transitions either, so this
+        # normalization would be 0/0. Dividing by 1 instead leaves such a cell
+        # with an all-zero mixing row and a zero background weight, which makes
+        # its λ_obs exactly 0 against an all-zero X: a likelihood term of ~0 that
+        # contributes to no gradient. That is equivalent to dropping the cell,
+        # but keeps the batch indexing and the cell ordering intact. Without the
+        # guard the NaN reaches every shared parameter on the first step and the
+        # whole fit is NaN.
+        empty = total_transitions == 0
+        if empty.any():
+            warnings.warn(
+                f"{int(empty.sum())} of {len(empty)} cells have no recorded state "
+                "transitions (usually cells with no transcripts). They will not "
+                "contribute to the fit.",
+                stacklevel=2,
+            )
+        normalizer = np.where(empty, 1.0, total_transitions)
+
+        A = state_transitions / normalizer[:, None]
         assert isinstance(A, coo_matrix)
         A = A.tocsr()
         assert isinstance(A, csr_matrix)
         self.A = A.astype(np.float32)
 
-        self.bg_mix_rate = (to_bg_trans_count / total_transitions).astype(np.float32)
+        self.bg_mix_rate = (to_bg_trans_count / normalizer).astype(np.float32)
 
         # Observed totals are very nearly a fixed point of the mixing model
         # (median relative error of A @ s + bg vs s is -0.2%), so we can use them
