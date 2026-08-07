@@ -11,6 +11,8 @@ import numpy as np
 import numpy.typing as npt
 import torch
 import torch.nn as nn
+import pandas as pd
+import scipy.stats as stats
 
 from .loader import RegressionBatch, RegressionBatchLoader
 
@@ -34,13 +36,22 @@ class Regression:
     # set by fit()
     model: "RegressionModel | None" = None
 
-    def __init__(self, data: SpatialData | AnnData, formula: str):
+    # gene names copied from the anndata
+    var_names: list[str]
+
+    # true if the estimated mixing matrix should be used
+    include_mixing: bool
+
+    def __init__(self, data: SpatialData | AnnData, formula: str, include_mixing: bool=True):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
             adata = data
         else:
             raise TypeError("data must be an AnnData or SpatialData object")
+
+        self.var_names = list(adata.var_names)
+        self.include_mixing = include_mixing
 
         # In anndata X can be practically anything array like, but proseg always outputs csr matrices
         assert isinstance(adata.X, csr_matrix)
@@ -82,10 +93,9 @@ class Regression:
 
     def fit(
         self,
-        nepochs: int = 10,
+        nepochs: int = 100,
         batch_size: int = 1024,
         lr: float = 0.01,
-        include_mixing: bool = True,
         β_prior_σ: float = 1.0,
         seed: int | None = None,
         device: torch.device | str | None = None,
@@ -113,7 +123,7 @@ class Regression:
             ncells,
             ngenes,
             self.design.shape[1],
-            include_mixing=include_mixing,
+            include_mixing=self.include_mixing,
             β_prior_σ=β_prior_σ,
         )
         if device is not None:
@@ -140,8 +150,33 @@ class Regression:
         self.model = model
         return model
 
-    def regression_coefficients(self):
-        pass
+    def get_regression_coefficients(self, credible_interval: float | None = None) -> pd.DataFrame:
+        if self.model is None:
+            raise Exception("fit() must be called before get_regression_coefficients")
+
+        β_μ = self.model.β_μ.detach().cpu().numpy()
+
+        covariate_names = self.design.design_info.column_names
+        df = (
+            pd.DataFrame(β_μ, index=covariate_names, columns=self.var_names)
+            .melt(ignore_index=False, var_name="Gene", value_name="Mean")
+            .reset_index(names="Covariate")
+            )
+
+        if credible_interval is not None:
+            β_logσ = self.model.β_logσ.detach().cpu().numpy()
+            β_σ = np.exp(β_logσ)
+
+            z = stats.norm.ppf(1.0 - (1.0 - credible_interval) / 2.0)
+            df["Lower"] = (β_μ - z * β_σ).flatten(order="F")
+            df["Upper"] = (β_μ + z * β_σ).flatten(order="F")
+            df["MinimumCredible"] = np.where(
+                df["Lower"] > 0,
+                df["Lower"],
+                np.where(df["Upper"] < 0, df["Upper"], 0.0),
+            )
+
+        return df
 
 
 class RegressionModel(nn.Module):
