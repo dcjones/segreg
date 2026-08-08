@@ -190,6 +190,88 @@ class Regression:
         self.model = model
         return model
 
+    def posterior_sd(self, chunk: int = 16) -> npt.NDArray[np.float64]:
+        """Marginal posterior sd of β, [ncovariates, ngenes].
+
+        NOT `exp(β_logσ)`. The surrogate posterior is factorized over every
+        (covariate, gene) entry, so it can only represent the CONDITIONAL sd —
+        every other coefficient pinned at its mean — while a credible interval for
+        one coefficient needs the MARGINAL one, integrating over the others. The two
+        differ by however correlated the design is, and here that is a lot: a
+        per-type exposure column is supported only on that type's cells, so it
+        shares its support with that type's indicator. Measured on the breast
+        benchmark the marginal is up to 3.6x wider, and the gap tracks the
+        false-positive rate almost exactly.
+
+        So the width is recomputed here, from the Laplace approximation at the
+        fitted β. The negative-binomial likelihood factorizes over genes and β[:,g]
+        reaches only gene g, so the Hessian is block diagonal with one
+        [ncov, ncov] block per gene, and the marginal sd is just
+        sqrt(diag(H⁻¹)) — cheap, because the block is the width of the DESIGN, not
+        the gene count.
+
+        For a log link, d(-loglik)/dη² under Fisher information is r/(μ(r+μ)) per
+        cell with η = log μ, so H = J' diag(w) J where J = dμ/dβ. Mixing enters only
+        through J: λ is the cell's own rate but μ is A λ + background, so
+        J = A diag(λ) X rather than diag(λ) X.
+
+        The prior's curvature (1/β_prior_σ² per coefficient) is added, and it is not
+        a formality. Under mixing, spatially-intermixed cell types lose most of their
+        identifiability — Stromal's conditional sd goes 0.145 to 9.5 — and without
+        the prior term those pairs would be handed enormous likelihood-only
+        intervals, when the honest posterior there is prior-dominated and the fitted
+        β̂ is shrunk to match.
+        """
+        if self.model is None:
+            raise Exception("fit() must be called before posterior_sd")
+
+        m = self.model
+        dev = next(m.parameters()).device
+        B = m.β_μ.detach().double()
+        gene_bias = m.gene_bias.detach().double()
+        r = torch.exp(m.log_r.detach().double())
+        bg_profile = torch.softmax(m.bg_rates.detach().double(), dim=-1)
+
+        X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
+        log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
+        A = torch.sparse_csr_tensor(
+            torch.as_tensor(self.A.indptr, dtype=torch.int64, device=dev),
+            torch.as_tensor(self.A.indices, dtype=torch.int64, device=dev),
+            torch.as_tensor(self.A.data.astype(np.float64), device=dev),
+            size=self.A.shape,
+        )
+        bg_weight = (
+            torch.as_tensor(self.bg_mix_rate.astype(np.float64), device=dev)
+            * torch.exp(log_size)
+        )
+
+        ncov, ngenes = B.shape
+        ncells = X.shape[0]
+        prior_prec = 1.0 / float(m.β_prior_σ) ** 2
+        eye = torch.eye(ncov, dtype=torch.float64, device=dev)
+        out = np.empty((ncov, ngenes), dtype=np.float64)
+
+        for start in range(0, ngenes, chunk):
+            sl = slice(start, min(start + chunk, ngenes))
+            G = sl.stop - sl.start
+            η = X @ B[:, sl] + gene_bias[sl].unsqueeze(0) + log_size.unsqueeze(1)
+            λ = torch.exp(η.clamp(max=30.0))
+            if self.include_mixing:
+                # [ncells, G, ncov], flattened so the sparse product is one call.
+                d = (λ.unsqueeze(2) * X.unsqueeze(1)).reshape(ncells, G * ncov)
+                J = (A @ d).reshape(ncells, G, ncov)
+                μ = (A @ λ) + bg_weight.unsqueeze(1) * bg_profile[sl].unsqueeze(0)
+            else:
+                J = λ.unsqueeze(2) * X.unsqueeze(1)
+                μ = λ
+            w = r[sl].unsqueeze(0) / (μ * (r[sl].unsqueeze(0) + μ) + 1e-12)
+            H = torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2))
+            H = H + prior_prec * eye
+            cov = torch.linalg.inv(H)
+            sd = torch.diagonal(cov, dim1=1, dim2=2).clamp(min=0.0).sqrt()
+            out[:, sl] = sd.T.cpu().numpy()
+        return out
+
     def get_regression_coefficients(self, credible_interval: float | None = None) -> pd.DataFrame:
         if self.model is None:
             raise Exception("fit() must be called before get_regression_coefficients")
@@ -204,8 +286,7 @@ class Regression:
             )
 
         if credible_interval is not None:
-            β_logσ = self.model.β_logσ.detach().cpu().numpy()
-            β_σ = np.exp(β_logσ)
+            β_σ = self.posterior_sd()
 
             z = stats.norm.ppf(1.0 - (1.0 - credible_interval) / 2.0)
             df["Lower"] = (β_μ - z * β_σ).flatten(order="F")
