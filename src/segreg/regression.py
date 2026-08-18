@@ -43,7 +43,8 @@ class Regression:
     # true if the estimated mixing matrix should be used
     include_mixing: bool
 
-    def __init__(self, data: SpatialData | AnnData, formula: str, include_mixing: bool=True):
+    def __init__(self, data: SpatialData | AnnData, formula: str, include_mixing: bool=True,
+                 mixing_interval_correction: bool=False):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -53,6 +54,10 @@ class Regression:
 
         self.var_names = list(adata.var_names)
         self.include_mixing = include_mixing
+        # Widen the reported intervals for the correlation that molecule
+        # reallocation induces between cells sharing a donor. Off by default, and
+        # it changes only posterior_sd() -- never the fit, never a point estimate.
+        self.mixing_interval_correction = mixing_interval_correction
 
         # In anndata X can be practically anything array like, but proseg always outputs csr matrices
         assert isinstance(adata.X, csr_matrix)
@@ -190,7 +195,8 @@ class Regression:
         self.model = model
         return model
 
-    def posterior_sd(self, chunk: int = 16) -> npt.NDArray[np.float64]:
+    def posterior_sd(self, chunk: int = 16, sandwich: bool | None = None
+                     ) -> npt.NDArray[np.float64]:
         """Marginal posterior sd of β, [ncovariates, ngenes].
 
         NOT `exp(β_logσ)`. The surrogate posterior is factorized over every
@@ -224,6 +230,8 @@ class Regression:
         """
         if self.model is None:
             raise Exception("fit() must be called before posterior_sd")
+        if sandwich is None:
+            sandwich = getattr(self, "mixing_interval_correction", False)
 
         m = self.model
         dev = next(m.parameters()).device
@@ -244,6 +252,25 @@ class Regression:
             torch.as_tensor(self.bg_mix_rate.astype(np.float64), device=dev)
             * torch.exp(log_size)
         )
+        if sandwich:
+            # A' as a second operator. The meat below needs the mass flowing OUT of
+            # each donor (a column of A); the likelihood only ever needs what flows
+            # in (a row).
+            at = self.A.tocoo()
+            At = torch.sparse_coo_tensor(
+                torch.as_tensor(np.vstack([at.col, at.row]), dtype=torch.int64,
+                                device=dev),
+                torch.as_tensor(at.data.astype(np.float64), device=dev),
+                size=self.A.shape,
+            ).coalesce()
+            # A elementwise-squared, which turns the i == k term of A D A' into a
+            # single sparse product rather than a dense diagonal.
+            A2 = torch.sparse_coo_tensor(
+                torch.as_tensor(np.vstack([at.row, at.col]), dtype=torch.int64,
+                                device=dev),
+                torch.as_tensor((at.data.astype(np.float64)) ** 2, device=dev),
+                size=self.A.shape,
+            ).coalesce()
 
         ncov, ngenes = B.shape
         ncells = X.shape[0]
@@ -268,6 +295,60 @@ class Regression:
             H = torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2))
             H = H + prior_prec * eye
             cov = torch.linalg.inv(H)
+            if sandwich:
+                # Missegmentation reallocates MOLECULES, so two cells fed by the
+                # same donor share that donor's one realized expression and their
+                # residuals are correlated. With a_ij the mixing weights and N_j a
+                # donor's realized count, X_i = sum_j Binomial(N_j, a_ij) gives
+                #
+                #   Var(X_i)      = mu_i + sum_j a_ij^2 lambda_j^2 / r
+                #   Cov(X_i, X_k) =        sum_j a_ij a_kj lambda_j^2 / r
+                #
+                # The likelihood assumes those cells are independent, so the
+                # posterior concentrates as though there were more independent
+                # observations than there are. The fitted r absorbs the MARGINAL
+                # variance; it cannot absorb the correlation, and since exposure is
+                # spatially structured the correlated part projects onto it -- which
+                # is the measured failure: coverage 0.575 at nominal 0.95.
+                #
+                # H is already the bread of a sandwich, and the naive interval is
+                # the case Cov = diag(V), for which the meat collapses back to H.
+                # Substituting the covariance above gives J'W Cov WJ. The full
+                # [ncells, ncells] covariance is never formed: only A'(WJ) is
+                # needed, one sparse product of the shape the Jacobian already uses.
+                # The donor-level dispersion is CALIBRATED, not taken from r_g.
+                #
+                # Two earlier attempts failed for related reasons. Substituting the
+                # whole reallocation covariance with D = lambda^2/r_g made intervals
+                # narrower (FP 0.182 -> 0.436), because r_g is fitted at the
+                # OBSERVED level and has already absorbed the marginal
+                # overdispersion, while sum_j a_ij^2 lambda_j^2 <= mu_i^2 makes the
+                # reallocation-implied marginal smaller. Deleting the diagonal to
+                # avoid that double-count then made the added term INDEFINITE -- an
+                # off-diagonal-only matrix has zero trace -- so it widened some
+                # coefficients and narrowed others (planted coverage up, null FP up).
+                #
+                # Both are fixed by asking what donor-level variance is CONSISTENT
+                # with the dispersion the model actually fitted. Writing the donor
+                # variance as D_j = c_g lambda_j^2, the implied marginal is
+                # sum_j a_ij^2 D_j, and the fitted marginal overdispersion is
+                # mu_i^2 / r_g; matching them in aggregate per gene gives
+                #
+                #     c_g = sum_i (mu_i^2 / r_g)  /  sum_i sum_j a_ij^2 lambda_j^2
+                #
+                # so the marginal is preserved BY CONSTRUCTION and the covariance
+                # diag(mu) + A diag(D) A' stays PSD. What is left over is purely the
+                # between-cell correlation the likelihood omits -- which is the term
+                # this correction exists to add.
+                M = J * w.unsqueeze(2)                        # [ncells, G, ncov]
+                lam2 = λ * λ
+                s_i = A2 @ lam2                               # sum_j a_ij^2 lam_j^2
+                c_g = ((μ * μ) / r[sl].unsqueeze(0)).sum(0) / s_i.sum(0).clamp(min=1e-12)
+                dvar = c_g.unsqueeze(0) * lam2                # donor-rate variance
+                U = (At @ M.reshape(ncells, G * ncov)).reshape(ncells, G, ncov)
+                meat = torch.einsum("ngc,ngd->gcd", M, M * μ.unsqueeze(2))
+                meat = meat + torch.einsum("ngc,ngd->gcd", U, U * dvar.unsqueeze(2))
+                cov = cov @ meat @ cov
             sd = torch.diagonal(cov, dim1=1, dim2=2).clamp(min=0.0).sqrt()
             out[:, sl] = sd.T.cpu().numpy()
         return out
