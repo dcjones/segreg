@@ -44,7 +44,8 @@ class Regression:
     include_mixing: bool
 
     def __init__(self, data: SpatialData | AnnData, formula: str, include_mixing: bool=True,
-                 mixing_interval_correction: bool=False):
+                 mixing_interval_correction: bool=False, include_drift: bool=False,
+                 drift: pd.DataFrame | None=None):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -58,6 +59,7 @@ class Regression:
         # reallocation induces between cells sharing a donor. Off by default, and
         # it changes only posterior_sd() -- never the fit, never a point estimate.
         self.mixing_interval_correction = mixing_interval_correction
+        self.include_drift = include_drift
 
         # In anndata X can be practically anything array like, but proseg always outputs csr matrices
         assert isinstance(adata.X, csr_matrix)
@@ -68,6 +70,49 @@ class Regression:
         # excluding the redundant gene_bias parameter in RegressionModel if so.
         design_df = dmatrix(formula, adata.obs, return_type="dataframe")
         self.design = cast(DesignMatrix, design_df)
+
+        # --- the DRIFT covariate ------------------------------------------------
+        # u[k, g] is the exposure slope of gene g's foreign share along design
+        # column k -- the direction along which missegmentation biases a
+        # coefficient. Supplied rather than computed here: it depends on an
+        # unsupervised clustering of the counts, which is a preprocessing choice
+        # and does not belong inside the model.
+        #
+        # WHY THIS IDENTIFIES. The mean model fits design @ (β + κ*u), so β and δ
+        # = κ*u compete to explain the same exposure-correlated variation. What
+        # separates them is that β carries the N(0, β_prior_σ²) KL prior and κ does
+        # not, so variation that u can explain is explained by κ -- one scalar per
+        # design column -- leaving β shrunk toward zero. That asymmetry, not an
+        # extra prior on κ, is the mechanism: a coefficient is pulled to zero
+        # exactly where the data are consistent with contamination. Which is also
+        # why κ has no prior of its own; adding one would fight the mechanism.
+        #
+        # Reported coefficients are β, NOT β + δ, so get_regression_coefficients()
+        # returns the de-biased estimate without any change.
+        self.drift = None
+        if include_drift:
+            if drift is None:
+                raise ValueError(
+                    "include_drift=True requires `drift`: a DataFrame of the drift "
+                    "covariate, indexed by DESIGN COLUMN NAME with one column per "
+                    "gene. Rows/columns not present are filled with 0, so a "
+                    "covariate that only covers the exposure columns is fine."
+                )
+            cols = list(self.design.design_info.column_names)
+            aligned = drift.reindex(index=cols, columns=self.var_names)
+            # A silent misalignment produces an all-zero u and an arm that looks
+            # like a no-op rather than like a bug, so it is an error.
+            n_ok = int(aligned.notna().any(axis=1).sum())
+            if n_ok == 0:
+                raise ValueError(
+                    "`drift` shares no index value with the design's column names. "
+                    f"Design columns look like {cols[:3]}; drift index looks like "
+                    f"{list(drift.index[:3])}. The index must be design column "
+                    "names, not cell-type labels."
+                )
+            self.drift = aligned.fillna(0.0).to_numpy(dtype=np.float32)
+        elif drift is not None:
+            raise ValueError("`drift` was supplied but include_drift is False")
 
         # Construct the neighbor mixing matrix
         state_transitions = adata.obsp["state_transitions"]
@@ -151,6 +196,7 @@ class Regression:
             self.design.shape[1],
             include_mixing=self.include_mixing,
             β_prior_σ=β_prior_σ,
+            drift=self.drift,
         )
         if device is not None:
             model = model.to(device)
@@ -353,6 +399,24 @@ class Regression:
             out[:, sl] = sd.T.cpu().numpy()
         return out
 
+    def get_drift_scales(self) -> pd.Series:
+        """The fitted κ, one per design column.
+
+        Auditability, not a result: κ is the amount of each column's
+        exposure-correlated signal the model attributed to missegmentation rather
+        than to regulation. A κ whose sign disagrees with the drift covariate's
+        construction is the sparsity assumption failing for that column, and the
+        coefficients there should be read as uncorrected.
+        """
+        if self.model is None:
+            raise Exception("fit() must be called before get_drift_scales")
+        if not self.include_drift:
+            raise Exception("this model was fit without include_drift")
+        return pd.Series(
+            self.model.κ.detach().cpu().numpy(),
+            index=list(self.design.design_info.column_names), name="kappa",
+        )
+
     def get_regression_coefficients(self, credible_interval: float | None = None) -> pd.DataFrame:
         if self.model is None:
             raise Exception("fit() must be called before get_regression_coefficients")
@@ -387,6 +451,7 @@ class RegressionModel(nn.Module):
     """
 
     include_mixing: bool
+    include_drift: bool
 
     def __init__(
         self,
@@ -395,10 +460,12 @@ class RegressionModel(nn.Module):
         ncovariates: int,
         include_mixing: bool = True,
         β_prior_σ: float = 1.0,
+        drift: np.ndarray | None = None,
     ):
         super().__init__()
 
         self.include_mixing = include_mixing
+        self.include_drift = drift is not None
 
         # Needed to weight the KL against a minibatch's share of the likelihood.
         self.ncells = ncells
@@ -421,6 +488,19 @@ class RegressionModel(nn.Module):
         self.β_μ = nn.Parameter(torch.full((ncovariates, ngenes), 0.0))
         self.β_logσ = nn.Parameter(torch.full((ncovariates, ngenes), -2.0))
 
+        # The drift direction is FIXED (a buffer, so it follows .to(device) and is
+        # not optimized); only its per-column scale κ is fitted. One scalar per
+        # design column, initialized at 0 so the fit starts from the uncorrected
+        # solution and κ has to earn its way off it.
+        if drift is not None:
+            # np.ascontiguousarray: a reindexed DataFrame's array can be read-only,
+            # which torch warns about and would make the buffer's writability
+            # undefined.
+            self.register_buffer(
+                "u", torch.as_tensor(np.ascontiguousarray(drift),
+                                     dtype=torch.float32).clone())
+            self.κ = nn.Parameter(torch.zeros(ncovariates))
+
 
     def forward(self, batch: RegressionBatch):
         if self.training:
@@ -436,7 +516,12 @@ class RegressionModel(nn.Module):
         # log_size is a fixed offset, so exp(gene_bias) is a gene's share of a
         # cell's total and λ is on the absolute count scale, which is what the
         # mixing below needs in order to redistribute molecules correctly.
-        λ = torch.exp(batch.design @ β + self.gene_bias + batch.log_size.unsqueeze(1))
+        # δ = κ*u is the contamination bias in coefficient space. It enters the
+        # MEAN, so the fit reproduces the observed (biased) coefficients, while β
+        # -- what is reported -- is what is left after it. β is penalized and κ is
+        # not, which is what makes the split identifiable; see Regression.__init__.
+        β_eff = β + self.κ.unsqueeze(1) * self.u if self.include_drift else β
+        λ = torch.exp(batch.design @ β_eff + self.gene_bias + batch.log_size.unsqueeze(1))
 
         λ_obs = self.mix(λ, batch)
 
