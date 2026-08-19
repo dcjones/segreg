@@ -167,6 +167,8 @@ class Regression:
         batch_size: int = 1024,
         lr: float = 0.01,
         β_prior_σ: float = 1.0,
+        κ_prior_μ: float = 0.0,
+        κ_prior_σ: float | None = None,
         seed: int | None = None,
         device: torch.device | str | None = None,
         verbose: bool = True,
@@ -197,6 +199,8 @@ class Regression:
             include_mixing=self.include_mixing,
             β_prior_σ=β_prior_σ,
             drift=self.drift,
+            κ_prior_μ=κ_prior_μ,
+            κ_prior_σ=κ_prior_σ,
         )
         if device is not None:
             model = model.to(device)
@@ -461,6 +465,8 @@ class RegressionModel(nn.Module):
         include_mixing: bool = True,
         β_prior_σ: float = 1.0,
         drift: np.ndarray | None = None,
+        κ_prior_μ: float = 0.0,
+        κ_prior_σ: float | None = None,
     ):
         super().__init__()
 
@@ -492,6 +498,28 @@ class RegressionModel(nn.Module):
         # not optimized); only its per-column scale κ is fitted. One scalar per
         # design column, initialized at 0 so the fit starts from the uncorrected
         # solution and κ has to earn its way off it.
+        # A prior on κ, and WHY it is worth having one. The likelihood is EXACTLY
+        # invariant along (β + c*u, κ - c) -- the drift enters the mean only through
+        # β + κ*u -- so the split is chosen entirely by the priors, not fitted. With
+        # κ unpenalized that choice falls wholly on β_prior_σ, whose right value
+        # depends on the panel and the effect-size distribution and so does not
+        # transfer between datasets.
+        #
+        # κ transfers much better. Fitted per design group against measured damage it
+        # sits at mean -1.46, sd 1.04 over 17 groups spanning breast (313 genes) and
+        # Atera (16.7k-gene WTA) -- simple-seg-sim DESIGN_v2 §57. It also has an
+        # external check no prior on β has: compare the fitted κ against the prior on
+        # any new dataset. So N(-1.5, 1) is weakly informative rather than tuned, and
+        # it takes the arbitrariness off β_prior_σ.
+        #
+        # NOT derived from the mixing geometry, which was tried and fails: the
+        # per-gene donor/self ratio the first-order theory calls for is a ratio of two
+        # tiny noisy numbers, and using it pointwise destroys the covariate (median R²
+        # 0.24 -> 0.05 breast, 0.22 -> 0.01 Atera). Group-level geometry anchors
+        # correlate only +0.33 with κ. The fitted scalar is doing real variance
+        # reduction, not merely absorbing ignorance.
+        self.κ_prior_μ = κ_prior_μ
+        self.κ_prior_σ = κ_prior_σ
         if drift is not None:
             # np.ascontiguousarray: a reindexed DataFrame's array can be read-only,
             # which torch warns about and would make the buffer's writability
@@ -538,6 +566,11 @@ class RegressionModel(nn.Module):
         # once per pass. Without this it is applied once per *batch*, which is
         # ncells/batch_size times too strong.
         kl = self.β_kl() * (batch.nreceivers / self.ncells)
+        # κ is a MAP parameter, not variational, so its prior is a plain penalty --
+        # weighted like the KL so that a pass over the data applies it exactly once.
+        if self.include_drift and self.κ_prior_σ is not None:
+            kl = kl + (((self.κ - self.κ_prior_μ) ** 2).sum()
+                       / (2.0 * self.κ_prior_σ ** 2)) * (batch.nreceivers / self.ncells)
 
         return -ll.sum() + kl
 

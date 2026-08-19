@@ -146,3 +146,33 @@ def test_drift_without_flag_is_an_error():
     adata, drift, _, _, _ = make_data()
     with pytest.raises(ValueError, match="include_drift is False"):
         Regression(adata, "~ 1 + exposure", drift=drift)
+
+
+def test_a_prior_on_kappa_takes_the_load_off_the_beta_prior():
+    """The point of the kappa prior: recover the correction at the DEFAULT beta prior.
+
+    The likelihood is exactly invariant along (beta + c*u, kappa - c), so something
+    has to choose the split. With kappa unpenalized that job falls entirely on
+    beta_prior_sigma, which does not transfer across panels. A weakly informative
+    N(-1.5, 1) on kappa -- covering the mean -1.46, sd 1.04 measured over 17 groups
+    on two datasets -- does the same job with a quantity that does transfer.
+    """
+    adata, drift, beta, u, _ = make_data()
+    nulls = beta == 0
+
+    reg_flat, est_flat = fit(adata, drift)                      # sigma_beta = 1.0
+    reg_pri = Regression(adata, "~ 1 + exposure", include_mixing=True,
+                         include_drift=True, drift=drift)
+    reg_pri.fit(nepochs=1200, batch_size=300, seed=0, verbose=False, compile=False,
+                β_prior_σ=1.0, κ_prior_μ=KAPPA_TRUE, κ_prior_σ=1.0)
+    df = reg_pri.get_regression_coefficients()
+    est_pri = (df[df["Covariate"] == "exposure"]
+               .set_index("Gene")["Mean"].reindex(adata.var_names).to_numpy())
+
+    k_flat = float(reg_flat.get_drift_scales()["exposure"])
+    k_pri = float(reg_pri.get_drift_scales()["exposure"])
+    # At the same (default, loose) beta prior, the kappa prior recovers the
+    # correction that beta_prior_sigma alone needed to be tightened 10x to reach.
+    assert abs(k_pri - KAPPA_TRUE) < abs(k_flat - KAPPA_TRUE), \
+        f"kappa prior did not help: {k_flat} -> {k_pri}"
+    assert np.abs(est_pri[nulls]).mean() < np.abs(est_flat[nulls]).mean()
