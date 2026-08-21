@@ -254,6 +254,7 @@ class Regression:
         nepochs: int = 100,
         batch_size: int = 1024,
         lr: float = 0.01,
+        β_prior: str = "normal",
         β_prior_σ: float = 1.0,
         κ_prior_μ: float = 0.0,
         κ_prior_σ: float | None = None,
@@ -279,12 +280,19 @@ class Regression:
         if seed is not None:
             torch.manual_seed(seed)
 
+        # Recorded on the object, not only passed on, because it is the one
+        # fit-time argument a caller may need to ASSERT is live: bench's
+        # `requires:` check resolves attributes here, and "cauchy but silently
+        # normal" and "cauchy" look identical in a topline.
+        self.β_prior = β_prior
+
         ncells, ngenes = self.X.shape
         model = RegressionModel(
             ncells,
             ngenes,
             self.design.shape[1],
             include_mixing=self.include_mixing,
+            β_prior=β_prior,
             β_prior_σ=β_prior_σ,
             drift=self.drift,
             κ_prior_μ=κ_prior_μ,
@@ -415,7 +423,22 @@ class Regression:
 
         ncov, ngenes = B.shape
         ncells = X.shape[0]
-        prior_prec = 1.0 / float(m.β_prior_σ) ** 2
+        # The prior's contribution to the curvature. Gaussian: 1/σ², the same for
+        # every coefficient. Cauchy: the local quadratic that MATCHES THE PRIOR'S
+        # GRADIENT at β̂, i.e. 2β/(γ² + β²) = β/σ_eff² with precision
+        # 2/(γ² + β̂²). Not the exact second derivative, 2(γ² − β̂²)/(γ² + β̂²)²,
+        # which goes NEGATIVE for |β̂| > γ and would hand a shrunk-to-nothing
+        # coefficient an indefinite Hessian; the gradient-matched form is positive
+        # everywhere, agrees with the true curvature at β̂ = 0 (both 2/γ²), and is
+        # the majorizing quadratic the scale-mixture view of the Cauchy gives. It
+        # is per-(covariate, gene) rather than a scalar, which is the whole point:
+        # a large coefficient is barely penalized and gets a likelihood-driven
+        # interval, while a null one is prior-dominated.
+        if getattr(m, "β_prior", "normal") == "cauchy":
+            prior_prec = 2.0 / (float(m.β_prior_σ) ** 2 + B**2)
+        else:
+            prior_prec = torch.full_like(
+                B, 1.0 / float(m.β_prior_σ) ** 2)
         eye = torch.eye(ncov, dtype=torch.float64, device=dev)
         out = np.empty((ncov, ngenes), dtype=np.float64)
 
@@ -434,7 +457,9 @@ class Regression:
                 μ = λ
             w = r[sl].unsqueeze(0) / (μ * (r[sl].unsqueeze(0) + μ) + 1e-12)
             H = torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2))
-            H = H + prior_prec * eye
+            # [G, ncov, ncov] diagonal, since the precision now varies by
+            # coefficient as well as by gene.
+            H = H + prior_prec[:, sl].T.unsqueeze(2) * eye
             cov = torch.linalg.inv(H)
             if sandwich:
                 # Missegmentation reallocates MOLECULES, so two cells fed by the
@@ -563,6 +588,7 @@ class RegressionModel(nn.Module):
         ngenes: int,
         ncovariates: int,
         include_mixing: bool = True,
+        β_prior: str = "normal",
         β_prior_σ: float = 1.0,
         drift: np.ndarray | None = None,
         κ_prior_μ: float = 0.0,
@@ -581,7 +607,15 @@ class RegressionModel(nn.Module):
         # Needed to weight the KL against a minibatch's share of the likelihood.
         self.ncells = ncells
 
-        # Prior on the regression coefficients, N(0, β_prior_σ²)
+        # Prior on the regression coefficients: N(0, β_prior_σ²) by default, or
+        # Cauchy(0, β_prior_σ) with `β_prior="cauchy"` -- one scale parameter
+        # either way, so an arm switches the FAMILY without also retuning a knob.
+        # See β_kl for the two cross-entropy terms and why the Cauchy one is a
+        # single-sample estimate.
+        if β_prior not in ("normal", "cauchy"):
+            raise ValueError(
+                f"β_prior must be 'normal' or 'cauchy', got {β_prior!r}")
+        self.β_prior = β_prior
         self.β_prior_σ = β_prior_σ
 
         # Per-gene regression intercept. With log_size as an offset this is a log
@@ -692,7 +726,7 @@ class RegressionModel(nn.Module):
         # an epoch these weights come to exactly 1, i.e. the prior is applied
         # once per pass. Without this it is applied once per *batch*, which is
         # ncells/batch_size times too strong.
-        kl = self.β_kl() * (batch.nreceivers / self.ncells)
+        kl = self.β_kl(β) * (batch.nreceivers / self.ncells)
         # κ is a MAP parameter, not variational, so its prior is a plain penalty --
         # weighted like the KL so that a pass over the data applies it exactly once.
         if self.include_cellspace and self.cellspace_percluster:
@@ -729,9 +763,32 @@ class RegressionModel(nn.Module):
         out[:, keep] = frac[:, g[keep]]
         return out
 
-    def β_kl(self) -> Tensor:
-        """KL(q(β) || N(0, β_prior_σ²)), summed over all covariates and genes."""
+    def β_kl(self, β: Tensor) -> Tensor:
+        """KL(q(β) || prior), summed over all covariates and genes.
+
+        `β` is the reparameterized draw the likelihood used this step; it is read
+        only by the Cauchy branch, which has no closed form.
+
+        NORMAL: KL(q || N(0, β_prior_σ²)), exact.
+
+        CAUCHY: KL(q || Cauchy(0, β_prior_σ)), split as -H(q) - E_q[log p]. The
+        entropy is exact; the cross-entropy is a ONE-SAMPLE estimate at the draw
+        the likelihood already made. A second draw would add variance without
+        information, and the gradient through β is unbiased either way. The point
+        of the heavy tail: the penalty gradient is 2β/(γ² + β²), which pulls like
+        2β/γ² near zero but decays like 2/β in the tail, so a scale tight enough
+        to shrink the nulls does not also attenuate a real log-FC -- the coupling
+        that refuted `β_prior_σ = 0.1` (simple-seg-sim DESIGN_v2 §62).
+
+        In eval mode β is β_μ and the Cauchy estimate degenerates to a point
+        evaluation; nothing calls this outside training.
+        """
         β_logσ = self.β_logσ.clamp(max=4.0)
+        if self.β_prior == "cauchy":
+            neg_entropy = -(0.5 * np.log(2.0 * np.pi * np.e) + β_logσ)
+            cross = np.log(np.pi * self.β_prior_σ) + torch.log1p(
+                (β / self.β_prior_σ) ** 2)
+            return (neg_entropy + cross).sum()
         prior_var = self.β_prior_σ**2
         return (
             np.log(self.β_prior_σ)
