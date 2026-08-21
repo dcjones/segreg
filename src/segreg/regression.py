@@ -47,7 +47,8 @@ class Regression:
                  mixing_interval_correction: bool=False, include_drift: bool=False,
                  drift: pd.DataFrame | None=None, include_cellspace: bool=False,
                  cellspace: dict | None=None, cellspace_percluster: bool=False,
-                 cellspace_shrink_σ: float=1.0):
+                 cellspace_shrink_σ: float=1.0, propagate_κ: bool=False,
+                 κ_rel_sd: float | None=None):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -62,6 +63,33 @@ class Regression:
         # it changes only posterior_sd() -- never the fit, never a point estimate.
         self.mixing_interval_correction = mixing_interval_correction
         self.include_drift = include_drift
+        # --- what β's INTERVAL knows about κ -------------------------------------
+        # Reported β is what is left after δ = κ*u, so β's uncertainty ought to
+        # include not knowing the split. By default it does NOT: posterior_sd
+        # conditions on the fitted point κ, which is a MAP parameter. These two
+        # knobs are the two available answers, and they are different in kind.
+        #
+        # `propagate_κ` is the HONEST IN-MODEL one: marginalize κ out of the joint
+        # Laplace instead of pinning it (see posterior_sd). It needs no assumption,
+        # and its size is a property of the panel rather than a choice --
+        # measured on simple-seg-sim, the implied sd(κ) is σ/sqrt(Σ_g u²), which is
+        # 0.027-0.075 on the 16.7k-gene WTA and 0.083-0.627 on the 313-gene panel.
+        # So it is expected to be negligible on a large panel and material on a
+        # small one, for the reason DESIGN_v2 §62 gives: β's prior outvotes κ by
+        # ~n_genes to 1, and n_genes is what differs.
+        #
+        # `κ_rel_sd` is the DECLARED MISSPECIFICATION one, mirroring the post-hoc
+        # arm's `kappa_rel_sd`: extra sd `κ_rel_sd * |κ_k| * |u[k,g]|` added in
+        # quadrature. It exists because the in-model uncertainty above answers
+        # "how well is the split determined GIVEN this prior", not "how wrong might
+        # this κ be" -- and on a WTA panel the first is ~0 while the second plainly
+        # is not. It is an assumption, of exactly the epistemic status of the
+        # post-hoc arm's 0.5, and it is recorded as one.
+        #
+        # Both change only posterior_sd(); neither touches the fit or a point
+        # estimate. They compose (variances add).
+        self.propagate_κ = propagate_κ
+        self.κ_rel_sd = κ_rel_sd
         # --- the CELL-SPACE alternative to the drift term ------------------------
         # `include_drift` adds kappa*u to the COEFFICIENT, where u is frac projected
         # onto the design; this adds kappa*frac[i,g] to each cell's linear predictor
@@ -376,11 +404,46 @@ class Regression:
         the prior term those pairs would be handed enormous likelihood-only
         intervals, when the honest posterior there is prior-dominated and the fitted
         β̂ is shrunk to match.
+
+        WITH `propagate_κ`, κ is MARGINALIZED rather than pinned. The drift term
+        makes the mean depend on β + κ*u, so β[:,g] and the global κ are coupled and
+        the joint Hessian is no longer block diagonal: it gains a κ row/column that
+        touches EVERY gene. Marginalizing κ out of the joint Gaussian is one Schur
+        complement,
+
+            S          = H_κκ + prior_κ − Σ_g H_κg H_gg⁻¹ H_gκ        [ncov, ncov]
+            Cov(β_g)   = H_gg⁻¹ + H_gg⁻¹ H_gκ S⁻¹ H_κg H_gg⁻¹
+
+        with H_gκ = K_g diag(u[:,g]) and H_κκ = Σ_g diag(u_g) K_g diag(u_g), where
+        K_g = J'WJ is the likelihood block. The priors do not couple β to κ, so they
+        enter only their own diagonals. Two things make this well behaved:
+
+        * The likelihood is EXACTLY flat along (β + c·u, κ − c), so H_κκ − Σ_g …
+          cancels to the PRIOR's curvature along that direction. S is therefore
+          essentially Σ_g u_g²/β_prior_σ² (Gaussian), i.e. the marginal precision of
+          κ is supplied by β's prior over all genes -- which is the algebraic form
+          of DESIGN_v2 §62's "κ is outnumbered ~n_genes to 1".
+        * A pinned κ (`κ_prior_σ → 0`, the fixed-κ arm) sends S → ∞ and the
+          correction to 0, which is the correct limit: nothing is being estimated.
+
+        `κ_rel_sd` instead adds a DECLARED (κ_rel_sd·|κ_k|·|u[k,g]|)² in quadrature.
+        The two are independent and may both be on.
         """
         if self.model is None:
             raise Exception("fit() must be called before posterior_sd")
         if sandwich is None:
             sandwich = getattr(self, "mixing_interval_correction", False)
+        propagate = (getattr(self, "propagate_κ", False)
+                     and getattr(self.model, "include_drift", False))
+        if propagate and sandwich:
+            # Both rewrite the covariance from different premises -- the sandwich
+            # replaces H⁻¹ with H⁻¹ M H⁻¹, the marginalization adds a rank-ncov term
+            # to H⁻¹ -- and there is no defensible way to compose them without
+            # deriving the sandwich for the joint (β, κ) parameter. Refuse rather
+            # than emit a number nobody can interpret.
+            raise ValueError(
+                "propagate_κ and the sandwich correction cannot be combined; the "
+                "sandwich would need re-deriving for the joint (β, κ) Hessian.")
 
         m = self.model
         dev = next(m.parameters()).device
@@ -441,6 +504,12 @@ class Regression:
                 B, 1.0 / float(m.β_prior_σ) ** 2)
         eye = torch.eye(ncov, dtype=torch.float64, device=dev)
         out = np.empty((ncov, ngenes), dtype=np.float64)
+        if propagate:
+            # u is [ncov, ngenes] and is a buffer, so it already follows .to(device).
+            u_all = m.u.detach().double()
+            Hκκ = torch.zeros((ncov, ncov), dtype=torch.float64, device=dev)
+            Σ_gg = torch.zeros((ncov, ncov), dtype=torch.float64, device=dev)
+            stash = []          # (slice, cov, H_gκ) per chunk; ~22 MB on the WTA panel
 
         for start in range(0, ngenes, chunk):
             sl = slice(start, min(start + chunk, ngenes))
@@ -456,11 +525,20 @@ class Regression:
                 J = λ.unsqueeze(2) * X.unsqueeze(1)
                 μ = λ
             w = r[sl].unsqueeze(0) / (μ * (r[sl].unsqueeze(0) + μ) + 1e-12)
-            H = torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2))
+            K = torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2))
             # [G, ncov, ncov] diagonal, since the precision now varies by
             # coefficient as well as by gene.
-            H = H + prior_prec[:, sl].T.unsqueeze(2) * eye
+            H = K + prior_prec[:, sl].T.unsqueeze(2) * eye
             cov = torch.linalg.inv(H)
+            if propagate:
+                # H_gκ[j,k] = K_g[j,k] * u[k,g]: κ_k enters gene g's mean exactly as
+                # β[k,g] does, scaled by u[k,g], and the priors do not couple them.
+                ug = u_all[:, sl].T                            # [G, ncov]
+                cross = K * ug.unsqueeze(1)                    # [G, β, κ]
+                Hκκ = Hκκ + (cross * ug.unsqueeze(2)).sum(0)
+                Σ_gg = Σ_gg + torch.einsum("gak,gac,gcl->kl", cross, cov, cross)
+                stash.append((sl, cov, cross))
+                continue
             if sandwich:
                 # Missegmentation reallocates MOLECULES, so two cells fed by the
                 # same donor share that donor's one realized expression and their
@@ -517,7 +595,79 @@ class Regression:
                 cov = cov @ meat @ cov
             sd = torch.diagonal(cov, dim1=1, dim2=2).clamp(min=0.0).sqrt()
             out[:, sl] = sd.T.cpu().numpy()
+
+        if propagate:
+            # S is κ's MARGINAL precision. The likelihood is exactly flat along
+            # (β + c·u, κ − c), so Hκκ and Σ_gg very nearly cancel and what is left
+            # is the curvature β's prior supplies along that direction -- which is
+            # why S grows with the gene count and why this correction is small on a
+            # WTA panel and large on a 313-gene one.
+            S = Hκκ - Σ_gg
+            if m.κ_prior_σ is not None:
+                S = S + eye / float(m.κ_prior_σ) ** 2
+            # Symmetrize before inverting: S is symmetric in exact arithmetic, and
+            # the einsum accumulation over ~16.7k genes is not.
+            S = 0.5 * (S + S.T)
+            # S is STRUCTURALLY SINGULAR on every design column the covariate does
+            # not cover -- the drift table is supplied on the exposure columns only,
+            # so u is exactly 0 on the intercept and the type contrasts (12 of 20
+            # columns on Atera). Those κ entries are not parameters of anything and
+            # there is nothing to marginalize, so the Schur complement is inverted on
+            # the ACTIVE sub-block and left at zero elsewhere. Ridging the whole
+            # matrix instead would fire a warning on every real fit and quietly
+            # invent uncertainty for columns that have none.
+            active = (u_all.abs().sum(dim=1) > 0)
+            na = int(active.sum())
+            Sinv = torch.zeros_like(S)
+            if na:
+                idx = torch.nonzero(active, as_tuple=True)[0]
+                Sa = S[idx][:, idx]
+                ev = torch.linalg.eigvalsh(Sa)
+                if float(ev.min()) <= 0:
+                    # A column the covariate DOES cover, still not identified: a
+                    # genuine pathology worth a warning rather than a silent ridge.
+                    warnings.warn(
+                        f"κ's marginal precision is singular on a covered design "
+                        f"column (min eigenvalue {float(ev.min()):.3g}); ridging. "
+                        "Check the drift covariate for a near-constant column.",
+                        stacklevel=2)
+                    Sa = Sa + torch.eye(na, dtype=S.dtype, device=S.device) * (
+                        abs(float(ev.min())) + 1e-10)
+                Sinv[idx.unsqueeze(1), idx.unsqueeze(0)] = torch.linalg.inv(Sa)
+            # Reported as a VARIANCE with inf on the uncovered columns, so a caller
+            # cannot mistake a structural zero for a precisely known κ.
+            κcov = Sinv.clone()
+            κcov[~active, ~active] = float("nan")
+            self._κ_marginal_cov = κcov.cpu().numpy()
+            for sl, cov, cross in stash:
+                T = cov @ cross                                # [G, β, κ]
+                cov = cov + torch.einsum("gak,kl,gbl->gab", T, Sinv, T)
+                sd = torch.diagonal(cov, dim1=1, dim2=2).clamp(min=0.0).sqrt()
+                out[:, sl] = sd.T.cpu().numpy()
+
+        # The DECLARED misspecification term, independent of everything above: how
+        # wrong κ might be, rather than how well this prior determines it. Mirrors
+        # the post-hoc arm's kappa_rel_sd, and is an assumption of the same standing.
+        rel = getattr(self, "κ_rel_sd", None)
+        if rel is not None and getattr(m, "include_drift", False):
+            κ = m.κ.detach().double().cpu().numpy()[:, None]
+            u_np = m.u.detach().double().cpu().numpy()
+            out = np.sqrt(out**2 + (float(rel) * np.abs(κ) * np.abs(u_np)) ** 2)
         return out
+
+    def κ_posterior_sd(self) -> npt.NDArray[np.float64]:
+        """Marginal posterior sd of κ, one per design column.
+
+        A by-product of `posterior_sd(propagate_κ=True)`'s Schur complement, exposed
+        because it is the quantity that says whether propagating κ can matter at all:
+        it is ~σ/sqrt(Σ_g u[k,g]²), so it shrinks with the panel size. Requires a
+        `posterior_sd()` call with `propagate_κ` set.
+        """
+        cov = getattr(self, "_κ_marginal_cov", None)
+        if cov is None:
+            raise Exception(
+                "call posterior_sd() on a propagate_κ model before κ_posterior_sd")
+        return np.sqrt(np.diag(cov))
 
     def get_cellspace_scales(self) -> np.ndarray:
         """The fitted cell-space kappa: a scalar, or one per Leiden cluster."""
