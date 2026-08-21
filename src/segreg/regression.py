@@ -364,6 +364,21 @@ class Regression:
         if compile:
             step = torch.compile(model.forward, dynamic=True)
 
+        # --- convergence diagnostic ---------------------------------------------
+        # ASSERTED, not assumed. `nepochs` was validated on a 313-gene panel and
+        # transferred to a 16.7k-gene one, where 200 epochs left individual
+        # coefficients 4 log-FC from their optimum (simple-seg-sim DESIGN_v2 §68) --
+        # a defect that read as a model or simulator bug for a whole afternoon. The
+        # cost here is one clone of β_μ and one extra sync at 90% of training.
+        #
+        # The measure is scale-free because β_μ is initialized at exactly 0: the
+        # movement over the last 10% of epochs, relative to β's final magnitude,
+        # says what fraction of the fit was still happening at the end. A converged
+        # fit leaves it near 0; Atera at 200 epochs does not.
+        snap_at = max(int(nepochs * 0.9) - 1, 0)
+        β_snap = None
+        losses = []
+
         model.train()
         for epoch in range(nepochs):
             # Accumulated on device; reading it every batch would force a sync.
@@ -375,12 +390,51 @@ class Regression:
                 optimizer.step()
                 total += loss.detach()
 
+            losses.append(float(total) / ncells)
+            if epoch == snap_at:
+                β_snap = model.β_μ.detach().clone()
+
             if verbose:
                 # Per cell, so it stays comparable across batch sizes.
-                print(f"epoch {epoch + 1}/{nepochs}: loss = {float(total) / ncells:.4f}")
+                print(f"epoch {epoch + 1}/{nepochs}: loss = {losses[-1]:.4f}")
 
         model.eval()
         self.model = model
+
+        β_fin = model.β_μ.detach()
+        tail = max(len(losses) // 10, 1)
+        norm = float(torch.linalg.vector_norm(β_fin))
+        move = (float(torch.linalg.vector_norm(β_fin - β_snap))
+                if β_snap is not None else float("nan"))
+        self.fit_diagnostics = {
+            "nepochs": nepochs,
+            "steps_per_epoch": int(np.ceil(ncells / batch_size)),
+            "total_steps": int(nepochs * np.ceil(ncells / batch_size)),
+            # Fraction of β's final magnitude that moved during the last 10% of
+            # epochs. Not a hard threshold anywhere -- it is recorded so that
+            # under-convergence is visible in a fit's own provenance instead of
+            # requiring the experiment that found it.
+            "β_rel_move_last10pct": move / norm if norm > 0 else float("nan"),
+            "β_max_abs_move_last10pct": (
+                float((β_fin - β_snap).abs().max()) if β_snap is not None
+                else float("nan")),
+            "β_l2": norm,
+            "loss_first": losses[0] if losses else float("nan"),
+            "loss_final": losses[-1] if losses else float("nan"),
+            # Improvement still being made at the end, as a share of the whole run's
+            # improvement. A converged fit has this near 0.
+            "loss_tail_share": (
+                (np.mean(losses[-2 * tail:-tail]) - np.mean(losses[-tail:]))
+                / (losses[0] - losses[-1])
+                if len(losses) >= 2 * tail and losses[0] != losses[-1]
+                else float("nan")),
+        }
+        if verbose:
+            d = self.fit_diagnostics
+            print(f"convergence: β moved {d['β_rel_move_last10pct']:.4f} of its norm "
+                  f"in the last 10% of epochs (max |Δβ| "
+                  f"{d['β_max_abs_move_last10pct']:.4f}); tail loss share "
+                  f"{d['loss_tail_share']:.4f}")
         return model
 
     def posterior_sd(self, chunk: int = 16, sandwich: bool | None = None
