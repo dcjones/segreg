@@ -46,7 +46,8 @@ class Regression:
     def __init__(self, data: SpatialData | AnnData, formula: str, include_mixing: bool=True,
                  mixing_interval_correction: bool=False, include_drift: bool=False,
                  drift: pd.DataFrame | None=None, include_cellspace: bool=False,
-                 cellspace: dict | None=None):
+                 cellspace: dict | None=None, cellspace_percluster: bool=False,
+                 cellspace_shrink_σ: float=1.0):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -82,6 +83,24 @@ class Regression:
         # frac is never materialized (3.0 GB on Atera); the pieces are held and
         # recombined per minibatch. See cellspace_frac().
         self.include_cellspace = include_cellspace
+        # RUNG 2 of the scale ladder. With one global kappa the cell-space term
+        # INJECTS bias: fitted at -2.31 (breast) / -3.43 (Atera) it lands on an
+        # average dominated by the large tumor types and then distorts every type
+        # whose frac-design alignment differs from that average -- breast Invasive
+        # Tumor's null bias went +0.005 -> +0.370 and its FP 0.273 -> 0.870
+        # (simple-seg-sim DESIGN_v2 §61).
+        #
+        # That is also what made the §61 comparison UNFAIR: the drift arms carry
+        # kappa per design column, which is kappa per cell type (13 breast, 9
+        # Atera), against a single scalar here. Per-cluster kappa is the like-for-
+        # like test -- Leiden clusters are annotation-free and at least as granular
+        # (56 breast, 225 Atera).
+        #
+        # Parameterized as kappa_c = kappa0 + delta_c with delta penalized, so the
+        # cluster count does not buy unchecked freedom against a likelihood that is
+        # exactly flat in this direction per parameter.
+        self.cellspace_percluster = cellspace_percluster
+        self.cellspace_shrink_σ = cellspace_shrink_σ
         self.cellspace = None
         if include_cellspace:
             if cellspace is None:
@@ -271,6 +290,8 @@ class Regression:
             κ_prior_μ=κ_prior_μ,
             κ_prior_σ=κ_prior_σ,
             cellspace=self.cellspace,
+            cellspace_percluster=self.cellspace_percluster,
+            cellspace_shrink_σ=self.cellspace_shrink_σ,
         )
         if device is not None:
             model = model.to(device)
@@ -473,6 +494,15 @@ class Regression:
             out[:, sl] = sd.T.cpu().numpy()
         return out
 
+    def get_cellspace_scales(self) -> np.ndarray:
+        """The fitted cell-space kappa: a scalar, or one per Leiden cluster."""
+        if self.model is None or not self.include_cellspace:
+            raise Exception("no cell-space term on this fit")
+        k0 = float(self.model.κ_cs.detach().cpu().numpy())
+        if not getattr(self.model, "cellspace_percluster", False):
+            return np.array([k0])
+        return k0 + self.model.δ_cs.detach().cpu().numpy()
+
     def get_drift_scales(self) -> pd.Series:
         """The fitted κ, one per design column.
 
@@ -538,12 +568,15 @@ class RegressionModel(nn.Module):
         κ_prior_μ: float = 0.0,
         κ_prior_σ: float | None = None,
         cellspace: dict | None = None,
+        cellspace_percluster: bool = False,
+        cellspace_shrink_σ: float = 1.0,
     ):
         super().__init__()
 
         self.include_mixing = include_mixing
         self.include_drift = drift is not None
         self.include_cellspace = cellspace is not None
+        self.cellspace_percluster = False
 
         # Needed to weight the KL against a minibatch's share of the likelihood.
         self.ncells = ncells
@@ -603,6 +636,11 @@ class RegressionModel(nn.Module):
                 self.register_buffer(nm, torch.as_tensor(
                     np.ascontiguousarray(arr)).to(dt).clone())
             self.κ_cs = nn.Parameter(torch.zeros(()))
+            self.cellspace_percluster = cellspace_percluster
+            self.cellspace_shrink_σ = cellspace_shrink_σ
+            if cellspace_percluster:
+                self.δ_cs = nn.Parameter(
+                    torch.zeros(int(cellspace["P"].shape[0])))
         if drift is not None:
             # np.ascontiguousarray: a reindexed DataFrame's array can be read-only,
             # which torch warns about and would make the buffer's writability
@@ -634,7 +672,10 @@ class RegressionModel(nn.Module):
         β_eff = β + self.κ.unsqueeze(1) * self.u if self.include_drift else β
         η = batch.design @ β_eff + self.gene_bias + batch.log_size.unsqueeze(1)
         if self.include_cellspace:
-            η = η + self.κ_cs * self.cellspace_frac(batch)
+            κc = self.κ_cs
+            if self.cellspace_percluster:
+                κc = (self.κ_cs + self.δ_cs[self.cs_own[batch.nodes]]).unsqueeze(1)
+            η = η + κc * self.cellspace_frac(batch)
         λ = torch.exp(η)
 
         λ_obs = self.mix(λ, batch)
@@ -654,6 +695,12 @@ class RegressionModel(nn.Module):
         kl = self.β_kl() * (batch.nreceivers / self.ncells)
         # κ is a MAP parameter, not variational, so its prior is a plain penalty --
         # weighted like the KL so that a pass over the data applies it exactly once.
+        if self.include_cellspace and self.cellspace_percluster:
+            # Partial pooling on the per-cluster deviations, weighted like the KL so
+            # one pass applies it exactly once.
+            kl = kl + ((self.δ_cs ** 2).sum()
+                       / (2.0 * self.cellspace_shrink_σ ** 2)) * (
+                           batch.nreceivers / self.ncells)
         if self.include_drift and self.κ_prior_σ is not None:
             kl = kl + (((self.κ - self.κ_prior_μ) ** 2).sum()
                        / (2.0 * self.κ_prior_σ ** 2)) * (batch.nreceivers / self.ncells)

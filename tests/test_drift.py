@@ -226,3 +226,27 @@ def test_cellspace_without_flag_is_an_error():
     with pytest.raises(ValueError, match="include_cellspace is False"):
         Regression(adata, "~ 1 + exposure",
                    cellspace=make_cellspace(adata, drift))
+
+
+def test_percluster_cellspace_kappa_is_live_and_pooled():
+    """Rung 2: one kappa per cluster, with the deviations penalized.
+
+    Checks it is (a) live -- the deviations move off zero -- and (b) actually
+    pooled: a tight shrink sigma must pull them back toward the shared level, or
+    the cluster count is unchecked freedom against a flat likelihood direction.
+    """
+    adata, drift, beta, u, _ = make_data()
+    adata.obs["original_cell_id"] = np.arange(adata.n_obs, dtype=np.int64)
+    cs = make_cellspace(adata, drift)
+    spread = {}
+    for sig in (1.0, 0.01):
+        reg = Regression(adata, "~ 1 + exposure", include_mixing=True,
+                         include_cellspace=True, cellspace=cs,
+                         cellspace_percluster=True, cellspace_shrink_σ=sig)
+        reg.fit(nepochs=200, batch_size=300, seed=0, verbose=False, compile=False)
+        k = reg.get_cellspace_scales()
+        assert len(k) == cs["P"].shape[0], "expected one kappa per cluster"
+        spread[sig] = float(np.std(k))
+    assert spread[1.0] > 0, "per-cluster deviations never moved off zero"
+    assert spread[0.01] < spread[1.0], (
+        f"tight shrinkage did not pool: sd {spread[1.0]:.4f} -> {spread[0.01]:.4f}")
