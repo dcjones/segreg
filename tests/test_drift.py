@@ -63,8 +63,11 @@ def make_data(seed=0):
 def fit(adata, drift=None, seed=0, nepochs=1200, prior_sigma=1.0):
     reg = Regression(adata, "~ 1 + exposure", include_mixing=True,
                      include_drift=drift is not None, drift=drift)
+    # β_prior pinned: segreg's DEFAULT is now Cauchy (see regression.py), and every
+    # measured ladder recorded in this file is a Gaussian one. Leaving it implicit
+    # would silently re-measure a different prior against the old numbers.
     reg.fit(nepochs=nepochs, batch_size=300, seed=seed, verbose=False,
-            compile=False, β_prior_σ=prior_sigma)
+            compile=False, β_prior="normal", β_prior_σ=prior_sigma)
     df = reg.get_regression_coefficients()
     est = (df[df["Covariate"] == "exposure"]
            .set_index("Gene")["Mean"].reindex(adata.var_names).to_numpy())
@@ -164,7 +167,8 @@ def test_a_prior_on_kappa_takes_the_load_off_the_beta_prior():
     reg_pri = Regression(adata, "~ 1 + exposure", include_mixing=True,
                          include_drift=True, drift=drift)
     reg_pri.fit(nepochs=1200, batch_size=300, seed=0, verbose=False, compile=False,
-                β_prior_σ=1.0, κ_prior_μ=KAPPA_TRUE, κ_prior_σ=1.0)
+                β_prior="normal", β_prior_σ=1.0, κ_prior_μ=KAPPA_TRUE,
+                κ_prior_σ=1.0)
     df = reg_pri.get_regression_coefficients()
     est_pri = (df[df["Covariate"] == "exposure"]
                .set_index("Gene")["Mean"].reindex(adata.var_names).to_numpy())

@@ -254,7 +254,7 @@ class Regression:
         nepochs: int = 100,
         batch_size: int = 1024,
         lr: float = 0.01,
-        β_prior: str = "normal",
+        β_prior: str = "cauchy",
         β_prior_σ: float = 1.0,
         κ_prior_μ: float = 0.0,
         κ_prior_σ: float | None = None,
@@ -588,7 +588,7 @@ class RegressionModel(nn.Module):
         ngenes: int,
         ncovariates: int,
         include_mixing: bool = True,
-        β_prior: str = "normal",
+        β_prior: str = "cauchy",
         β_prior_σ: float = 1.0,
         drift: np.ndarray | None = None,
         κ_prior_μ: float = 0.0,
@@ -607,11 +607,25 @@ class RegressionModel(nn.Module):
         # Needed to weight the KL against a minibatch's share of the likelihood.
         self.ncells = ncells
 
-        # Prior on the regression coefficients: N(0, β_prior_σ²) by default, or
-        # Cauchy(0, β_prior_σ) with `β_prior="cauchy"` -- one scale parameter
-        # either way, so an arm switches the FAMILY without also retuning a knob.
-        # See β_kl for the two cross-entropy terms and why the Cauchy one is a
+        # Prior on the regression coefficients: Cauchy(0, β_prior_σ) by DEFAULT,
+        # or N(0, β_prior_σ²) with `β_prior="normal"` -- one scale parameter either
+        # way, so a caller switches the FAMILY without also retuning a knob. See
+        # β_kl for the two cross-entropy terms and why the Cauchy one is a
         # single-sample estimate.
+        #
+        # WHY THE CAUCHY IS THE DEFAULT (simple-seg-sim bench/DESIGN_v2 §63). At
+        # γ=1 it is at or above the Gaussian on false positives AND on power for
+        # the largest effects at the same time -- Atera cur FP 0.176 vs 0.179, FP
+        # panel 0.150 vs 0.160, power at |log-FC| > 0.65 0.85 vs 0.83 -- so it is
+        # the one setting on this axis that costs nothing. Tightening γ below 1
+        # then buys FP at a steady ~8 points of large-effect power per 0.04 of cur
+        # FP, with no sweet spot anywhere in between: γ is a DIAL for the caller,
+        # not a tuned constant.
+        #
+        # It matters ONLY where the likelihood is flat, which in practice means the
+        # drift term's β/κ split; with β facing the likelihood alone the family is
+        # worth nothing (σ 1.0 vs 0.3 moves the null bias in the 4th decimal). So
+        # this default is not a general claim about regularizing β.
         if β_prior not in ("normal", "cauchy"):
             raise ValueError(
                 f"β_prior must be 'normal' or 'cauchy', got {β_prior!r}")
