@@ -135,15 +135,42 @@ def test_the_prior_is_LIVE_in_the_split():
     assert abs(kc - kg) > 0.05, f"cauchy changed nothing: kappa {kg} -> {kc}"
 
 
-def test_at_MATCHED_kappa_recovery_the_heavy_TAIL_costs_the_effects_less():
-    """THE CLAIM. A Gaussian tight enough to hand the nulls' exposure slope to κ
-    also attenuates the real effects, because one scale does both jobs; that
-    coupling is what refuted β_prior_σ = 0.1 on the benchmark. The Cauchy's
-    penalty gradient 2β/(γ² + β²) is per-coefficient, so in principle it buys the
-    same κ while leaving a large β alone.
+def test_at_MATCHED_null_SHRINKAGE_the_heavy_TAIL_costs_the_effects_less():
+    """THE CLAIM, and the measurement that qualifies it.
 
-    Compared at MATCHED κ rather than at a matched scale: the scale is a free knob,
-    so the question is whether the frontier moves.
+    A Gaussian tight enough to hand the nulls' exposure slope to κ also attenuates
+    the real effects, because one scale does both jobs; that coupling is what
+    refuted β_prior_σ = 0.1 on the benchmark (DESIGN_v2 §62). The Cauchy's penalty
+    gradient 2β/(γ² + β²) is per-coefficient, so it can in principle shrink the
+    nulls without the same tax.
+
+    MEASURED here (κ_true = -1.5, `keep` = mean |β̂|/0.8 over the 6 real effects,
+    `null` = mean |β̂| over the 54 nulls):
+
+        gaussian σ   1.0     0.3     0.1     0.03
+        κ           -0.670  -0.922  -1.345  -1.358
+        keep         0.878   0.871   0.851   0.745
+        null         0.228   0.159   0.108   0.095
+
+        cauchy γ     1.0     0.3     0.1     0.03
+        κ           -0.687  -0.861  -1.103  -1.168
+        keep         0.878   0.874   0.868   0.867
+        null         0.223   0.175   0.118   0.106
+
+    Two things follow, and the second is the reason this is not a free win:
+
+    * The decoupling is REAL but small. At matched null shrinkage (γ=0.03's 0.106
+      against σ=0.1's 0.108) the Cauchy keeps 0.867 of the effects against 0.851,
+      and it never falls off the cliff the Gaussian hits at σ=0.03 (0.745).
+    * The Cauchy recovers LESS κ at every scale and saturates around -1.17,
+      short of the truth. Its tail is exactly what lets a coefficient keep the
+      exposure-correlated variation the drift term is trying to claim, so
+      "attenuates the effects less" and "corrects less" are the same fact seen
+      twice. Which of the two the benchmark rewards is not decidable here.
+
+    Matched on NULL SHRINKAGE rather than on κ: κ cannot be matched at all at the
+    tight end (no Cauchy reaches -1.345), and it is the nulls the prior is nominally
+    there to shrink.
     """
     adata, drift, beta, u, idx = make_drift_data()
 
@@ -158,39 +185,59 @@ def test_at_MATCHED_kappa_recovery_the_heavy_TAIL_costs_the_effects_less():
     cauchy = [run("cauchy", s) for s in grid]
     print("\ngaussian", gauss, "\ncauchy  ", cauchy)
 
-    # Match on κ: for each Gaussian setting take the Cauchy that recovered at least
-    # as much of the drift (κ at least as negative), then compare attenuation.
-    compared, wins = 0, 0
+    # Both families must be monotone in their scale, or there is no frontier to
+    # compare -- only noise.
+    for fam, name in ((gauss, "gaussian"), (cauchy, "cauchy")):
+        nulls = [v["null"] for v in fam]
+        assert nulls == sorted(nulls, reverse=True), f"{name} not monotone: {fam}"
+
+    # Frontier comparison: for each Gaussian setting, the Cauchy that shrinks the
+    # nulls at least as hard (within a 0.005 tolerance, since the grids do not
+    # line up exactly) must not attenuate the effects more.
+    compared = 0
     for g in gauss:
-        cands = [c for c in cauchy if c["κ"] <= g["κ"]]
+        cands = [c for c in cauchy if c["null"] <= g["null"] + 0.005]
         if not cands:
             continue
-        c = max(cands, key=lambda v: v["κ"])      # the least aggressive match
+        c = min(cands, key=lambda v: abs(v["null"] - g["null"]))
         compared += 1
-        wins += c["keep"] >= g["keep"]
-    assert compared >= 2, f"no κ-matched pairs: {gauss} {cauchy}"
-    # Not "every pair", because κ cannot be matched exactly on a 4-point grid; the
-    # claim is that the family does not LOSE on the frontier.
-    assert wins >= compared - 1, (
-        f"cauchy attenuates more than the gaussian at matched kappa: "
-        f"{gauss} vs {cauchy}")
+        assert c["keep"] >= g["keep"] - 0.01, (
+            f"cauchy γ={c['scale']} shrank the nulls to {c['null']:.3f} against "
+            f"gaussian σ={g['scale']}'s {g['null']:.3f} but kept only "
+            f"{c['keep']:.3f} of the effects against {g['keep']:.3f}")
+    assert compared >= 2, f"no comparable pairs: {gauss} {cauchy}"
+
+    # And the specific failure the Gaussian has: at its tightest setting it gives
+    # up 13% of the effects for 0.013 of null bias. The Cauchy's tightest does not.
+    assert cauchy[-1]["keep"] > gauss[-1]["keep"] + 0.05, (
+        f"cauchy tail did not avoid the gaussian's collapse: "
+        f"{cauchy[-1]} vs {gauss[-1]}")
 
 
 def test_the_interval_prior_curvature_follows_the_family():
-    """posterior_sd adds the prior's curvature. Under a Cauchy that is
-    per-coefficient -- 2/(gamma^2 + beta^2) -- so a large coefficient gets a
-    likelihood-driven interval while a null one stays prior-dominated. A scalar
-    1/gamma^2 would hand the effects the null's width."""
+    """posterior_sd adds the prior's curvature, and under a Cauchy it is
+    PER-COEFFICIENT: 2/(γ² + β̂²), so a null is prior-dominated while a large
+    coefficient is handed back to the likelihood.
+
+    Tested as a RATIO against the Gaussian at the same scale, not as
+    "effects get wider intervals than nulls" -- they do not, and that was our
+    first version of this test. The likelihood term dominates both, and a real
+    effect raises λ where the exposure is high, so it is the BETTER-determined
+    coefficient (sd 0.0156 against the nulls' 0.0176). What the family changes is
+    the prior's share, which the ratio isolates: at β = 0 the Cauchy's 2/γ²
+    exceeds the Gaussian's 1/γ², so nulls narrow, while at |β| >> γ its
+    contribution vanishes.
+    """
     adata, beta, idx = make_data()
     nulls = beta == 0
-    reg, est = fit(adata, "cauchy", 0.1)
-    col = list(reg.design.design_info.column_names).index("exposure")
-    sd = reg.posterior_sd()[col]
-    assert sd[idx].mean() > sd[nulls].mean(), (
-        f"effect sd {sd[idx].mean():.4f} not wider than null sd "
-        f"{sd[nulls].mean():.4f}")
-    # And the null width must not exceed what a Gaussian at the same scale gives,
-    # since 2/gamma^2 > 1/sigma^2 at beta = 0.
-    reg_g, _ = fit(adata, "normal", 0.1)
-    sd_g = reg_g.posterior_sd()[col]
-    assert sd[nulls].mean() <= sd_g[nulls].mean() * 1.05
+    scale = 0.1
+    reg_c, _ = fit(adata, "cauchy", scale)
+    reg_g, _ = fit(adata, "normal", scale)
+    col = list(reg_c.design.design_info.column_names).index("exposure")
+    sd_c, sd_g = reg_c.posterior_sd()[col], reg_g.posterior_sd()[col]
+    ratio_eff = float((sd_c[idx] / sd_g[idx]).mean())
+    ratio_null = float((sd_c[nulls] / sd_g[nulls]).mean())
+    assert ratio_eff > ratio_null, (
+        f"cauchy/gaussian width ratio {ratio_eff:.3f} at the effects is not above "
+        f"{ratio_null:.3f} at the nulls -- the curvature is not per-coefficient")
+    assert ratio_null <= 1.0 + 1e-6, f"nulls not narrowed: ratio {ratio_null:.3f}"
