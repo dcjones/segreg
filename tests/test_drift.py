@@ -176,3 +176,53 @@ def test_a_prior_on_kappa_takes_the_load_off_the_beta_prior():
     assert abs(k_pri - KAPPA_TRUE) < abs(k_flat - KAPPA_TRUE), \
         f"kappa prior did not help: {k_flat} -> {k_pri}"
     assert np.abs(est_pri[nulls]).mean() < np.abs(est_flat[nulls]).mean()
+
+
+def make_cellspace(adata, drift, rng_seed=1):
+    """A field whose design-projected part is exactly `drift`'s direction.
+
+    Two clusters, so frac[i,g] varies by cell and gene through a real donor
+    mixture rather than being hand-set -- the point is to exercise the same
+    reconstruction the real builder feeds in.
+    """
+    rng = np.random.default_rng(rng_seed)
+    n, G = adata.n_obs, adata.n_vars
+    P = rng.random((2, G)) + 0.5
+    P = P / P.sum(axis=1, keepdims=True)
+    M = np.zeros((n, 2), dtype=np.float32)
+    frac_target = 0.15 + 0.10 * (adata.obs["exposure"].to_numpy() > 0)
+    M[:, 0] = frac_target
+    sw = (1.0 - frac_target).astype(np.float32)
+    return dict(M=M, sw=sw, own=np.ones(n, dtype=np.int64), P=P.astype(np.float32),
+                original_cell_id=np.asarray(adata.obs["original_cell_id"]),
+                genes=np.asarray(list(adata.var_names), dtype=object))
+
+
+def test_cellspace_term_is_live_and_reconstructs_frac():
+    adata, drift, beta, u, _ = make_data()
+    adata.obs["original_cell_id"] = np.arange(adata.n_obs, dtype=np.int64)
+    cs = make_cellspace(adata, drift)
+    reg = Regression(adata, "~ 1 + exposure", include_mixing=True,
+                     include_cellspace=True, cellspace=cs)
+    reg.fit(nepochs=200, batch_size=300, seed=0, verbose=False, compile=False)
+    assert reg.model.include_cellspace
+    # kappa moved off its zero init, i.e. the term is doing something.
+    assert abs(float(reg.model.κ_cs.detach())) > 1e-3
+
+
+def test_cellspace_misalignment_is_an_error():
+    adata, drift, _, _, _ = make_data()
+    adata.obs["original_cell_id"] = np.arange(adata.n_obs, dtype=np.int64)
+    cs = make_cellspace(adata, drift)
+    cs["original_cell_id"] = cs["original_cell_id"][:-5]
+    cs["M"] = cs["M"][:-5]; cs["sw"] = cs["sw"][:-5]; cs["own"] = cs["own"][:-5]
+    with pytest.raises(ValueError, match="missing"):
+        Regression(adata, "~ 1 + exposure", include_cellspace=True, cellspace=cs)
+
+
+def test_cellspace_without_flag_is_an_error():
+    adata, drift, _, _, _ = make_data()
+    adata.obs["original_cell_id"] = np.arange(adata.n_obs, dtype=np.int64)
+    with pytest.raises(ValueError, match="include_cellspace is False"):
+        Regression(adata, "~ 1 + exposure",
+                   cellspace=make_cellspace(adata, drift))

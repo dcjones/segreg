@@ -45,7 +45,8 @@ class Regression:
 
     def __init__(self, data: SpatialData | AnnData, formula: str, include_mixing: bool=True,
                  mixing_interval_correction: bool=False, include_drift: bool=False,
-                 drift: pd.DataFrame | None=None):
+                 drift: pd.DataFrame | None=None, include_cellspace: bool=False,
+                 cellspace: dict | None=None):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -60,6 +61,37 @@ class Regression:
         # it changes only posterior_sd() -- never the fit, never a point estimate.
         self.mixing_interval_correction = mixing_interval_correction
         self.include_drift = include_drift
+        # --- the CELL-SPACE alternative to the drift term ------------------------
+        # `include_drift` adds kappa*u to the COEFFICIENT, where u is frac projected
+        # onto the design; this adds kappa*frac[i,g] to each cell's linear predictor
+        # directly, keeping the component of frac ORTHOGONAL to the design that the
+        # projection discards.
+        #
+        # Why it might win: simple-seg-sim DESIGN_v2 §60 measured that the rank-one
+        # residual is reproducibly structured (cross-seed rho 0.31-0.34) but is
+        # explained by NO analytic second direction we could construct (best
+        # |corr| 0.12 against headroom 0.19-0.24 R²). Using the full field requires
+        # no such guess.
+        #
+        # Why it might lose: (d/s - 1) is wildly heterogeneous (IQR 1.3 breast,
+        # 2.8 Atera), so a single kappa is an average either way -- and the
+        # coefficient-space version averages it over exactly the direction that
+        # biases beta, while this averages over the whole field, most of which is
+        # orthogonal to the design and cannot bias anything.
+        #
+        # frac is never materialized (3.0 GB on Atera); the pieces are held and
+        # recombined per minibatch. See cellspace_frac().
+        self.include_cellspace = include_cellspace
+        self.cellspace = None
+        if include_cellspace:
+            if cellspace is None:
+                raise ValueError(
+                    "include_cellspace=True requires `cellspace`: the dict written "
+                    "by bench/scripts/cluster_mixing_covariates.py --reduce field "
+                    "(M, sw, own, P, original_cell_id, genes).")
+            self.cellspace = cellspace
+        elif cellspace is not None:
+            raise ValueError("`cellspace` supplied but include_cellspace is False")
 
         # In anndata X can be practically anything array like, but proseg always outputs csr matrices
         assert isinstance(adata.X, csr_matrix)
@@ -159,6 +191,43 @@ class Regression:
         counts = np.asarray(self.X.sum(axis=1)).squeeze()
         self.log_size = np.log(np.maximum(counts, 1)).astype(np.float32)
 
+        if self.cellspace is not None:
+            cs = self.cellspace
+            # Align to THIS object's cell order by original_cell_id and to its gene
+            # order by name. A silent misalignment here would look like a weak
+            # result rather than a bug, so both are errors.
+            oid = np.asarray(adata.obs["original_cell_id"]).astype(np.int64)
+            pos = pd.Series(np.arange(len(cs["original_cell_id"])),
+                            index=np.asarray(cs["original_cell_id"]).astype(np.int64))
+            pos = pos[~pos.index.duplicated()]
+            row = pos.reindex(oid)
+            if row.isna().any():
+                raise ValueError(
+                    f"`cellspace` is missing {int(row.isna().sum())} of "
+                    f"{len(oid)} cells; it must cover every cell of this object.")
+            gi = pd.Series(np.arange(len(cs["genes"])),
+                           index=np.asarray(cs["genes"]).astype(str))
+            gi = gi[~gi.index.duplicated()].reindex(
+                [str(v) for v in self.var_names])
+            if gi.isna().all():
+                raise ValueError(
+                    "`cellspace` shares no gene name with this object.")
+            self._cs_gene = gi.fillna(-1).to_numpy().astype(np.int64)
+            r_ = row.to_numpy().astype(int)
+            self.cellspace = dict(
+                M=np.ascontiguousarray(cs["M"][r_]),
+                sw=np.ascontiguousarray(cs["sw"][r_]),
+                own=np.ascontiguousarray(cs["own"][r_]).astype(np.int64),
+                P=np.ascontiguousarray(cs["P"]),
+                gene_index=self._cs_gene,
+            )
+            n_missing = int((self._cs_gene < 0).sum())
+            if n_missing:
+                warnings.warn(
+                    f"{n_missing} of {len(self._cs_gene)} genes absent from "
+                    "`cellspace`; their cell-space correction is 0.",
+                    stacklevel=2)
+
         self.spatial = np.asarray(adata.obsm["spatial"]) if "spatial" in adata.obsm else None
 
     def fit(
@@ -201,6 +270,7 @@ class Regression:
             drift=self.drift,
             κ_prior_μ=κ_prior_μ,
             κ_prior_σ=κ_prior_σ,
+            cellspace=self.cellspace,
         )
         if device is not None:
             model = model.to(device)
@@ -467,11 +537,13 @@ class RegressionModel(nn.Module):
         drift: np.ndarray | None = None,
         κ_prior_μ: float = 0.0,
         κ_prior_σ: float | None = None,
+        cellspace: dict | None = None,
     ):
         super().__init__()
 
         self.include_mixing = include_mixing
         self.include_drift = drift is not None
+        self.include_cellspace = cellspace is not None
 
         # Needed to weight the KL against a minibatch's share of the likelihood.
         self.ncells = ncells
@@ -520,6 +592,17 @@ class RegressionModel(nn.Module):
         # reduction, not merely absorbing ignorance.
         self.κ_prior_μ = κ_prior_μ
         self.κ_prior_σ = κ_prior_σ
+        if cellspace is not None:
+            # frac is rebuilt per minibatch from these; materializing it would be
+            # 3.0 GB on the Atera panel. One kappa, as for the drift term.
+            for nm, arr, dt in (("cs_M", cellspace["M"], torch.float32),
+                                ("cs_sw", cellspace["sw"], torch.float32),
+                                ("cs_own", cellspace["own"], torch.long),
+                                ("cs_P", cellspace["P"], torch.float32),
+                                ("cs_gene", cellspace["gene_index"], torch.long)):
+                self.register_buffer(nm, torch.as_tensor(
+                    np.ascontiguousarray(arr)).to(dt).clone())
+            self.κ_cs = nn.Parameter(torch.zeros(()))
         if drift is not None:
             # np.ascontiguousarray: a reindexed DataFrame's array can be read-only,
             # which torch warns about and would make the buffer's writability
@@ -549,7 +632,10 @@ class RegressionModel(nn.Module):
         # -- what is reported -- is what is left after it. β is penalized and κ is
         # not, which is what makes the split identifiable; see Regression.__init__.
         β_eff = β + self.κ.unsqueeze(1) * self.u if self.include_drift else β
-        λ = torch.exp(batch.design @ β_eff + self.gene_bias + batch.log_size.unsqueeze(1))
+        η = batch.design @ β_eff + self.gene_bias + batch.log_size.unsqueeze(1)
+        if self.include_cellspace:
+            η = η + self.κ_cs * self.cellspace_frac(batch)
+        λ = torch.exp(η)
 
         λ_obs = self.mix(λ, batch)
 
@@ -573,6 +659,28 @@ class RegressionModel(nn.Module):
                        / (2.0 * self.κ_prior_σ ** 2)) * (batch.nreceivers / self.ncells)
 
         return -ll.sum() + kl
+
+    def cellspace_frac(self, batch: RegressionBatch) -> Tensor:
+        """frac[i, g] for this batch's nodes, [nnodes, ngenes].
+
+            F = M_i @ P          what the donor neighbourhood expresses
+            O = sw_i * P[own_i]  what the cell's own cluster expresses
+            frac = F / (F + O)
+
+        Rebuilt rather than stored: the full field is 3.0 GB on Atera, while a
+        2048-node batch is ~137 MB. Genes absent from the field get 0, which makes
+        their correction a no-op rather than a NaN.
+        """
+        idx = batch.nodes
+        F = self.cs_M[idx] @ self.cs_P                     # [nnodes, ngenes_field]
+        O = self.cs_sw[idx].unsqueeze(1) * self.cs_P[self.cs_own[idx]]
+        frac = F / (F + O).clamp(min=1e-9)
+        g = self.cs_gene
+        out = torch.zeros((frac.shape[0], g.shape[0]), dtype=frac.dtype,
+                          device=frac.device)
+        keep = g >= 0
+        out[:, keep] = frac[:, g[keep]]
+        return out
 
     def β_kl(self) -> Tensor:
         """KL(q(β) || N(0, β_prior_σ²)), summed over all covariates and genes."""

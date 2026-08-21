@@ -29,6 +29,11 @@ class RegressionBatch:
     weights: Tensor  # mixing amount, one entry per edge
     bg_weight: Tensor  # [nnodes] mixing weight with bg
 
+    # [nnodes] each node's index in the FULL cell ordering, receivers first.
+    # Needed by any term that carries a per-cell quantity the loader does not
+    # already stage (the cell-space drift field); nothing else reads it.
+    nodes: Tensor
+
 
 @dataclass
 class _TilePlan:
@@ -56,6 +61,7 @@ class _TilePlan:
     receivers: Tensor
     senders: Tensor
     weights: Tensor
+    nodes: Tensor
 
 
 def _ragged_gather(
@@ -192,6 +198,7 @@ class RegressionBatchLoader:
             receivers=self._stage(receivers),
             senders=self._stage(senders),
             weights=self._stage(weights),
+            nodes=self._stage(batch_idx.astype(np.int64)),
         )
 
     def _to_device(self, x: Tensor) -> Tensor:
@@ -216,6 +223,7 @@ class RegressionBatchLoader:
             senders=self._to_device(plan.senders),
             weights=self._to_device(plan.weights),
             bg_weight=self._to_device(plan.bg_weight),
+            nodes=self._to_device(plan.nodes),
         )
 
     def __iter__(self):
