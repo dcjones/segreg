@@ -47,7 +47,7 @@ class Regression:
                  mixing_interval_correction: bool=False, include_drift: bool=False,
                  drift: pd.DataFrame | None=None, include_cellspace: bool=False,
                  cellspace: dict | None=None, cellspace_percluster: bool=False,
-                 cellspace_shrink_σ: float=1.0, propagate_κ: bool=False,
+                 cellspace_shrink_σ: float=1.0, propagate_κ: bool | None=None,
                  κ_rel_sd: float | None=None):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
@@ -88,7 +88,18 @@ class Regression:
         #
         # Both change only posterior_sd(); neither touches the fit or a point
         # estimate. They compose (variances add).
-        self.propagate_κ = propagate_κ
+        #
+        # `propagate_κ=None` (the default) resolves to ON whenever there IS a drift
+        # term and off otherwise, because measured on both benchmark datasets it is
+        # free where it cannot help and a real gain where it can: on the 313-gene
+        # panel it moves FP panel 0.250 -> 0.217 and cur FP 0.289 -> 0.257 for FN
+        # +0.003, a ~10:1 exchange, while on the 16.7k-gene panel every metric is
+        # unchanged to 3-4 decimals (§65). It cannot cost power in the ordinary
+        # sense either -- it only widens intervals, and only the pairs whose β
+        # actually depended on the split. Pass False explicitly for the
+        # κ-conditional interval, which is what every result before §65 used.
+        self.propagate_κ = (include_drift if propagate_κ is None
+                            else propagate_κ)
         self.κ_rel_sd = κ_rel_sd
         # --- the CELL-SPACE alternative to the drift term ------------------------
         # `include_drift` adds kappa*u to the COEFFICIENT, where u is frac projected
