@@ -49,7 +49,8 @@ class Regression:
                  cellspace: dict | None=None, cellspace_percluster: bool=False,
                  cellspace_shrink_σ: float=1.0, propagate_κ: bool | None=None,
                  κ_rel_sd: float | None=None, include_donor_scale: bool=False,
-                 donor_clusters: np.ndarray | None=None):
+                 donor_clusters: np.ndarray | None=None,
+                 include_cell_size: bool=False):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -293,10 +294,26 @@ class Regression:
         self.bg_mix_rate = (to_bg_trans_count / normalizer).astype(np.float32)
 
         # Observed totals are very nearly a fixed point of the mixing model
-        # (median relative error of A @ s + bg vs s is -0.2%), so we can use them
-        # as a fixed offset rather than fitting per-cell size factors.
+        # (median relative error of A @ s + bg vs s is -0.2%), so they are used as a
+        # fixed offset rather than fitting per-cell size factors.
+        #
+        # ⚠ THAT FIXED POINT IS A MEDIAN, AND THE COST IS A SPREAD (simple-seg-sim
+        # DESIGN_v2 §74). Summing the model over genes gives cell i a predicted total
+        # of `sum_j A[i,j] gamma_j s_j + b_i s_i`, a weighted average of its
+        # NEIGHBOURS' totals, and `rho_i = predicted/observed` is exactly 1 for every
+        # cell only when mixing is off. Its median is indeed ~1 on both benchmark
+        # datasets (1.015 breast / 1.056 Atera) while its SPREAD is not (sd log rho
+        # 0.247 vs 0.711; 5.2% vs 16.8% of cells beyond 0.5 in log). The Poisson cost
+        # of a scale error goes like c (log rho)²/2, so it is billed on the spread:
+        # measured, it accounts for 0.6-0.7 of a 37.7 nats/cell penalty that made
+        # mixing WORSE than no mixing on the 16.7k-gene panel.
+        #
+        # `include_cell_size` is the response: a per-cell log-scale learned as a
+        # DEVIATION from this offset, so that unset (or shrunk hard) reproduces the
+        # behaviour above exactly.
         counts = np.asarray(self.X.sum(axis=1)).squeeze()
         self.log_size = np.log(np.maximum(counts, 1)).astype(np.float32)
+        self.include_cell_size = include_cell_size
 
         if self.cellspace is not None:
             cs = self.cellspace
@@ -347,6 +364,7 @@ class Regression:
         κ_prior_μ: float = 0.0,
         κ_prior_σ: float | None = None,
         u_prior_σ: float = 0.1,
+        size_prior_σ: float = 0.2,
         seed: int | None = None,
         device: torch.device | str | None = None,
         verbose: bool = True,
@@ -375,6 +393,7 @@ class Regression:
         # normal" and "cauchy" look identical in a topline.
         self.β_prior = β_prior
         self.u_prior_σ = u_prior_σ
+        self.size_prior_σ = size_prior_σ
 
         ncells, ngenes = self.X.shape
         model = RegressionModel(
@@ -392,6 +411,8 @@ class Regression:
             cellspace_shrink_σ=self.cellspace_shrink_σ,
             donor_clusters=self.donor_clusters,
             u_prior_σ=u_prior_σ,
+            include_cell_size=self.include_cell_size,
+            size_prior_σ=size_prior_σ,
         )
         if device is not None:
             model = model.to(device)
@@ -572,6 +593,11 @@ class Regression:
 
         X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
         log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
+        # The FITTED offset, for the same reason the fitted operator is used below:
+        # a Laplace at rates the model never used is the curvature of a different
+        # model. This CONDITIONS on δ̂ rather than marginalizing it.
+        if getattr(m, "include_cell_size", False):
+            log_size = log_size + m.δ_size.detach().to(dev).double()
         # The FITTED operator, not proseg's raw one. With a donor-cluster scale the
         # model's mixing matrix is A' -- off-diagonals scaled by exp(u) and rows
         # renormalized -- so computing the Laplace against A would evaluate the
@@ -829,6 +855,26 @@ class Regression:
         return pd.DataFrame({"cluster": np.arange(len(u)), "u": u, "u_sd": sd,
                              "scale": np.exp(u)})
 
+    def get_cell_sizes(self) -> pd.DataFrame:
+        """The fitted per-cell size factor, one row per cell.
+
+        `delta` is the learned deviation from `log(observed total)` and `scale` is
+        exp of it, so scale 1 means the cell kept the fixed offset. `log_size_fixed`
+        is that offset and `log_size_fitted` is what the model actually used.
+
+        Read `delta` against `log_size_fixed`: a δ that is uncorrelated with the
+        cell's total is the mixing correction the offset could not express, while a δ
+        that tracks the total is the model disagreeing about depth itself -- and the
+        latter is the case where it can compete with the DE signal, since a planted
+        effect carrying real mass moves the total too (DESIGN_v2 §74).
+        """
+        if self.model is None or not getattr(self.model, "include_cell_size", False):
+            raise Exception("no cell size factor on this fit")
+        d = self.model.δ_size.detach().cpu().numpy().astype(np.float64)
+        return pd.DataFrame({"delta": d, "scale": np.exp(d),
+                             "log_size_fixed": self.log_size.astype(np.float64),
+                             "log_size_fitted": self.log_size.astype(np.float64) + d})
+
     def get_cellspace_scales(self) -> np.ndarray:
         """The fitted cell-space kappa: a scalar, or one per Leiden cluster."""
         if self.model is None or not self.include_cellspace:
@@ -908,6 +954,8 @@ class RegressionModel(nn.Module):
         cellspace_shrink_σ: float = 1.0,
         donor_clusters: np.ndarray | None = None,
         u_prior_σ: float = 0.1,
+        include_cell_size: bool = False,
+        size_prior_σ: float = 0.2,
     ):
         super().__init__()
 
@@ -927,6 +975,26 @@ class RegressionModel(nn.Module):
             self.n_donor_clusters = K
             self.u_μ = nn.Parameter(torch.zeros(K))
             self.u_logσ = nn.Parameter(torch.full((K,), -3.0))
+        # A per-cell log-scale, learned as a DEVIATION from log(observed total):
+        # `log_size_eff[i] = log_size[i] + δ_size[i]`, with a N(0, size_prior_σ²)
+        # shrinkage penalty. δ = 0 is exactly the fixed offset, so the prior width is
+        # the whole knob and the status quo is one end of it.
+        #
+        # It sits on λ, BEFORE the mixing, which is the point: a scale applied to the
+        # observed side would fix each cell's own predicted total and still hand every
+        # neighbour the wrong donor rate. Here a cell's scale propagates through A to
+        # everyone it donates to, which is what makes this a deconvolution of the
+        # totals rather than a per-cell fudge factor. It scales the background term
+        # with the cell too, since `bg_weight` is a FRACTION of the cell's own size.
+        #
+        # MAP rather than variational, following δ_cs: each δ has ngenes observations
+        # behind it, so the posterior is sharp and the mode is nearly the mean. β's
+        # interval therefore CONDITIONS on δ̂ -- the same gap κ had before propagate_κ
+        # and u has now.
+        self.include_cell_size = include_cell_size
+        self.size_prior_σ = size_prior_σ
+        if include_cell_size:
+            self.δ_size = nn.Parameter(torch.zeros(ncells))
         self.include_cellspace = cellspace is not None
         self.cellspace_percluster = False
 
@@ -1044,7 +1112,10 @@ class RegressionModel(nn.Module):
         # -- what is reported -- is what is left after it. β is penalized and κ is
         # not, which is what makes the split identifiable; see Regression.__init__.
         β_eff = β + self.κ.unsqueeze(1) * self.u if self.include_drift else β
-        η = batch.design @ β_eff + self.gene_bias + batch.log_size.unsqueeze(1)
+        log_size = batch.log_size
+        if self.include_cell_size:
+            log_size = log_size + self.δ_size[batch.nodes]
+        η = batch.design @ β_eff + self.gene_bias + log_size.unsqueeze(1)
         if self.include_cellspace:
             κc = self.κ_cs
             if self.cellspace_percluster:
@@ -1060,7 +1131,7 @@ class RegressionModel(nn.Module):
             else:
                 u = self.u_μ
 
-        λ_obs = self.mix(λ, batch, u=u)
+        λ_obs = self.mix(λ, batch, u=u, log_size=log_size)
 
         # Senders-only nodes exist to supply λ for the mixing; only receivers are
         # modeled, so the likelihood is over the leading block of the batch.
@@ -1085,6 +1156,10 @@ class RegressionModel(nn.Module):
                            batch.nreceivers / self.ncells)
         if self.include_donor_scale:
             kl = kl + self.u_kl() * (batch.nreceivers / self.ncells)
+        if self.include_cell_size:
+            kl = kl + ((self.δ_size ** 2).sum()
+                       / (2.0 * self.size_prior_σ ** 2)) * (
+                           batch.nreceivers / self.ncells)
         if self.include_drift and self.κ_prior_σ is not None:
             kl = kl + (((self.κ - self.κ_prior_μ) ** 2).sum()
                        / (2.0 * self.κ_prior_σ ** 2)) * (batch.nreceivers / self.ncells)
@@ -1154,7 +1229,8 @@ class RegressionModel(nn.Module):
         return (np.log(self.u_prior_σ) - lg
                 + (torch.exp(2.0 * lg) + self.u_μ ** 2) / (2.0 * pv) - 0.5).sum()
 
-    def mix(self, λ: Tensor, batch: RegressionBatch, u: Tensor | None = None) -> Tensor:
+    def mix(self, λ: Tensor, batch: RegressionBatch, u: Tensor | None = None,
+            log_size: Tensor | None = None) -> Tensor:
         """Corrupt per-cell rates by missegmentation, [nnodes, ngenes] -> [nreceivers, ngenes].
 
         A[i,j] is the posterior probability that a molecule counted in cell i was
@@ -1200,7 +1276,8 @@ class RegressionModel(nn.Module):
         # fraction of cell i's molecules that came from background, so this has
         # to be scaled by the cell's own size and bg_rates is a profile over
         # genes rather than an absolute rate.
-        bg = batch.bg_weight[:nr] * torch.exp(batch.log_size[:nr])
+        ls = batch.log_size if log_size is None else log_size
+        bg = batch.bg_weight[:nr] * torch.exp(ls[:nr])
         return λ_obs + bg.unsqueeze(1) * torch.softmax(self.bg_rates, dim=-1)
 
     def negbinom_likelihood(self, λ: Tensor, X: Tensor) -> Tensor:
