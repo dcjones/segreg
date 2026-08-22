@@ -48,7 +48,8 @@ class Regression:
                  drift: pd.DataFrame | None=None, include_cellspace: bool=False,
                  cellspace: dict | None=None, cellspace_percluster: bool=False,
                  cellspace_shrink_σ: float=1.0, propagate_κ: bool | None=None,
-                 κ_rel_sd: float | None=None):
+                 κ_rel_sd: float | None=None, include_donor_scale: bool=False,
+                 donor_clusters: np.ndarray | None=None):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -101,6 +102,54 @@ class Regression:
         self.propagate_κ = (include_drift if propagate_κ is None
                             else propagate_κ)
         self.κ_rel_sd = κ_rel_sd
+
+        # --- a LEARNED scale on A's off-diagonal, indexed by the DONOR's cluster --
+        # A is otherwise a known constant. This makes it uncertain in the one way
+        # that is both identified and cheap: one scalar per unsupervised donor
+        # cluster, `A'[i,j] = A[i,j] exp(u_c(j))`, with each row renormalized so its
+        # total (and therefore the background share) is untouched.
+        #
+        # WHY THIS PARAMETERIZATION, from simple-seg-sim DESIGN_v2 §71-§72:
+        #   * per-cell freedom cannot work -- missegmentation is not independent
+        #     noise, so per-cell adjustment adds variance without touching the
+        #     correlated part that makes coefficients spurious;
+        #   * a constant or per-gene scale is too crude, and cell-type indexing needs
+        #     annotations this model does not assume;
+        #   * a donor-cluster scale IS identified by data: 76-81% of the variance of
+        #     each cell's donor-composition vector is orthogonal to the design
+        #     (against the drift covariate's 0%, which is why κ was exactly flat and
+        #     had to be settled by a prior), and only ~1% lies on the exposure
+        #     columns, so it cannot steal the DE signal;
+        #   * and it captures ~47-60% of the variance of A's error where it MATTERS,
+        #     i.e. projected onto the coefficients, at correlation 0.93 -- against
+        #     only 13% of A's raw off-diagonal L1 error, which is why §71's
+        #     truth-matching experiment looked so much worse than this.
+        #
+        # ⚠ THE INTERVAL PAYOFF IS NOT AUTOMATIC. Mean-field VI factorizes
+        # q(β, u) = q(β)q(u), so it carries no β-u posterior correlation and β's
+        # reported width stays at its CONDITIONAL value. §72's measured effect --
+        # A's error correlated across cells by ~3 orders of magnitude over an
+        # independent-rows model, worth ~1.2-1.4x in sd -- reaches β's interval only
+        # once u is MARGINALIZED in posterior_sd, exactly as κ is under propagate_κ.
+        # This object fits u and applies it consistently; the marginalization is a
+        # separate step and is not done here.
+        self.include_donor_scale = include_donor_scale
+        self.donor_clusters = None
+        if include_donor_scale:
+            if donor_clusters is None:
+                raise ValueError(
+                    "include_donor_scale=True requires `donor_clusters`: an integer "
+                    "label per cell, in this object's cell order, giving the cluster "
+                    "a cell belongs to WHEN IT ACTS AS A DONOR. -1 means unlabelled, "
+                    "and such a donor's weight is left exactly as proseg had it.")
+            dc = np.asarray(donor_clusters).astype(np.int64).ravel()
+            if len(dc) != adata.n_obs:
+                raise ValueError(
+                    f"`donor_clusters` has {len(dc)} entries for {adata.n_obs} cells")
+            self.donor_clusters = dc
+        elif donor_clusters is not None:
+            raise ValueError(
+                "`donor_clusters` supplied but include_donor_scale is False")
         # --- the CELL-SPACE alternative to the drift term ------------------------
         # `include_drift` adds kappa*u to the COEFFICIENT, where u is frac projected
         # onto the design; this adds kappa*frac[i,g] to each cell's linear predictor
@@ -297,6 +346,7 @@ class Regression:
         β_prior_σ: float = 1.0,
         κ_prior_μ: float = 0.0,
         κ_prior_σ: float | None = None,
+        u_prior_σ: float = 0.1,
         seed: int | None = None,
         device: torch.device | str | None = None,
         verbose: bool = True,
@@ -324,6 +374,7 @@ class Regression:
         # `requires:` check resolves attributes here, and "cauchy but silently
         # normal" and "cauchy" look identical in a topline.
         self.β_prior = β_prior
+        self.u_prior_σ = u_prior_σ
 
         ncells, ngenes = self.X.shape
         model = RegressionModel(
@@ -339,6 +390,8 @@ class Regression:
             cellspace=self.cellspace,
             cellspace_percluster=self.cellspace_percluster,
             cellspace_shrink_σ=self.cellspace_shrink_σ,
+            donor_clusters=self.donor_clusters,
+            u_prior_σ=u_prior_σ,
         )
         if device is not None:
             model = model.to(device)
@@ -519,6 +572,14 @@ class Regression:
 
         X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
         log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
+        # The FITTED operator, not proseg's raw one. With a donor-cluster scale the
+        # model's mixing matrix is A' -- off-diagonals scaled by exp(u) and rows
+        # renormalized -- so computing the Laplace against A would evaluate the
+        # curvature of a model that was never fitted. Note this does NOT marginalize
+        # u: it conditions on û, exactly as the interval conditioned on a point κ
+        # before propagate_κ existed, and it is the same gap.
+        self.A = self._scaled_A() if getattr(m, "include_donor_scale", False) \
+            else self.A
         A = torch.sparse_csr_tensor(
             torch.as_tensor(self.A.indptr, dtype=torch.int64, device=dev),
             torch.as_tensor(self.A.indices, dtype=torch.int64, device=dev),
@@ -734,6 +795,40 @@ class Regression:
                 "call posterior_sd() on a propagate_κ model before κ_posterior_sd")
         return np.sqrt(np.diag(cov))
 
+    def _scaled_A(self) -> csr_matrix:
+        """proseg's A with the fitted donor-cluster scale applied, rows renormalized
+        to their original totals -- the operator the fit actually used."""
+        u = self.model.u_μ.detach().cpu().numpy().astype(np.float64)
+        dc = self.donor_clusters
+        C = self.A.tocoo()
+        off = C.row != C.col
+        lab = dc[C.col]
+        sc = np.ones(len(C.data), dtype=np.float64)
+        ok = off & (lab >= 0)
+        sc[ok] = np.exp(u[lab[ok]])
+        new = C.data.astype(np.float64) * sc
+        n = self.A.shape[0]
+        old_tot = np.bincount(C.row, weights=C.data.astype(np.float64), minlength=n)
+        new_tot = np.bincount(C.row, weights=new, minlength=n)
+        f = np.where(new_tot > 0, old_tot / np.maximum(new_tot, 1e-300), 1.0)
+        out = coo_matrix((new * f[C.row], (C.row, C.col)), shape=self.A.shape)
+        return out.tocsr().astype(np.float32)
+
+    def get_donor_scales(self) -> pd.DataFrame:
+        """The fitted donor-cluster scale, one row per cluster.
+
+        Auditability, not a result: `exp(u)` is the factor by which a donor cluster's
+        contribution to every neighbour was raised or lowered relative to proseg's
+        estimate, and `sd` is what the data had to say about it. A cluster whose sd is
+        at the prior width was not identified by anything.
+        """
+        if self.model is None or not getattr(self.model, "include_donor_scale", False):
+            raise Exception("no donor scale on this fit")
+        u = self.model.u_μ.detach().cpu().numpy()
+        sd = np.exp(self.model.u_logσ.detach().cpu().numpy().clip(max=2.0))
+        return pd.DataFrame({"cluster": np.arange(len(u)), "u": u, "u_sd": sd,
+                             "scale": np.exp(u)})
+
     def get_cellspace_scales(self) -> np.ndarray:
         """The fitted cell-space kappa: a scalar, or one per Leiden cluster."""
         if self.model is None or not self.include_cellspace:
@@ -811,11 +906,27 @@ class RegressionModel(nn.Module):
         cellspace: dict | None = None,
         cellspace_percluster: bool = False,
         cellspace_shrink_σ: float = 1.0,
+        donor_clusters: np.ndarray | None = None,
+        u_prior_σ: float = 0.1,
     ):
         super().__init__()
 
         self.include_mixing = include_mixing
         self.include_drift = drift is not None
+        # A's donor-cluster scale. u is variational like β (mean-field), with a
+        # N(0, u_prior_σ²) prior; the scale multiplies each off-diagonal weight and
+        # every row is renormalized to its ORIGINAL total, so the background share is
+        # exactly untouched -- §55 measured slack at 15x the matrix effect, so letting
+        # it move would make this experiment about slack instead.
+        self.include_donor_scale = donor_clusters is not None
+        self.u_prior_σ = u_prior_σ
+        if donor_clusters is not None:
+            self.register_buffer("donor_cluster", torch.as_tensor(
+                np.ascontiguousarray(donor_clusters), dtype=torch.long).clone())
+            K = int(np.asarray(donor_clusters).max()) + 1
+            self.n_donor_clusters = K
+            self.u_μ = nn.Parameter(torch.zeros(K))
+            self.u_logσ = nn.Parameter(torch.full((K,), -3.0))
         self.include_cellspace = cellspace is not None
         self.cellspace_percluster = False
 
@@ -941,7 +1052,15 @@ class RegressionModel(nn.Module):
             η = η + κc * self.cellspace_frac(batch)
         λ = torch.exp(η)
 
-        λ_obs = self.mix(λ, batch)
+        u = None
+        if self.include_donor_scale:
+            if self.training:
+                u_σ = torch.exp(self.u_logσ.clamp(max=2.0))
+                u = self.u_μ + torch.randn_like(u_σ) * u_σ
+            else:
+                u = self.u_μ
+
+        λ_obs = self.mix(λ, batch, u=u)
 
         # Senders-only nodes exist to supply λ for the mixing; only receivers are
         # modeled, so the likelihood is over the leading block of the batch.
@@ -964,6 +1083,8 @@ class RegressionModel(nn.Module):
             kl = kl + ((self.δ_cs ** 2).sum()
                        / (2.0 * self.cellspace_shrink_σ ** 2)) * (
                            batch.nreceivers / self.ncells)
+        if self.include_donor_scale:
+            kl = kl + self.u_kl() * (batch.nreceivers / self.ncells)
         if self.include_drift and self.κ_prior_σ is not None:
             kl = kl + (((self.κ - self.κ_prior_μ) ** 2).sum()
                        / (2.0 * self.κ_prior_σ ** 2)) * (batch.nreceivers / self.ncells)
@@ -1026,7 +1147,14 @@ class RegressionModel(nn.Module):
             - 0.5
         ).sum()
 
-    def mix(self, λ: Tensor, batch: RegressionBatch) -> Tensor:
+    def u_kl(self) -> Tensor:
+        """KL(q(u) || N(0, u_prior_σ²)) over the donor-cluster scales."""
+        lg = self.u_logσ.clamp(max=2.0)
+        pv = self.u_prior_σ ** 2
+        return (np.log(self.u_prior_σ) - lg
+                + (torch.exp(2.0 * lg) + self.u_μ ** 2) / (2.0 * pv) - 0.5).sum()
+
+    def mix(self, λ: Tensor, batch: RegressionBatch, u: Tensor | None = None) -> Tensor:
         """Corrupt per-cell rates by missegmentation, [nnodes, ngenes] -> [nreceivers, ngenes].
 
         A[i,j] is the posterior probability that a molecule counted in cell i was
@@ -1039,8 +1167,31 @@ class RegressionModel(nn.Module):
         if not self.include_mixing:
             return λ[:nr, :]
 
+        w = batch.weights
+        if u is not None:
+            # Off-diagonal weights scale by exp(u) of the DONOR's cluster, then each
+            # row is renormalized to its original total. Renormalizing (rather than
+            # letting the diagonal absorb additively) keeps every weight positive
+            # with no clipping, and holds the row total -- hence the background
+            # share -- exactly fixed. Self edges are exactly `senders == receivers`,
+            # because receivers occupy local positions 0..nreceivers-1; and every
+            # edge of a receiver is present in its batch, so the row sums below are
+            # complete rather than partial.
+            d = self.donor_cluster[batch.nodes[batch.senders]]
+            sc = torch.where(d >= 0, torch.exp(u[d.clamp(min=0)]),
+                             torch.ones((), dtype=w.dtype, device=w.device))
+            is_self = batch.senders == batch.receivers
+            sc = torch.where(is_self, torch.ones_like(sc), sc)
+            w_new = w * sc
+            nr_ = batch.nreceivers
+            old_tot = torch.zeros(nr_, dtype=w.dtype, device=w.device)
+            old_tot.index_add_(0, batch.receivers, w)
+            new_tot = torch.zeros(nr_, dtype=w.dtype, device=w.device)
+            new_tot.index_add_(0, batch.receivers, w_new)
+            w = w_new * (old_tot / new_tot.clamp(min=1e-12))[batch.receivers]
+
         # [nedges, ngenes], one row per (receiver, sender) pair
-        contrib = batch.weights.unsqueeze(1) * λ[batch.senders, :]
+        contrib = w.unsqueeze(1) * λ[batch.senders, :]
 
         λ_obs = torch.zeros((nr, λ.shape[1]), dtype=λ.dtype, device=λ.device)
         λ_obs.index_add_(0, batch.receivers, contrib)
