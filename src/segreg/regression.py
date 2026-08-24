@@ -5,7 +5,7 @@ from typing import cast
 from anndata import AnnData
 from patsy import dmatrix
 from patsy.design_info import DesignMatrix
-from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse import coo_matrix, csr_matrix, issparse
 from spatialdata import SpatialData
 from torch import Tensor
 import numpy as np
@@ -50,7 +50,7 @@ class Regression:
                  cellspace_shrink_σ: float=1.0, propagate_κ: bool | None=None,
                  κ_rel_sd: float | None=None, include_donor_scale: bool=False,
                  donor_clusters: np.ndarray | None=None,
-                 include_cell_size: bool=False):
+                 include_cell_size: bool=False, quasi_interval: bool=False):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -64,6 +64,39 @@ class Regression:
         # reallocation induces between cells sharing a donor. Off by default, and
         # it changes only posterior_sd() -- never the fit, never a point estimate.
         self.mixing_interval_correction = mixing_interval_correction
+        # --- what VARIANCE FUNCTION the reported interval is built from ----------
+        # The likelihood's own NB curvature, r/(mu(r+mu)), or the quasi-Poisson one,
+        # 1/(phi_g mu), with phi_g the per-gene Pearson dispersion of the same fit.
+        # Off by default: the NB weight is the model's own curvature and swapping it
+        # is a claim about the variance function, not a bug fix. Like
+        # mixing_interval_correction it changes only posterior_sd() -- never the fit,
+        # never a point estimate.
+        #
+        # WHY IT IS HERE (simple-seg-sim DESIGN_v2 §84-§85). Graded against the true
+        # sampling sd -- measured across emission replicates, so it references no
+        # truth at all -- the NB interval is 1.55x (313-gene panel) to 1.95x
+        # (16.7k-gene panel) too WIDE on the well-measured coefficients, and that
+        # width is the entire power deficit against a plain quasi-Poisson GLM. Two
+        # things cause it and they compound:
+        #
+        #   * r_hat is biased LOW. The fitted NB variance claims ~2x the squared
+        #     residual the data shows at the fitted mean, on 84-91% of genes.
+        #   * the mu^2/r term MISPLACES that error. NB information per cell saturates
+        #     at r as mu grows while quasi-Poisson information keeps growing, so a
+        #     uniform level error in r_hat becomes an abundance-GRADED width error:
+        #     sd_qp/sd_nb is ~1.0 at the median pair and 0.49-0.53 on the abundant
+        #     genes, which is where any real effect is measurable in the first place.
+        #
+        # Measured, the swap lands on the sampling sd (reported/empirical 1.55 -> 0.89
+        # and 1.95 -> 0.93) and is a Pareto move rather than a trade: it makes the
+        # interval WIDER on nulls and NARROWER on effects at the same time, so false
+        # positives fall with false negatives.
+        #
+        # It is NOT a substitute for the sandwich and the two may not be combined:
+        # both re-state the same covariance from different premises (a different
+        # variance function vs. a between-cell correlation the variance function
+        # cannot express), and composing them would double-count.
+        self.quasi_interval = quasi_interval
         self.include_drift = include_drift
         # --- what β's INTERVAL knows about κ -------------------------------------
         # Reported β is what is left after δ = κ*u, so β's uncertainty ought to
@@ -511,8 +544,8 @@ class Regression:
                   f"{d['loss_tail_share']:.4f}")
         return model
 
-    def posterior_sd(self, chunk: int = 16, sandwich: bool | None = None
-                     ) -> npt.NDArray[np.float64]:
+    def posterior_sd(self, chunk: int = 16, sandwich: bool | None = None,
+                     quasi: bool | None = None) -> npt.NDArray[np.float64]:
         """Marginal posterior sd of β, [ncovariates, ngenes].
 
         NOT `exp(β_logσ)`. The surrogate posterior is factorized over every
@@ -536,6 +569,15 @@ class Regression:
         cell with η = log μ, so H = J' diag(w) J where J = dμ/dβ. Mixing enters only
         through J: λ is the cell's own rate but μ is A λ + background, so
         J = A diag(λ) X rather than diag(λ) X.
+
+        WITH `quasi` the weight becomes the QUASI-POISSON one, 1/(φ_g μ), with φ_g
+        the per-gene Pearson dispersion at this fitted mean. Only w changes -- same
+        J, same prior curvature, same algebra -- because the claim is about the
+        variance FUNCTION and nothing else. It matters most where the NB weight
+        saturates: r/(μ(r+μ)) → r as μ grows, so NB information stops responding to
+        the data on exactly the well-measured genes, while 1/(φ_g μ) keeps
+        responding. See `quasi_interval` in __init__ for the measurement that
+        motivates it, and note the two may not be combined with the sandwich.
 
         The prior's curvature (1/β_prior_σ² per coefficient) is added, and it is not
         a formality. Under mixing, spatially-intermixed cell types lose most of their
@@ -572,6 +614,20 @@ class Regression:
             raise Exception("fit() must be called before posterior_sd")
         if sandwich is None:
             sandwich = getattr(self, "mixing_interval_correction", False)
+        if quasi is None:
+            quasi = getattr(self, "quasi_interval", False)
+        if quasi and sandwich:
+            # Both replace the covariance the NB curvature implies, from premises
+            # that are not composable: `quasi` says the variance FUNCTION is wrong
+            # (phi*mu, not mu + mu^2/r) while the sandwich says the cells are
+            # CORRELATED at a variance function taken as given. Applying both would
+            # count the same excess scatter twice, once as dispersion and once as
+            # covariance. Refuse rather than emit a number nobody can interpret --
+            # the same call as for propagate_κ below.
+            raise ValueError(
+                "quasi_interval and the sandwich correction cannot be combined; "
+                "both restate the same covariance from different premises and "
+                "would double-count the excess scatter.")
         propagate = (getattr(self, "propagate_κ", False)
                      and getattr(self.model, "include_drift", False))
         if propagate and sandwich:
@@ -656,6 +712,9 @@ class Regression:
                 B, 1.0 / float(m.β_prior_σ) ** 2)
         eye = torch.eye(ncov, dtype=torch.float64, device=dev)
         out = np.empty((ncov, ngenes), dtype=np.float64)
+        # Recorded even when unused, so `interval_phi` is never a stale array from a
+        # previous call with a different flag.
+        phi_out = np.full(ngenes, np.nan, dtype=np.float64)
         if propagate:
             # u is [ncov, ngenes] and is a buffer, so it already follows .to(device).
             u_all = m.u.detach().double()
@@ -676,7 +735,25 @@ class Regression:
             else:
                 J = λ.unsqueeze(2) * X.unsqueeze(1)
                 μ = λ
-            w = r[sl].unsqueeze(0) / (μ * (r[sl].unsqueeze(0) + μ) + 1e-12)
+            if quasi:
+                # The QUASI-POISSON weight, 1/(phi_g mu), with phi_g the per-gene
+                # Pearson dispersion AT THIS FITTED MEAN -- the same estimator a
+                # quasi-Poisson GLM uses, so the two are directly comparable. It is
+                # computed here rather than at fit time on purpose: it must be the
+                # dispersion of the mean the interval is being reported around.
+                #
+                # Floored at 1, exactly as a quasi-Poisson GLM floors it: a gene
+                # measured as UNDER-dispersed relative to Poisson is a small-sample
+                # artifact, and letting phi < 1 would report an interval narrower
+                # than the Poisson one. Not capped above -- a genuinely wild gene
+                # deserves a wide interval, and that is the direction that is safe.
+                yb = self._counts_chunk(sl, dev)
+                res2 = (yb - μ) ** 2
+                φ = (res2 / μ.clamp(min=1e-10)).mean(0).clamp(min=1.0)
+                phi_out[sl] = φ.cpu().numpy()
+                w = 1.0 / (φ.unsqueeze(0) * μ + 1e-12)
+            else:
+                w = r[sl].unsqueeze(0) / (μ * (r[sl].unsqueeze(0) + μ) + 1e-12)
             K = torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2))
             # [G, ncov, ncov] diagonal, since the precision now varies by
             # coefficient as well as by gene.
@@ -800,12 +877,44 @@ class Regression:
         # The DECLARED misspecification term, independent of everything above: how
         # wrong κ might be, rather than how well this prior determines it. Mirrors
         # the post-hoc arm's kappa_rel_sd, and is an assumption of the same standing.
+        self._interval_phi = phi_out
         rel = getattr(self, "κ_rel_sd", None)
         if rel is not None and getattr(m, "include_drift", False):
             κ = m.κ.detach().double().cpu().numpy()[:, None]
             u_np = m.u.detach().double().cpu().numpy()
             out = np.sqrt(out**2 + (float(rel) * np.abs(κ) * np.abs(u_np)) ** 2)
         return out
+
+    def _counts_chunk(self, sl: slice, dev) -> Tensor:
+        """Observed counts for a slice of genes, as a dense [ncells, G] tensor.
+
+        Column-slicing a CSR matrix costs a pass over its nnz, and posterior_sd asks
+        for ~n_genes/chunk slices (over a thousand on a WTA panel), so the CSC copy
+        is built once and cached. It is the same nnz as self.X, not a densification.
+        """
+        X = self.X
+        if issparse(X):
+            csc = getattr(self, "_X_csc", None)
+            if csc is None:
+                csc = self._X_csc = X.tocsc()
+            blk = np.asarray(csc[:, sl].todense(), dtype=np.float64)
+        else:
+            blk = np.asarray(X[:, sl], dtype=np.float64)
+        return torch.as_tensor(blk, device=dev)
+
+    @property
+    def interval_phi(self) -> npt.NDArray[np.float64]:
+        """Per-gene Pearson dispersion the last `quasi` posterior_sd used.
+
+        NaN everywhere if that call did not use the quasi-Poisson weight, so a
+        caller recording it cannot mistake an NB fit's intervals for quasi ones.
+        Compare against `exp(model.log_r)`: the two are the same misfit measured
+        under different variance functions, and DESIGN_v2 §85 is the account.
+        """
+        phi = getattr(self, "_interval_phi", None)
+        if phi is None:
+            raise Exception("call posterior_sd() before interval_phi")
+        return phi
 
     def κ_posterior_sd(self) -> npt.NDArray[np.float64]:
         """Marginal posterior sd of κ, one per design column.
