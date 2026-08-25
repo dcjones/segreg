@@ -50,7 +50,8 @@ class Regression:
                  cellspace_shrink_σ: float=1.0, propagate_κ: bool | None=None,
                  κ_rel_sd: float | None=None, include_donor_scale: bool=False,
                  donor_clusters: np.ndarray | None=None,
-                 include_cell_size: bool=False, quasi_interval: bool=False):
+                 include_cell_size: bool=False, quasi_interval: bool=False,
+                 offset: npt.NDArray[np.float64] | pd.Series | None=None):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -346,6 +347,45 @@ class Regression:
         # behaviour above exactly.
         counts = np.asarray(self.X.sum(axis=1)).squeeze()
         self.log_size = np.log(np.maximum(counts, 1)).astype(np.float32)
+        # --- an EXTERNALLY SUPPLIED offset, replacing the observed total ----------
+        # The observed total is what the segmenter ASSIGNED to a cell -- its retained
+        # mass plus INFLOW -- while λ_i is the rate of what the cell EMITTED, retained
+        # plus OUTFLOW. A caller that can compute the emitted total (it is derivable
+        # from the segmenter's own transition matrix; see simple-seg-sim
+        # bench/scripts/flow_offset.py and DESIGN_v2 §95) can pass it here.
+        #
+        # A SEAM, not a mechanism: nothing in this class computes an offset, and the
+        # default is unchanged. It exists because the fixed-point argument above is a
+        # MEDIAN and the cost is a SPREAD, and because the offset is the one input the
+        # mixing model is known to be coupled to (§74) -- so whether a better offset
+        # helps is a question this class could not previously be asked.
+        #
+        # Supplied on the LOG scale and as a per-cell vector in this object's row
+        # order, or as a pandas Series indexed by `original_cell_id`, which is checked
+        # against the obs column rather than trusted -- a silent misalignment here
+        # would read as a weak result rather than as a bug.
+        self.offset_supplied = offset is not None
+        if offset is not None:
+            if isinstance(offset, pd.Series):
+                if "original_cell_id" not in adata.obs:
+                    raise ValueError(
+                        "offset given as a Series (indexed by original_cell_id) but "
+                        "the AnnData has no original_cell_id column to align to")
+                oid_o = np.asarray(adata.obs["original_cell_id"]).astype(np.int64)
+                v = offset.reindex(oid_o)
+                if v.isna().any():
+                    raise ValueError(
+                        f"offset is missing {int(v.isna().sum())} of {len(oid_o)} "
+                        "cells by original_cell_id; refusing to fill a size factor")
+                offset = v.to_numpy()
+            offset = np.asarray(offset, dtype=np.float64).squeeze()
+            if offset.shape != (self.X.shape[0],):
+                raise ValueError(
+                    f"offset has shape {offset.shape}, expected "
+                    f"({self.X.shape[0]},) -- one log-scale value per cell")
+            if not np.all(np.isfinite(offset)):
+                raise ValueError("offset contains non-finite values")
+            self.log_size = offset.astype(np.float32)
         self.include_cell_size = include_cell_size
 
         if self.cellspace is not None:
