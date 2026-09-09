@@ -11,6 +11,12 @@ dependencies = [
     "anndata>=0.13.2",
     "pandas>=3.0.5",
     "patsy>=1.0.2",
+    # The Leiden step of the in-model drift covariate (segreg/drift.py). A hard
+    # dependency, not an extra: the drift term is the leading correction and it is
+    # meant to run without a preprocessing step. `flavor="igraph"` is what scanpy's
+    # leiden uses here, so igraph rather than leidenalg.
+    "igraph>=0.11",
+    "scanpy>=1.11",
     "scipy>=1.18.0",
     "spatialdata>=0.8.0",
     "torch>=2.13.0",

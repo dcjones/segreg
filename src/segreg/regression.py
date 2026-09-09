@@ -15,6 +15,7 @@ import torch.nn as nn
 import pandas as pd
 import scipy.stats as stats
 
+from .drift import compute_drift
 from .loader import RegressionBatch, RegressionBatchLoader
 
 
@@ -51,7 +52,12 @@ class Regression:
                  κ_rel_sd: float | None=None, include_donor_scale: bool=False,
                  donor_clusters: np.ndarray | None=None,
                  include_cell_size: bool=False, quasi_interval: bool=False,
-                 offset: npt.NDArray[np.float64] | pd.Series | None=None):
+                 offset: npt.NDArray[np.float64] | pd.Series | None=None,
+                 drift_clusters: np.ndarray | None=None,
+                 drift_weights: str="none", drift_resolution: float=1.0,
+                 drift_n_pcs: int=50, drift_n_top_genes: int=2000,
+                 drift_gene_chunk: int=2000, drift_seed: int=0,
+                 drift_verbose: bool=True):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -248,9 +254,12 @@ class Regression:
         # --- the DRIFT covariate ------------------------------------------------
         # u[k, g] is the exposure slope of gene g's foreign share along design
         # column k -- the direction along which missegmentation biases a
-        # coefficient. Supplied rather than computed here: it depends on an
-        # unsupervised clustering of the counts, which is a preprocessing choice
-        # and does not belong inside the model.
+        # coefficient. COMPUTED HERE by default, from this object's own counts,
+        # transition matrix and design matrix (see drift.py for the construction
+        # and why it is the projection form). `drift=` remains as a seam for a
+        # covariate built some other way -- an oracle-built or deliberately
+        # perturbed u is how u's own robustness gets measured -- but the leading
+        # correction now needs no preprocessing step.
         #
         # WHY THIS IDENTIFIES. The mean model fits design @ (β + κ*u), so β and δ
         # = κ*u compete to explain the same exposure-correlated variation. What
@@ -264,29 +273,60 @@ class Regression:
         # Reported coefficients are β, NOT β + δ, so get_regression_coefficients()
         # returns the de-biased estimate without any change.
         self.drift = None
+        self.drift_supplied = drift is not None
+        self.drift_clusters = drift_clusters
+        # Recorded so a caller reading settings back off the object (bench's
+        # `resolved_kwargs` does exactly this) sees what the build actually used,
+        # not what the config asked for.
+        self.drift_weights = drift_weights
+        self.drift_resolution = drift_resolution
+        self.drift_n_pcs = drift_n_pcs
+        self.drift_n_top_genes = drift_n_top_genes
+        self.drift_gene_chunk = drift_gene_chunk
+        self.drift_seed = drift_seed
+        self.drift_verbose = drift_verbose
         if include_drift:
-            if drift is None:
-                raise ValueError(
-                    "include_drift=True requires `drift`: a DataFrame of the drift "
-                    "covariate, indexed by DESIGN COLUMN NAME with one column per "
-                    "gene. Rows/columns not present are filled with 0, so a "
-                    "covariate that only covers the exposure columns is fine."
-                )
             cols = list(self.design.design_info.column_names)
-            aligned = drift.reindex(index=cols, columns=self.var_names)
-            # A silent misalignment produces an all-zero u and an arm that looks
-            # like a no-op rather than like a bug, so it is an error.
-            n_ok = int(aligned.notna().any(axis=1).sum())
-            if n_ok == 0:
-                raise ValueError(
-                    "`drift` shares no index value with the design's column names. "
-                    f"Design columns look like {cols[:3]}; drift index looks like "
-                    f"{list(drift.index[:3])}. The index must be design column "
-                    "names, not cell-type labels."
+            if drift is None:
+                # The counts and the transition matrix are read straight off the
+                # AnnData rather than from self.X / self.A: the covariate is defined
+                # on the raw transition counts (background excluded), while self.A is
+                # row-normalized WITH background, and self.X may later be reassigned.
+                u, labels = compute_drift(
+                    adata.X,
+                    adata.obsp["state_transitions"],
+                    np.asarray(design_df, dtype=np.float64),
+                    self.var_names,
+                    clusters=drift_clusters,
+                    weights=drift_weights,
+                    resolution=drift_resolution,
+                    n_pcs=drift_n_pcs,
+                    n_top_genes=drift_n_top_genes,
+                    gene_chunk=drift_gene_chunk,
+                    seed=drift_seed,
+                    verbose=drift_verbose,
                 )
-            self.drift = aligned.fillna(0.0).to_numpy(dtype=np.float32)
+                self.drift_clusters = labels
+                self.drift = u.astype(np.float32)
+            else:
+                self.drift_clusters = None
+                aligned = drift.reindex(index=cols, columns=self.var_names)
+                # A silent misalignment produces an all-zero u and an arm that looks
+                # like a no-op rather than like a bug, so it is an error.
+                n_ok = int(aligned.notna().any(axis=1).sum())
+                if n_ok == 0:
+                    raise ValueError(
+                        "`drift` shares no index value with the design's column "
+                        f"names. Design columns look like {cols[:3]}; drift index "
+                        f"looks like {list(drift.index[:3])}. The index must be "
+                        "design column names, not cell-type labels."
+                    )
+                self.drift = aligned.fillna(0.0).to_numpy(dtype=np.float32)
         elif drift is not None:
             raise ValueError("`drift` was supplied but include_drift is False")
+        elif drift_clusters is not None:
+            raise ValueError(
+                "`drift_clusters` was supplied but include_drift is False")
 
         # Construct the neighbor mixing matrix
         state_transitions = adata.obsp["state_transitions"]
@@ -1049,6 +1089,21 @@ class Regression:
         return pd.Series(
             self.model.κ.detach().cpu().numpy(),
             index=list(self.design.design_info.column_names), name="kappa",
+        )
+
+    def get_drift_covariate(self) -> pd.DataFrame:
+        """u itself: [design column x gene], whether computed here or supplied.
+
+        Auditability, and the thing to compare against when checking that the
+        in-model build reproduces an externally built covariate. Available as soon
+        as the constructor returns -- it is not a fit result.
+        """
+        if not self.include_drift or self.drift is None:
+            raise Exception("this model was constructed without include_drift")
+        return pd.DataFrame(
+            self.drift.astype(np.float64),
+            index=list(self.design.design_info.column_names),
+            columns=list(self.var_names),
         )
 
     def get_regression_coefficients(self, credible_interval: float | None = None) -> pd.DataFrame:
