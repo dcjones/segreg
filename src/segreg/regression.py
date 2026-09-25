@@ -615,6 +615,8 @@ class Regression:
                 / (losses[0] - losses[-1])
                 if len(losses) >= 2 * tail and losses[0] != losses[-1]
                 else float("nan")),
+            # Per-cell loss per epoch, for plotting the trajectory itself.
+            "losses": losses,
         }
         if verbose:
             d = self.fit_diagnostics
