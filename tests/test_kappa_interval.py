@@ -86,6 +86,22 @@ def test_a_PINNED_kappa_gets_no_correction():
     assert reg_pin.κ_posterior_sd()[col] < 0.1 * reg_free.κ_posterior_sd()[col]
 
 
+def test_a_FIXED_kappa_stays_exactly_put():
+    """κ_prior_σ == 0 fixes κ at κ_prior_μ exactly -- a tight prior does not, since
+    the likelihood's gradient on κ can outvote it -- and leaves nothing to
+    marginalize, so the interval is the κ-conditional one."""
+    adata, drift, beta, u, _ = make_data()
+    reg = Regression(adata, "~ 1 + exposure", include_mixing=True,
+                     include_drift=True, drift=drift, propagate_κ=True)
+    reg.fit(nepochs=50, batch_size=300, seed=0, verbose=False, compile=False,
+            β_prior="normal", κ_prior_μ=KAPPA_TRUE, κ_prior_σ=0.0)
+    assert not reg.model.κ.requires_grad
+    assert (reg.model.κ.detach().cpu().numpy() == np.float32(KAPPA_TRUE)).all()
+    sd_prop = reg.posterior_sd()
+    reg.propagate_κ = False
+    assert np.array_equal(sd_prop, reg.posterior_sd())
+
+
 def test_the_declared_term_is_exactly_what_it_says():
     """κ_rel_sd is an assumption, not an estimate, so it should be trivially
     auditable: exactly (rel·|κ|·|u|)² added in quadrature."""

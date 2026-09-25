@@ -57,6 +57,7 @@ class Regression:
                  drift_weights: str="none", drift_resolution: float=1.0,
                  drift_n_pcs: int=50, drift_n_top_genes: int=2000,
                  drift_gene_chunk: int=500, drift_seed: int=0,
+                 drift_transform: str="linear",
                  drift_verbose: bool=True):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
@@ -284,6 +285,7 @@ class Regression:
         self.drift_n_top_genes = drift_n_top_genes
         self.drift_gene_chunk = drift_gene_chunk
         self.drift_seed = drift_seed
+        self.drift_transform = drift_transform
         self.drift_verbose = drift_verbose
         if include_drift:
             cols = list(self.design.design_info.column_names)
@@ -304,11 +306,16 @@ class Regression:
                     n_top_genes=drift_n_top_genes,
                     gene_chunk=drift_gene_chunk,
                     seed=drift_seed,
+                    transform=drift_transform,
                     verbose=drift_verbose,
                 )
                 self.drift_clusters = labels
                 self.drift = u.astype(np.float32)
             else:
+                if drift_transform != "linear":
+                    raise ValueError(
+                        "`drift_transform` applies only to a covariate computed here; "
+                        "a supplied `drift=` table is used as given.")
                 self.drift_clusters = None
                 aligned = drift.reindex(index=cols, columns=self.var_names)
                 # A silent misalignment produces an all-zero u and an arm that looks
@@ -710,8 +717,11 @@ class Regression:
                 "quasi_interval and the sandwich correction cannot be combined; "
                 "both restate the same covariance from different premises and "
                 "would double-count the excess scatter.")
+        # A FIXED κ (κ_prior_σ == 0) is the limit in which the correction vanishes:
+        # nothing is being estimated, so there is nothing to marginalize.
         propagate = (getattr(self, "propagate_κ", False)
-                     and getattr(self.model, "include_drift", False))
+                     and getattr(self.model, "include_drift", False)
+                     and not getattr(self.model, "κ_fixed", False))
         if propagate and sandwich:
             # Both rewrite the covariance from different premises -- the sandwich
             # replaces H⁻¹ with H⁻¹ M H⁻¹, the marginalization adds a rank-ncov term
@@ -1308,6 +1318,9 @@ class RegressionModel(nn.Module):
         # reduction, not merely absorbing ignorance.
         self.κ_prior_μ = κ_prior_μ
         self.κ_prior_σ = κ_prior_σ
+        if κ_prior_σ is not None and κ_prior_σ < 0:
+            raise ValueError(f"κ_prior_σ must be >= 0 or None; got {κ_prior_σ}")
+        self.κ_fixed = κ_prior_σ == 0
         if cellspace is not None:
             # frac is rebuilt per minibatch from these; materializing it would be
             # 3.0 GB on the Atera panel. One kappa, as for the drift term.
@@ -1331,7 +1344,14 @@ class RegressionModel(nn.Module):
             self.register_buffer(
                 "u", torch.as_tensor(np.ascontiguousarray(drift),
                                      dtype=torch.float32).clone())
-            self.κ = nn.Parameter(torch.zeros(ncovariates))
+            # κ_prior_σ == 0 FIXES κ at κ_prior_μ: a buffer, not a parameter. A
+            # tight prior is not a substitute, because the likelihood's gradient on
+            # κ sums over every gene and cell in a batch and easily outvotes it.
+            κ0 = torch.full((ncovariates,), float(κ_prior_μ))
+            if self.κ_fixed:
+                self.register_buffer("κ", κ0)
+            else:
+                self.κ = nn.Parameter(κ0)
 
 
     def forward(self, batch: RegressionBatch):
@@ -1401,7 +1421,7 @@ class RegressionModel(nn.Module):
             kl = kl + ((self.δ_size ** 2).sum()
                        / (2.0 * self.size_prior_σ ** 2)) * (
                            batch.nreceivers / self.ncells)
-        if self.include_drift and self.κ_prior_σ is not None:
+        if self.include_drift and self.κ_prior_σ is not None and not self.κ_fixed:
             kl = kl + (((self.κ - self.κ_prior_μ) ** 2).sum()
                        / (2.0 * self.κ_prior_σ ** 2)) * (batch.nreceivers / self.ncells)
 

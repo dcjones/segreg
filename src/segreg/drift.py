@@ -206,6 +206,7 @@ def compute_drift(
     gene_chunk: int = 500,
     seed: int = 0,
     verbose: bool = True,
+    transform: str = "linear",
 ):
     """The six steps above. Returns (u [ncov, ngenes], cluster labels [ncells]).
 
@@ -213,6 +214,17 @@ def compute_drift(
     dense design matrix in the SAME row order -- which is the whole reason this can
     live inside `Regression`: there is no join to get wrong.
     """
+    # --- what is projected (`transform`) -------------------------------------
+    # frac is the predicted foreign share of the observed expression, so if
+    # foreign transcripts ADD to a cell's own, observed = own / (1 - frac) and the
+    # log-rate bias is exactly -log(1 - frac). `linear` projects frac itself, the
+    # first-order term, which is what the free-κ model has always used; `log`
+    # projects the exact bias, which is ~2.6x larger on the strongly contaminated
+    # genes where the linearization matters (RCC CosMx niche markers). With κ
+    # fixed at 1 the `log` covariate is proseg's mixing estimate taken at face
+    # value, with no parameter fitted.
+    if transform not in ("linear", "log"):
+        raise ValueError(f"drift transform must be 'linear' or 'log'; got {transform!r}")
     if weights not in ("none", "size", "irls"):
         raise ValueError(
             f"drift_weights must be one of 'none', 'size', 'irls'; got {weights!r}")
@@ -257,6 +269,11 @@ def compute_drift(
     for j0 in range(0, ngenes, gene_chunk):
         j1 = min(j0 + gene_chunk, ngenes)
         frac = _frac_chunk(M, sw, own, P, j0, j1)
+        if transform == "log":
+            # frac < 1 whenever the cell retains any of its own mass; the clip only
+            # guards a cell with none.
+            np.minimum(frac, 1.0 - 1e-6, out=frac)
+            frac = -np.log1p(-frac)
         u[:, j0:j1] = project(Xd, frac, w)
         if weights == "irls":
             for j in range(j0, j1):
