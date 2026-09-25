@@ -56,7 +56,7 @@ class Regression:
                  drift_clusters: np.ndarray | None=None,
                  drift_weights: str="none", drift_resolution: float=1.0,
                  drift_n_pcs: int=50, drift_n_top_genes: int=2000,
-                 drift_gene_chunk: int=2000, drift_seed: int=0,
+                 drift_gene_chunk: int=500, drift_seed: int=0,
                  drift_verbose: bool=True):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
@@ -624,7 +624,7 @@ class Regression:
                   f"{d['loss_tail_share']:.4f}")
         return model
 
-    def posterior_sd(self, chunk: int = 16, sandwich: bool | None = None,
+    def posterior_sd(self, chunk: int | None = None, sandwich: bool | None = None,
                      quasi: bool | None = None) -> npt.NDArray[np.float64]:
         """Marginal posterior sd of β, [ncovariates, ngenes].
 
@@ -802,15 +802,36 @@ class Regression:
             Σ_gg = torch.zeros((ncov, ncov), dtype=torch.float64, device=dev)
             stash = []          # (slice, cov, H_gκ) per chunk; ~22 MB on the WTA panel
 
-        for start in range(0, ngenes, chunk):
-            sl = slice(start, min(start + chunk, ngenes))
+        # --- gene chunk size ------------------------------------------------------
+        # Each chunk materializes a handful of dense [ncells, G, ncov] float64
+        # tensors (the Jacobian, its weighted copy, the sparse product's input), so
+        # the working set is ~5 of those. At 300k cells and 30 covariates a chunk of
+        # 16 is ~5 GB, which does not fit beside a desktop on a 12 GB card. So by
+        # default the chunk is sized to the memory actually free, and halved and
+        # retried if a chunk still runs out. Chunking over genes is exact -- the
+        # Hessian is block diagonal by gene -- so this changes nothing but speed.
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+        if chunk is None:
+            chunk = 64
+            if dev.type == "cuda":
+                free, _ = torch.cuda.mem_get_info(dev)
+                per_gene = ncells * ncov * 8 * (7 if sandwich else 5)
+                chunk = int(min(chunk, max(1, (0.7 * free) // per_gene)))
+
+        def laplace_block(sl: slice):
+            """Likelihood block K and the covariance H⁻¹ (sandwiched if asked) for
+            one chunk of genes. Free of side effects apart from phi_out[sl], so a
+            chunk that runs out of memory can simply be retried smaller."""
             G = sl.stop - sl.start
             η = X @ B[:, sl] + gene_bias[sl].unsqueeze(0) + log_size.unsqueeze(1)
             λ = torch.exp(η.clamp(max=30.0))
+            del η
             if self.include_mixing:
                 # [ncells, G, ncov], flattened so the sparse product is one call.
                 d = (λ.unsqueeze(2) * X.unsqueeze(1)).reshape(ncells, G * ncov)
                 J = (A @ d).reshape(ncells, G, ncov)
+                del d
                 μ = (A @ λ) + bg_weight.unsqueeze(1) * bg_profile[sl].unsqueeze(0)
             else:
                 J = λ.unsqueeze(2) * X.unsqueeze(1)
@@ -839,15 +860,6 @@ class Regression:
             # coefficient as well as by gene.
             H = K + prior_prec[:, sl].T.unsqueeze(2) * eye
             cov = torch.linalg.inv(H)
-            if propagate:
-                # H_gκ[j,k] = K_g[j,k] * u[k,g]: κ_k enters gene g's mean exactly as
-                # β[k,g] does, scaled by u[k,g], and the priors do not couple them.
-                ug = u_all[:, sl].T                            # [G, ncov]
-                cross = K * ug.unsqueeze(1)                    # [G, β, κ]
-                Hκκ = Hκκ + (cross * ug.unsqueeze(2)).sum(0)
-                Σ_gg = Σ_gg + torch.einsum("gak,gac,gcl->kl", cross, cov, cross)
-                stash.append((sl, cov, cross))
-                continue
             if sandwich:
                 # Missegmentation reallocates MOLECULES, so two cells fed by the
                 # same donor share that donor's one realized expression and their
@@ -902,6 +914,29 @@ class Regression:
                 meat = torch.einsum("ngc,ngd->gcd", M, M * μ.unsqueeze(2))
                 meat = meat + torch.einsum("ngc,ngd->gcd", U, U * dvar.unsqueeze(2))
                 cov = cov @ meat @ cov
+            return K, cov
+
+        start = 0
+        while start < ngenes:
+            sl = slice(start, min(start + chunk, ngenes))
+            try:
+                K, cov = laplace_block(sl)
+            except torch.OutOfMemoryError:
+                if chunk == 1:
+                    raise
+                chunk = max(1, chunk // 2)
+                torch.cuda.empty_cache()
+                continue
+            start = sl.stop
+            if propagate:
+                # H_gκ[j,k] = K_g[j,k] * u[k,g]: κ_k enters gene g's mean exactly as
+                # β[k,g] does, scaled by u[k,g], and the priors do not couple them.
+                ug = u_all[:, sl].T                            # [G, ncov]
+                cross = K * ug.unsqueeze(1)                    # [G, β, κ]
+                Hκκ = Hκκ + (cross * ug.unsqueeze(2)).sum(0)
+                Σ_gg = Σ_gg + torch.einsum("gak,gac,gcl->kl", cross, cov, cross)
+                stash.append((sl, cov, cross))
+                continue
             sd = torch.diagonal(cov, dim1=1, dim2=2).clamp(min=0.0).sqrt()
             out[:, sl] = sd.T.cpu().numpy()
 

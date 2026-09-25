@@ -104,8 +104,14 @@ def leiden_clusters(X, var_names, resolution: float = 1.0, n_pcs: int = 50,
     if n_top_genes and b.n_vars > n_top_genes:
         sc.pp.highly_variable_genes(b, n_top_genes=n_top_genes)
         b = b[:, b.var["highly_variable"]].copy()
+    # Scaling densifies (to float64), and the default ARPACK PCA on that dense
+    # matrix peaked at +15 GB at 300k cells x 2000 genes. The covariance
+    # eigendecomposition is exact -- same labels, ARI 1.0 on RCC Xenium -- and
+    # ~10x faster. Casting to float32 would halve memory again, but it perturbs
+    # the Leiden partition (ARI 0.72), so it is not done.
     sc.pp.scale(b, max_value=10)
-    sc.tl.pca(b, n_comps=min(n_pcs, b.n_vars - 1, b.n_obs - 1), random_state=seed)
+    sc.tl.pca(b, n_comps=min(n_pcs, b.n_vars - 1, b.n_obs - 1), random_state=seed,
+              svd_solver="covariance_eigh")
     sc.pp.neighbors(b, n_neighbors=15, random_state=seed)
     sc.tl.leiden(b, resolution=resolution, random_state=seed,
                  flavor="igraph", n_iterations=2, directed=False)
@@ -177,9 +183,14 @@ def donor_mixture(A, code: npt.NDArray[np.integer], n_clusters: int):
 
 def _frac_chunk(M, sw, own, P, j0, j1):
     """frac[i, g] over a gene slice -- the one definition, never materialized whole."""
+    # In place, so only two [ncells, j1 - j0] arrays are ever live.
     F = M @ P[:, j0:j1]
-    O = sw[:, None] * P[own, j0:j1]
-    return F / np.maximum(F + O, EPS)
+    O = P[own, j0:j1]
+    O *= sw[:, None]
+    O += F
+    np.maximum(O, EPS, out=O)
+    F /= O
+    return F
 
 
 def compute_drift(
@@ -192,7 +203,7 @@ def compute_drift(
     resolution: float = 1.0,
     n_pcs: int = 50,
     n_top_genes: int = 2000,
-    gene_chunk: int = 2000,
+    gene_chunk: int = 500,
     seed: int = 0,
     verbose: bool = True,
 ):
