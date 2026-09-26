@@ -69,6 +69,21 @@ W = diag((dμ/dη)² / V(μ)), the GLM's own IRLS weight, in three tiers:
 MEASURED, the tier does not matter: three tiers span 0.022 (313-gene panel) /
 0.013 (16.7k-gene panel) of median R², and the ranking INVERTS between the two
 datasets. Which is why the default is the simplest one.
+
+  mu    W_g = diag(counts_i * (F + O)[i, g]): each cell's EXPECTED count of g
+        under the reconstruction itself, so the weight is NOT separable -- it
+        depends on what cell i's neighbourhood and cluster express, not only on
+        its size. That is what the Poisson (and, below saturation, NB) fit
+        actually weights by, and the reason the separable tiers above can all
+        cancel to the same answer. Each gene gets its own projection, with a
+        ridge (`mu_ridge`, in expected transcripts at unit design value) for
+        design columns a gene barely touches.
+
+        Why it exists: with κ fixed at 1 and the log transform, the unweighted
+        projection OVERCORRECTS lineage-marker leakage on RCC Xenium and CosMx
+        (5 and 10 of 20 cell type pairs pushed below -0.25), and projecting the
+        same frac with realized count weights halves that. This tier is the
+        smooth version of those weights, needing no per-transcript data.
 """
 
 import warnings
@@ -193,6 +208,41 @@ def _frac_chunk(M, sw, own, P, j0, j1):
     return F
 
 
+def _mixture_chunk(M, sw, own, P, j0, j1):
+    """(frac, share) over a gene slice: the foreign share F / (F + O), and F + O,
+    the gene's expected share of the cell's (non-background) counts."""
+    F = M @ P[:, j0:j1]
+    S = P[own, j0:j1]
+    S *= sw[:, None]
+    S += F
+    np.maximum(S, EPS, out=S)
+    F /= S
+    return F, S
+
+
+def project_per_gene(Xd, Y, W, pairs, ridge: float):
+    """u[:, g] = (X' W_g X + ridge I)^-1 X' W_g Y[:, g], for a gene-specific weight.
+
+    `pairs` is `design_pairs(Xd)`. The Gram matrices of a whole chunk of genes are
+    one product, W' @ pairs, rather than a loop over genes.
+    """
+    ncov = Xd.shape[1]
+    iu = np.triu_indices(ncov)
+    flat = W.T @ pairs                                   # [G, npairs]
+    gram = np.zeros((W.shape[1], ncov, ncov))
+    gram[:, iu[0], iu[1]] = flat
+    gram[:, iu[1], iu[0]] = flat
+    gram += ridge * np.eye(ncov)
+    rhs = (W * Y).T @ Xd                                 # [G, ncov]
+    return np.linalg.solve(gram, rhs[:, :, None])[:, :, 0].T
+
+
+def design_pairs(Xd):
+    """Products of every pair of design columns (upper triangle), [ncells, npairs]."""
+    iu = np.triu_indices(Xd.shape[1])
+    return Xd[:, iu[0]] * Xd[:, iu[1]]
+
+
 def compute_drift(
     X,
     A,
@@ -207,6 +257,7 @@ def compute_drift(
     seed: int = 0,
     verbose: bool = True,
     transform: str = "linear",
+    mu_ridge: float = 10.0,
 ):
     """The six steps above. Returns (u [ncov, ngenes], cluster labels [ncells]).
 
@@ -225,9 +276,9 @@ def compute_drift(
     # value, with no parameter fitted.
     if transform not in ("linear", "log"):
         raise ValueError(f"drift transform must be 'linear' or 'log'; got {transform!r}")
-    if weights not in ("none", "size", "irls"):
+    if weights not in ("none", "size", "irls", "mu"):
         raise ValueError(
-            f"drift_weights must be one of 'none', 'size', 'irls'; got {weights!r}")
+            f"drift_weights must be one of 'none', 'size', 'irls', 'mu'; got {weights!r}")
     X = X.tocsr() if sp.issparse(X) else sp.csr_matrix(X)
     ncells, ngenes = X.shape
     if A.shape[0] != ncells:
@@ -257,7 +308,8 @@ def compute_drift(
     Xd = np.asarray(design, dtype=np.float64)
     counts_i = np.asarray(X.sum(axis=1)).ravel().astype(float)
     w_size = np.maximum(counts_i, 1.0)
-    w = {"none": None, "size": w_size, "irls": w_size}[weights]
+    w = {"none": None, "size": w_size, "irls": w_size, "mu": None}[weights]
+    pairs = design_pairs(Xd) if weights == "mu" else None
 
     rg = pg = None
     if weights == "irls":
@@ -268,12 +320,16 @@ def compute_drift(
     n_sat = 0
     for j0 in range(0, ngenes, gene_chunk):
         j1 = min(j0 + gene_chunk, ngenes)
-        frac = _frac_chunk(M, sw, own, P, j0, j1)
+        frac, share = _mixture_chunk(M, sw, own, P, j0, j1)
         if transform == "log":
             # frac < 1 whenever the cell retains any of its own mass; the clip only
             # guards a cell with none.
             np.minimum(frac, 1.0 - 1e-6, out=frac)
             frac = -np.log1p(-frac)
+        if weights == "mu":
+            share *= counts_i[:, None]                   # expected counts
+            u[:, j0:j1] = project_per_gene(Xd, frac, share, pairs, mu_ridge)
+            continue
         u[:, j0:j1] = project(Xd, frac, w)
         if weights == "irls":
             for j in range(j0, j1):

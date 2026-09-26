@@ -57,7 +57,7 @@ class Regression:
                  drift_weights: str="none", drift_resolution: float=1.0,
                  drift_n_pcs: int=50, drift_n_top_genes: int=2000,
                  drift_gene_chunk: int=500, drift_seed: int=0,
-                 drift_transform: str="linear",
+                 drift_transform: str="linear", drift_mu_ridge: float=10.0,
                  drift_verbose: bool=True):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
@@ -286,6 +286,7 @@ class Regression:
         self.drift_gene_chunk = drift_gene_chunk
         self.drift_seed = drift_seed
         self.drift_transform = drift_transform
+        self.drift_mu_ridge = drift_mu_ridge
         self.drift_verbose = drift_verbose
         if include_drift:
             cols = list(self.design.design_info.column_names)
@@ -307,6 +308,7 @@ class Regression:
                     gene_chunk=drift_gene_chunk,
                     seed=drift_seed,
                     transform=drift_transform,
+                    mu_ridge=drift_mu_ridge,
                     verbose=drift_verbose,
                 )
                 self.drift_clusters = labels
