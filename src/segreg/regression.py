@@ -58,7 +58,7 @@ class Regression:
                  drift_n_pcs: int=50, drift_n_top_genes: int=2000,
                  drift_gene_chunk: int=500, drift_seed: int=0,
                  drift_transform: str="linear", drift_mu_ridge: float=10.0,
-                 drift_verbose: bool=True):
+                 drift_verbose: bool=True, leak: dict | None=None):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -474,6 +474,97 @@ class Regression:
                     "`cellspace`; their cell-space correction is 0.",
                     stacklevel=2)
 
+        # --- a LONG-RANGE LEAK nuisance -------------------------------------------
+        #
+        # MODEL. Indices: i index cell, j source cell, g gene, s source group (e.g.
+        # a segmenter component), k design column.
+        #
+        #   X_ig ~ NegBin(mu_ig, r_g)
+        #   mu_ig = lambda_ig (+ mixing/background) + L_ig
+        #   log lambda_ig = log n_i + b_g + sum_k D_ik beta_kg
+        #   L_ig = sum_s rho_s E_is P_sg
+        #   E_is = A_i sum_{j in s, j != i} N_j K(x_i - x_j)
+        #
+        # P_sg: group s's profile (fraction of its counts in gene g, rows sum to 1).
+        # E_is: expected leaked transcripts (all genes) landing in cell i per unit
+        # rate -- A_i cell area, N_j source total count, x centroids, K a 2D leak
+        # kernel density integrating to 1. rho_s: fraction of a source's emission
+        # that leaks AND is still in X; one per group, shared across genes. All of
+        # E and P are built by the caller (simple-seg-sim2 eval/leak_nuisance.py
+        # builds them from proseg components with a fixed 0.5*G12 + 0.5*G48 kernel).
+        #
+        # rho is not fitted for reporting (it is not identified; see below). The
+        # point estimate uses a stated rho0 (fit's leak_prior_μ = log rho0 with
+        # leak_prior_σ = 0, and `offset_rho` = rho0 so the offset is the native size
+        # log(n_i - sum_s rho0_s E_is)), and `interval_sd` sigma_s adds
+        #   Var(beta_kg) += sum_s (d beta_kg / d rho_s)^2 sigma_s^2,
+        #   d beta_g / d rho = -H_gg^-1 H_g,rho,  H_g,rho = sum_i J_ig w_ig E_is P_sg
+        # in posterior_sd. A declared range rho_s in [0, rho_max_s] maps to
+        # rho0 = sigma = rho_max / 2. See proseg leakage-field-mvp.md, "Model
+        # specification: leak as a segreg nuisance".
+        #
+        # Additive in count space: lambda_obs[i, g] += sum_s rho_s E[i, s] P[s, g].
+        # E[i, s] is cell i's exposure to leak from source group s (the source
+        # group's emission density blurred by a fixed leak kernel and integrated
+        # over the cell) and P[s, g] the source group's gene profile, so E P is the
+        # expected leak count at rho = 1. Only rho, one scalar per source group,
+        # SHARED ACROSS GENES, is fitted (see fit's leak_prior_*).
+        #
+        # Why here rather than in the segmenter (proseg leakage-field-mvp.md): a
+        # leak term only decontaminates when it competes against a POOLED native
+        # rate; against per-cell or per-component rates the native model absorbs
+        # the leak. This regression's design already pools by cell type, and
+        # because rho is shared across genes, a leak-shaped effect (the source's
+        # whole profile, in proportion) is separable from a gene-specific niche
+        # effect at the same length scale.
+        #
+        # `leak` = dict(E=[ncells, nsources], P=[nsources, ngenes_P],
+        # genes=[ngenes_P] names, optional names=[nsources], optional offset_rho). P is aligned to this
+        # object's genes by name; genes absent from P get no leak.
+        self.leak = None
+        if leak is not None:
+            E = np.asarray(leak["E"], dtype=np.float32)
+            if E.ndim != 2 or E.shape[0] != adata.n_obs:
+                raise ValueError(f"leak E has shape {E.shape}, expected ({adata.n_obs}, nsources)")
+            gpos = pd.Series(np.arange(len(leak["genes"])), index=np.asarray(leak["genes"]).astype(str))
+            gpos = gpos[~gpos.index.duplicated()].reindex([str(v) for v in self.var_names])
+            if gpos.isna().all():
+                raise ValueError("leak P shares no gene name with this object")
+            Psrc = np.asarray(leak["P"], dtype=np.float32)
+            if Psrc.shape[0] != E.shape[1]:
+                raise ValueError(f"leak P has {Psrc.shape[0]} sources, E has {E.shape[1]}")
+            P = np.zeros((E.shape[1], len(self.var_names)), dtype=np.float32)
+            ok = gpos.notna().to_numpy()
+            P[:, ok] = Psrc[:, gpos[ok].to_numpy().astype(int)]
+            if not (np.isfinite(E).all() and np.isfinite(P).all() and (E >= 0).all() and (P >= 0).all()):
+                raise ValueError("leak E and P must be finite and non-negative")
+            names = list(leak.get("names", [f"source{i}" for i in range(E.shape[1])]))
+            # `interval_sd`: a DECLARED uncertainty on the residual leak rate per
+            # source (absolute rho units), propagated into beta's interval in
+            # posterior_sd -- not fitted. Fitting rho from the regression's own data
+            # confuses leak with source-shaped biology and with the segmenter's
+            # gene-dependent filtering (both measured on simple-seg-sim2), so the
+            # range is the segmenter's to declare: how much residual leak its counts
+            # may still contain. A better segmenter declares a tighter range.
+            isd = leak.get("interval_sd")
+            if isd is not None:
+                isd = np.broadcast_to(np.asarray(isd, dtype=np.float64), (E.shape[1],)).copy()
+                if not (np.isfinite(isd).all() and (isd >= 0).all()):
+                    raise ValueError("leak interval_sd must be finite and non-negative")
+            self.leak = dict(E=E, P=P, names=names, interval_sd=isd)
+            # The offset is log(observed total), and the observed total INCLUDES the
+            # leaked counts, so exposed cells' native rates are already inflated by
+            # the leak and adding it on top double-counts (a known rate then
+            # over-corrects; a free rate silently fits low to compensate). With
+            # `offset_rho` (one value or one per source) the offset is instead
+            # log(total - expected leak at that rate), i.e. the native size. Ignored
+            # if an explicit `offset` was supplied.
+            if leak.get("offset_rho") is not None and offset is None:
+                rho_ref = np.broadcast_to(np.asarray(leak["offset_rho"], dtype=np.float64), (E.shape[1],))
+                leaked = (E.astype(np.float64) * rho_ref) @ P.sum(1).astype(np.float64)
+                total = np.asarray(self.X.sum(axis=1)).squeeze().astype(np.float64)
+                self.log_size = np.log(np.maximum(total - leaked, 1.0)).astype(np.float32)
+
         self.spatial = np.asarray(adata.obsm["spatial"]) if "spatial" in adata.obsm else None
 
     def fit(
@@ -487,6 +578,8 @@ class Regression:
         κ_prior_σ: float | None = None,
         u_prior_σ: float = 0.1,
         size_prior_σ: float = 0.2,
+        leak_prior_μ: float | np.ndarray = np.log(0.05),
+        leak_prior_σ: float | None = None,
         seed: int | None = None,
         device: torch.device | str | None = None,
         verbose: bool = True,
@@ -535,6 +628,9 @@ class Regression:
             u_prior_σ=u_prior_σ,
             include_cell_size=self.include_cell_size,
             size_prior_σ=size_prior_σ,
+            leak=self.leak,
+            leak_prior_μ=leak_prior_μ,
+            leak_prior_σ=leak_prior_σ,
         )
         if device is not None:
             model = model.to(device)
@@ -740,6 +836,17 @@ class Regression:
         gene_bias = m.gene_bias.detach().double()
         r = torch.exp(m.log_r.detach().double())
         bg_profile = torch.softmax(m.bg_rates.detach().double(), dim=-1)
+        # Leak nuisance: an additive known rate at the fitted rho (beta's interval
+        # CONDITIONS on rho-hat, as it does on kappa without propagate_κ). It does
+        # not depend on beta, so it changes only mu (the weights), not J.
+        leak_Eρ = leak_P = leak_E = leak_var = None
+        if getattr(m, "include_leak", False):
+            leak_E = m.leak_E.detach().double().to(dev)
+            leak_Eρ = leak_E * torch.exp(m.log_ρ.detach().double().to(dev))
+            leak_P = m.leak_P.detach().double().to(dev)
+            isd = self.leak.get("interval_sd") if self.leak is not None else None
+            if isd is not None:
+                leak_var = torch.as_tensor(isd ** 2, dtype=torch.float64, device=dev)
 
         X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
         log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
@@ -850,6 +957,8 @@ class Regression:
             else:
                 J = λ.unsqueeze(2) * X.unsqueeze(1)
                 μ = λ
+            if leak_Eρ is not None:
+                μ = μ + leak_Eρ @ leak_P[:, sl]
             if quasi:
                 # The QUASI-POISSON weight, 1/(phi_g mu), with phi_g the per-gene
                 # Pearson dispersion AT THIS FITTED MEAN -- the same estimator a
@@ -874,6 +983,16 @@ class Regression:
             # coefficient as well as by gene.
             H = K + prior_prec[:, sl].T.unsqueeze(2) * eye
             cov = torch.linalg.inv(H)
+            if leak_var is not None:
+                # Propagate the declared residual-leak uncertainty: to first order
+                # dβ̂_g/dρ_s = -H_gg⁻¹ H_gρ, with H_gρ = Σ_i J_ig w_ig E_is P_sg (the
+                # leak enters μ additively, so ∂μ_ig/∂ρ_s = E_is P_sg). The added
+                # variance Σ_s (dβ/dρ_s)² sd_s² is large exactly where a leak-shaped
+                # effect could explain the coefficient (a source's specific genes in
+                # an exposed index type) and ~0 elsewhere.
+                Hgρ = torch.einsum("ngc,ng,ns->gcs", J, w, leak_E) * leak_P[:, sl].T.unsqueeze(1)
+                dβ = -torch.einsum("gcd,gds->gcs", cov, Hgρ)
+                leak_extra = torch.diag_embed((dβ ** 2 * leak_var).sum(2))
             if sandwich:
                 # Missegmentation reallocates MOLECULES, so two cells fed by the
                 # same donor share that donor's one realized expression and their
@@ -928,6 +1047,9 @@ class Regression:
                 meat = torch.einsum("ngc,ngd->gcd", M, M * μ.unsqueeze(2))
                 meat = meat + torch.einsum("ngc,ngd->gcd", U, U * dvar.unsqueeze(2))
                 cov = cov @ meat @ cov
+            if leak_var is not None:
+                # Added after the sandwich: dβ/dρ is built from the bread H⁻¹.
+                cov = cov + leak_extra
             return K, cov
 
         start = 0
@@ -1122,6 +1244,13 @@ class Regression:
             return np.array([k0])
         return k0 + self.model.δ_cs.detach().cpu().numpy()
 
+    def get_leak_rates(self) -> pd.Series:
+        """Fitted leak rate rho per source group (exp of the MAP log rho)."""
+        if self.model is None or not getattr(self.model, "include_leak", False):
+            raise Exception("fit() with a `leak` nuisance must be called first")
+        return pd.Series(torch.exp(self.model.log_ρ.detach()).cpu().numpy(),
+                         index=self.leak["names"], name="rho")
+
     def get_drift_scales(self) -> pd.Series:
         """The fitted κ, one per design column.
 
@@ -1209,8 +1338,31 @@ class RegressionModel(nn.Module):
         u_prior_σ: float = 0.1,
         include_cell_size: bool = False,
         size_prior_σ: float = 0.2,
+        leak: dict | None = None,
+        leak_prior_μ: float | np.ndarray = np.log(0.05),
+        leak_prior_σ: float | None = None,
     ):
         super().__init__()
+
+        # Long-range leak nuisance (see Regression.__init__): rho_s = exp(log_ρ[s]),
+        # a MAP parameter per source group with a N(leak_prior_μ, leak_prior_σ²)
+        # prior on log rho. leak_prior_σ None = unpenalized, 0 = fixed at the prior
+        # mean (e.g. a known/oracle rate).
+        self.include_leak = leak is not None
+        if leak is not None:
+            self.register_buffer("leak_E", torch.as_tensor(np.ascontiguousarray(leak["E"]),
+                                                           dtype=torch.float32).clone())
+            self.register_buffer("leak_P", torch.as_tensor(np.ascontiguousarray(leak["P"]),
+                                                           dtype=torch.float32).clone())
+            nsrc = leak["E"].shape[1]
+            μ0 = torch.as_tensor(np.broadcast_to(np.asarray(leak_prior_μ, dtype=np.float32), (nsrc,)).copy())
+            self.register_buffer("leak_prior_μ", μ0.clone())
+            self.leak_prior_σ = leak_prior_σ
+            self.leak_fixed = leak_prior_σ == 0
+            if self.leak_fixed:
+                self.register_buffer("log_ρ", μ0.clone())
+            else:
+                self.log_ρ = nn.Parameter(μ0.clone())
 
         self.include_mixing = include_mixing
         self.include_drift = drift is not None
@@ -1395,6 +1547,8 @@ class RegressionModel(nn.Module):
                 u = self.u_μ
 
         λ_obs = self.mix(λ, batch, u=u, log_size=log_size)
+        if self.include_leak:
+            λ_obs = λ_obs + self.leak_rate(batch.nodes[: batch.nreceivers])
 
         # Senders-only nodes exist to supply λ for the mixing; only receivers are
         # modeled, so the likelihood is over the leading block of the batch.
@@ -1423,11 +1577,18 @@ class RegressionModel(nn.Module):
             kl = kl + ((self.δ_size ** 2).sum()
                        / (2.0 * self.size_prior_σ ** 2)) * (
                            batch.nreceivers / self.ncells)
+        if self.include_leak and self.leak_prior_σ is not None and not self.leak_fixed:
+            kl = kl + (((self.log_ρ - self.leak_prior_μ) ** 2).sum()
+                       / (2.0 * self.leak_prior_σ ** 2)) * (batch.nreceivers / self.ncells)
         if self.include_drift and self.κ_prior_σ is not None and not self.κ_fixed:
             kl = kl + (((self.κ - self.κ_prior_μ) ** 2).sum()
                        / (2.0 * self.κ_prior_σ ** 2)) * (batch.nreceivers / self.ncells)
 
         return -ll.sum() + kl
+
+    def leak_rate(self, nodes: Tensor) -> Tensor:
+        """Expected leak counts sum_s rho_s E[i, s] P[s, g] for these cells, [n, ngenes]."""
+        return (self.leak_E[nodes] * torch.exp(self.log_ρ)) @ self.leak_P
 
     def cellspace_frac(self, batch: RegressionBatch) -> Tensor:
         """frac[i, g] for this batch's nodes, [nnodes, ngenes].
