@@ -129,3 +129,50 @@ def test_declared_rate_uncertainty_WIDENS_only_the_source_shaped_genes():
     # and the widening tracks how leak-shaped a gene is
     from scipy.stats import spearmanr
     assert spearmanr(ratio, w1 / w0).statistic > 0.8
+
+
+def _interval(adata, leak, rho0, isd, method):
+    lk = dict(leak, offset_rho=rho0, interval_sd=isd, interval_method=method)
+    r = Regression(adata, "~ 1 + z", include_mixing=False, leak=lk)
+    r.fit(nepochs=600, seed=0, device="cpu", verbose=False, compile=False,
+          leak_prior_μ=np.log(max(rho0, 1e-12)), leak_prior_σ=0.0)
+    c = r.get_regression_coefficients(credible_interval=0.95).query("Covariate == 'z'")
+    return r, c.set_index("Gene").reindex(adata.var_names)
+
+
+def test_refit_interval_with_a_ZERO_range_is_the_ordinary_one():
+    """With sd 0 the three refits coincide at rho0, so the interval is the
+    Laplace interval at beta's MAP -- the same as posterior_sd's around the
+    fitted mean, up to the SGD fit's distance from the MAP."""
+    adata, leak, _ = make()
+    _, lin = _interval(adata, leak, RHO, 0.0, "linear")
+    _, ref = _interval(adata, leak, RHO, 0.0, "refit")
+    w_lin, w_ref = lin["Upper"] - lin["Lower"], ref["Upper"] - ref["Lower"]
+    assert np.allclose(w_ref, w_lin, rtol=0.05)
+    assert np.abs((ref["Upper"] + ref["Lower"]) / 2 - lin["Mean"]).max() < 0.05
+
+
+def test_refit_interval_COVERS_both_ends_of_the_range():
+    """A range [0.5 rho, 1.5 rho]: the refit interval must contain the slope a
+    full fit finds at either end, for every gene, and widen the leak-shaped
+    genes most. Every gene widens some: the native-size offset
+    log(n - rho E P) moves with rho, and here exposure IS the covariate, so all
+    slopes shift by ~0.1 across the range (confirmed by full fits at the ends;
+    the linear term holds the offset at rho0 and misses this). Not [0, 2 rho]:
+    there n - 2 rho E P is non-positive in the most exposed ~1% of cells."""
+    adata, leak, src = make()
+    _, ref = _interval(adata, leak, RHO, 0.5 * RHO, "refit")
+    _, none = _interval(adata, leak, RHO, 0.0, "refit")
+    for rho in (0.5 * RHO, 1.5 * RHO):
+        _, β = fit(adata, leak, offset_rho=rho, leak_prior_μ=np.log(rho), leak_prior_σ=0.0)
+        assert ((ref["Lower"].to_numpy() <= β + 0.02) & (β - 0.02 <= ref["Upper"].to_numpy())).all()
+    ratio = src / native_of(adata)
+    top, bottom = np.argsort(ratio)[-5:], np.argsort(ratio)[:5]
+    w = ((ref["Upper"] - ref["Lower"]) / (none["Upper"] - none["Lower"])).to_numpy()
+    assert w[top].mean() > 1.5 * w[bottom].mean()
+
+
+def test_refit_without_a_range_is_an_ERROR():
+    adata, leak, _ = make()
+    with pytest.raises(ValueError):
+        Regression(adata, "~ 1 + z", leak=dict(leak, interval_method="refit"))

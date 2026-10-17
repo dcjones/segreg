@@ -551,7 +551,20 @@ class Regression:
                 isd = np.broadcast_to(np.asarray(isd, dtype=np.float64), (E.shape[1],)).copy()
                 if not (np.isfinite(isd).all() and (isd >= 0).all()):
                     raise ValueError("leak interval_sd must be finite and non-negative")
-            self.leak = dict(E=E, P=P, names=names, interval_sd=isd)
+            # `interval_method`: how the declared range [rho0 - sd, rho0 + sd]
+            # (clipped at 0) reaches beta's interval. "linear" (default) adds
+            # (d beta / d rho)^2 sd^2 at rho0 (posterior_sd). "refit" re-solves
+            # each gene's beta at the range's ends and middle and reports the union
+            # of their Laplace intervals (leak_range_interval) -- exact for any
+            # monotone dependence on rho, where the linear term under-covers:
+            # leak is additive in count space but beta is on the log scale, so for
+            # a source's specific genes beta(rho) is strongly curved.
+            method = leak.get("interval_method", "linear")
+            if method not in ("linear", "refit"):
+                raise ValueError(f"leak interval_method must be 'linear' or 'refit', got {method!r}")
+            if method == "refit" and isd is None:
+                raise ValueError("leak interval_method 'refit' needs interval_sd (the range half-width)")
+            self.leak = dict(E=E, P=P, names=names, interval_sd=isd, interval_method=method)
             # The offset is log(observed total), and the observed total INCLUDES the
             # leaked counts, so exposed cells' native rates are already inflated by
             # the leak and adding it on top double-counts (a known rate then
@@ -1136,6 +1149,160 @@ class Regression:
             out = np.sqrt(out**2 + (float(rel) * np.abs(κ) * np.abs(u_np)) ** 2)
         return out
 
+    def leak_range_interval(self, credible_interval: float, chunk: int = 64,
+                            max_iter: int = 30, tol: float = 1e-4):
+        """(lower, upper), each [ncovariates, ngenes]: beta's interval over a
+        DECLARED leak range, by refitting rather than linearizing.
+
+        The range is rho in [max(rho0 - sd, 0), rho0 + sd] per source, with rho0
+        the fitted (fixed) rate and sd the leak `interval_sd`; with the usual
+        rho0 = sd = rho_max / 2 that is [0, rho_max]. At each of the range's two
+        ends and its middle, every gene's beta is re-solved at that rho -- leak
+        rate AND the matching native-size offset log(n_i - sum_s rho_s E_is P_s.),
+        as `offset_rho` builds it -- and its Laplace interval taken there. The
+        reported interval is the union of the three, so a coefficient is
+        significant only if it is significant everywhere in the range.
+
+        Why not the linear term in posterior_sd: leak enters mu additively, beta
+        acts on the log scale, so where leak dominates a gene's native rate (a
+        source's specific genes in an exposed type) d beta / d rho changes a lot
+        across the range, and the first-order interval at rho0 under-covers its
+        ends (simple-seg-sim2 findings §11: a range [0, alpha] around the true
+        alpha still left 12% Tumor-niche FP; [0, 2 alpha] was needed).
+
+        It also catches what the linear term leaves out: the native-size offset
+        moves with rho too, and where exposure correlates with a covariate that
+        shifts EVERY gene's coefficient on it (a composition effect: how much of
+        an exposed cell's total is native is uncertain), not only the leaked
+        genes'.
+
+        The union is exact when each beta is monotone in rho between the ends.
+        With several sources the ends are the two CORNERS of the box (all at the
+        low end, all at the high end), not every corner: right when the
+        coefficient moves the same way in every source's rate, which is the case
+        for leak (more leak subtracted, lower beta for the leaked genes).
+
+        Each refit conditions on the fitted nuisance parameters (gene_bias, r, the
+        background profile, the cell sizes, A) and solves beta's MAP under the same
+        prior by Fisher scoring with step halving, per gene (the problem is block
+        diagonal by gene), from the fitted beta. The middle is refitted too, so the
+        three intervals are on one footing; the reported Mean stays the fitted one.
+        """
+        if self.model is None:
+            raise Exception("fit() must be called before leak_range_interval")
+        m = self.model
+        if not getattr(m, "include_leak", False) or self.leak.get("interval_sd") is None:
+            raise ValueError("leak_range_interval needs a leak term with interval_sd")
+        for flag, name in ((getattr(m, "include_drift", False), "drift"),
+                           (getattr(m, "include_cellspace", False), "cellspace"),
+                           (getattr(self, "mixing_interval_correction", False), "the sandwich"),
+                           (getattr(self, "quasi_interval", False), "quasi_interval")):
+            if flag:
+                raise NotImplementedError(f"leak interval_method 'refit' with {name}")
+        dev = next(m.parameters()).device
+        z = float(stats.norm.ppf(1.0 - (1.0 - credible_interval) / 2.0))
+        B0 = m.β_μ.detach().double()
+        gene_bias = m.gene_bias.detach().double()
+        r = torch.exp(m.log_r.detach().double()).clamp(min=1e-3)
+        bg_profile = torch.softmax(m.bg_rates.detach().double(), dim=-1)
+        E = m.leak_E.detach().double().to(dev)
+        P = m.leak_P.detach().double().to(dev)
+        rho0 = torch.exp(m.log_ρ.detach().double().to(dev))
+        sd = torch.as_tensor(self.leak["interval_sd"], dtype=torch.float64, device=dev)
+        rhos = [(rho0 - sd).clamp(min=0.0), rho0, rho0 + sd]
+
+        X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
+        total = torch.as_tensor(np.asarray(self.X.sum(axis=1)).ravel().astype(np.float64), device=dev)
+        δ = (m.δ_size.detach().double().to(dev) if getattr(m, "include_cell_size", False)
+             else torch.zeros_like(total))
+        Pg = P.sum(1)
+        if self.include_mixing:
+            Aop = self._scaled_A() if getattr(m, "include_donor_scale", False) else self.A
+            A = torch.sparse_csr_tensor(
+                torch.as_tensor(Aop.indptr, dtype=torch.int64, device=dev),
+                torch.as_tensor(Aop.indices, dtype=torch.int64, device=dev),
+                torch.as_tensor(Aop.data.astype(np.float64), device=dev), size=Aop.shape)
+            bg_mix = torch.as_tensor(self.bg_mix_rate.astype(np.float64), device=dev)
+        cauchy = getattr(m, "β_prior", "normal") == "cauchy"
+        γ = float(m.β_prior_σ)
+        ncov, ngenes = B0.shape
+        ncells = X.shape[0]
+        eye = torch.eye(ncov, dtype=torch.float64, device=dev)
+        lower = np.full((ncov, ngenes), np.inf)
+        upper = np.full((ncov, ngenes), -np.inf)
+        self._leak_range_β = []
+
+        for rho in rhos:
+            # the native size at this rho, exactly as `offset_rho` builds it
+            log_size = torch.log((total - (E * rho) @ Pg).clamp(min=1.0)) + δ
+            leak_rate = (E * rho) @ P                                  # [ncells, ngenes]
+            βr = np.empty((ncov, ngenes))
+            for start in range(0, ngenes, chunk):
+                sl = slice(start, min(start + chunk, ngenes))
+                y = self._counts_chunk(sl, dev)
+                rg = r[sl].unsqueeze(0)
+
+                def mean(B):
+                    η = X @ B + gene_bias[sl].unsqueeze(0) + log_size.unsqueeze(1)
+                    λ = torch.exp(η.clamp(max=30.0))
+                    if self.include_mixing:
+                        μ = A @ λ + (bg_mix * torch.exp(log_size)).unsqueeze(1) * bg_profile[sl].unsqueeze(0)
+                    else:
+                        μ = λ
+                    return λ, μ + leak_rate[:, sl]
+
+                def objective(B):
+                    _, μ = mean(B)
+                    nll = -(y * torch.log(μ + 1e-8) - (y + rg) * torch.log(rg + μ + 1e-8)).sum(0)
+                    if cauchy:
+                        return nll + torch.log1p((B / γ) ** 2).sum(0)
+                    return nll + (B ** 2).sum(0) / (2.0 * γ ** 2)
+
+                def curvature(B):
+                    """Ascent direction (score minus prior gradient) and the Fisher
+                    information plus the prior's gradient-matched curvature."""
+                    λ, μ = mean(B)
+                    if self.include_mixing:
+                        G = B.shape[1]
+                        J = (A @ (λ.unsqueeze(2) * X.unsqueeze(1)).reshape(ncells, G * ncov)
+                             ).reshape(ncells, G, ncov)
+                    else:
+                        J = λ.unsqueeze(2) * X.unsqueeze(1)
+                    if cauchy:
+                        pgrad, pprec = 2.0 * B / (γ ** 2 + B ** 2), 2.0 / (γ ** 2 + B ** 2)
+                    else:
+                        pgrad, pprec = B / γ ** 2, torch.full_like(B, 1.0 / γ ** 2)
+                    w = rg / (μ * (rg + μ) + 1e-12)
+                    grad = torch.einsum("ngc,ng->gc", J, w * (y - μ)) - pgrad.T
+                    H = torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2)) + pprec.T.unsqueeze(2) * eye
+                    return grad, H
+
+                B = B0[:, sl].clone()
+                nll = objective(B)
+                for _ in range(max_iter):
+                    grad, H = curvature(B)
+                    step = torch.linalg.solve(H, grad.unsqueeze(2)).squeeze(2).T     # [ncov, G]
+                    t = torch.ones(B.shape[1], dtype=torch.float64, device=dev)
+                    for _ in range(20):  # per-gene step halving, on the objective alone
+                        nll_new = objective(B + step * t)
+                        bad = ~(nll_new <= nll + 1e-10)
+                        if not bad.any():
+                            break
+                        t = torch.where(bad, t / 2, t)
+                    t = torch.where(bad, torch.zeros_like(t), t)  # no descent found: stay
+                    B = B + step * t
+                    nll = torch.where(bad, nll, nll_new)
+                    if float((step * t).abs().max()) < tol:
+                        break
+                _, H = curvature(B)
+                sdv = torch.diagonal(torch.linalg.inv(H), dim1=1, dim2=2).clamp(min=0.0).sqrt().T
+                Bn, sdn = B.cpu().numpy(), sdv.cpu().numpy()
+                lower[:, sl] = np.minimum(lower[:, sl], Bn - z * sdn)
+                upper[:, sl] = np.maximum(upper[:, sl], Bn + z * sdn)
+                βr[:, sl] = Bn
+            self._leak_range_β.append(βr)
+        return lower, upper
+
     def _counts_chunk(self, sl: slice, dev) -> Tensor:
         """Observed counts for a slice of genes, as a dense [ncells, G] tensor.
 
@@ -1297,7 +1464,17 @@ class Regression:
             .reset_index(names="Covariate")
             )
 
-        if credible_interval is not None:
+        if credible_interval is not None and self.leak is not None \
+                and self.leak.get("interval_method") == "refit":
+            lo, hi = self.leak_range_interval(credible_interval)
+            df["Lower"] = lo.flatten(order="F")
+            df["Upper"] = hi.flatten(order="F")
+            df["MinimumCredible"] = np.where(
+                df["Lower"] > 0,
+                df["Lower"],
+                np.where(df["Upper"] < 0, df["Upper"], 0.0),
+            )
+        elif credible_interval is not None:
             β_σ = self.posterior_sd()
 
             z = stats.norm.ppf(1.0 - (1.0 - credible_interval) / 2.0)
