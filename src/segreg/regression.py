@@ -6,6 +6,7 @@ from anndata import AnnData
 from patsy import dmatrix
 from patsy.design_info import DesignMatrix
 from scipy.sparse import coo_matrix, csr_matrix, issparse
+from scipy.sparse import identity as sp_identity
 from spatialdata import SpatialData
 from torch import Tensor
 import numpy as np
@@ -52,6 +53,8 @@ class Regression:
                  κ_rel_sd: float | None=None, include_donor_scale: bool=False,
                  donor_clusters: np.ndarray | None=None,
                  include_cell_size: bool=False, quasi_interval: bool=False,
+                 mixing_scale: float=1.0,
+                 mixing_range: tuple[float, float] | None=None,
                  offset: npt.NDArray[np.float64] | pd.Series | None=None,
                  drift_clusters: np.ndarray | None=None,
                  drift_weights: str="none", drift_resolution: float=1.0,
@@ -372,9 +375,28 @@ class Regression:
         assert isinstance(A, coo_matrix)
         A = A.tocsr()
         assert isinstance(A, csr_matrix)
-        self.A = A.astype(np.float32)
-
-        self.bg_mix_rate = (to_bg_trans_count / normalizer).astype(np.float32)
+        # The segmenter's mixing at full strength. `mixing_scale` s interpolates
+        # between no mixing and that: A_s = (1 - s) I + s A, background share s·bg,
+        # so every row still sums to 1. Taken at face value (s = 1) proseg's mixing
+        # over-corrects on real data (segreg-rcc: the likelihood wants ~1-13% of
+        # it), so `mixing_range` = (lo, hi) treats s as a DECLARED nuisance the way
+        # the leak range treats rho: the point estimate is fitted at mixing_scale,
+        # and the interval is the union of refits at the range's ends (see
+        # range_interval). A coefficient is then significant only if it is with and
+        # without the segmenter's contact uncertainty.
+        self._A_full = A.astype(np.float32)
+        self._bg_full = (to_bg_trans_count / normalizer).astype(np.float32)
+        if not 0.0 <= mixing_scale <= 1.0:
+            raise ValueError(f"mixing_scale must be in [0, 1], got {mixing_scale}")
+        if mixing_range is not None:
+            lo, hi = mixing_range
+            if not (0.0 <= lo <= mixing_scale <= hi <= 1.0):
+                raise ValueError("mixing_range must satisfy 0 <= lo <= mixing_scale <= hi <= 1")
+            if not include_mixing:
+                raise ValueError("mixing_range needs include_mixing=True")
+        self.mixing_scale = float(mixing_scale)
+        self.mixing_range = None if mixing_range is None else (float(mixing_range[0]), float(mixing_range[1]))
+        self.A, self.bg_mix_rate = self._mixing_at(self.mixing_scale)
 
         # Observed totals are very nearly a fixed point of the mixing model
         # (median relative error of A @ s + bg vs s is -0.2%), so they are used as a
@@ -1149,6 +1171,19 @@ class Regression:
             out = np.sqrt(out**2 + (float(rel) * np.abs(κ) * np.abs(u_np)) ** 2)
         return out
 
+    def _mixing_at(self, scale: float) -> tuple[csr_matrix, npt.NDArray[np.float32]]:
+        """(A_s, bg_s) at mixing scale s: (1 - s) I + s A and s·bg."""
+        if scale == 1.0:
+            return self._A_full, self._bg_full
+        n = self._A_full.shape[0]
+        A = (sp_identity(n, format="csr", dtype=np.float32) * (1.0 - scale) + self._A_full * scale).tocsr()
+        return A.astype(np.float32), (self._bg_full * scale).astype(np.float32)
+
+    def range_interval(self, credible_interval: float, chunk: int = 64,
+                       max_iter: int = 30, tol: float = 1e-4):
+        """leak_range_interval over the declared leak range and/or mixing range."""
+        return self.leak_range_interval(credible_interval, chunk, max_iter, tol)
+
     def leak_range_interval(self, credible_interval: float, chunk: int = 64,
                             max_iter: int = 30, tol: float = 1e-4):
         """(lower, upper), each [ncovariates, ngenes]: beta's interval over a
@@ -1191,9 +1226,16 @@ class Regression:
         if self.model is None:
             raise Exception("fit() must be called before leak_range_interval")
         m = self.model
-        if not getattr(m, "include_leak", False) or self.leak.get("interval_sd") is None:
-            raise ValueError("leak_range_interval needs a leak term with interval_sd")
+        # Which declared ranges are active: the leak rate (refit interval) and/or
+        # the mixing scale (mixing_range). With both, the refits are at the middle
+        # and the four corners of the (rho, s) box.
+        leak_on = (getattr(m, "include_leak", False) and self.leak is not None
+                   and self.leak.get("interval_method") == "refit")
+        mix_on = getattr(self, "mixing_range", None) is not None
+        if not (leak_on or mix_on):
+            raise ValueError("range_interval needs a refit leak range or a mixing_range")
         for flag, name in ((getattr(m, "include_drift", False), "drift"),
+                           (getattr(m, "include_donor_scale", False) and mix_on, "a donor scale"),
                            (getattr(m, "include_cellspace", False), "cellspace"),
                            (getattr(self, "mixing_interval_correction", False), "the sandwich"),
                            (getattr(self, "quasi_interval", False), "quasi_interval")):
@@ -1205,24 +1247,41 @@ class Regression:
         gene_bias = m.gene_bias.detach().double()
         r = torch.exp(m.log_r.detach().double()).clamp(min=1e-3)
         bg_profile = torch.softmax(m.bg_rates.detach().double(), dim=-1)
-        E = m.leak_E.detach().double().to(dev)
-        P = m.leak_P.detach().double().to(dev)
-        rho0 = torch.exp(m.log_ρ.detach().double().to(dev))
-        sd = torch.as_tensor(self.leak["interval_sd"], dtype=torch.float64, device=dev)
-        rhos = [(rho0 - sd).clamp(min=0.0), rho0, rho0 + sd]
+        has_leak = getattr(m, "include_leak", False)
+        if has_leak:
+            E = m.leak_E.detach().double().to(dev)
+            P = m.leak_P.detach().double().to(dev)
+            rho0 = torch.exp(m.log_ρ.detach().double().to(dev))
+        if leak_on:
+            sd = torch.as_tensor(self.leak["interval_sd"], dtype=torch.float64, device=dev)
+            rho_ends = [(rho0 - sd).clamp(min=0.0), rho0 + sd]
+        s0 = getattr(self, "mixing_scale", 1.0)
+        mix_ends = list(self.mixing_range) if mix_on else []
+        r_mid = rho0 if has_leak else None
+        if leak_on and mix_on:
+            settings = [(r_mid, s0)] + [(rr, ss) for rr in rho_ends for ss in mix_ends]
+        elif leak_on:
+            settings = [(rho_ends[0], s0), (r_mid, s0), (rho_ends[1], s0)]
+        else:
+            settings = [(r_mid, mix_ends[0]), (r_mid, s0), (r_mid, mix_ends[1])]
 
         X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
         total = torch.as_tensor(np.asarray(self.X.sum(axis=1)).ravel().astype(np.float64), device=dev)
         δ = (m.δ_size.detach().double().to(dev) if getattr(m, "include_cell_size", False)
              else torch.zeros_like(total))
-        Pg = P.sum(1)
-        if self.include_mixing:
-            Aop = self._scaled_A() if getattr(m, "include_donor_scale", False) else self.A
+        Pg = P.sum(1) if has_leak else None
+        base_log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
+
+        def mixing_tensors(scale):
+            if getattr(m, "include_donor_scale", False):
+                Aop, bg = self._scaled_A(), self.bg_mix_rate
+            else:
+                Aop, bg = self._mixing_at(scale) if hasattr(self, "_A_full") else (self.A, self.bg_mix_rate)
             A = torch.sparse_csr_tensor(
                 torch.as_tensor(Aop.indptr, dtype=torch.int64, device=dev),
                 torch.as_tensor(Aop.indices, dtype=torch.int64, device=dev),
                 torch.as_tensor(Aop.data.astype(np.float64), device=dev), size=Aop.shape)
-            bg_mix = torch.as_tensor(self.bg_mix_rate.astype(np.float64), device=dev)
+            return A, torch.as_tensor(np.asarray(bg, dtype=np.float64), device=dev)
         cauchy = getattr(m, "β_prior", "normal") == "cauchy"
         γ = float(m.β_prior_σ)
         ncov, ngenes = B0.shape
@@ -1232,10 +1291,16 @@ class Regression:
         upper = np.full((ncov, ngenes), -np.inf)
         self._leak_range_β = []
 
-        for rho in rhos:
-            # the native size at this rho, exactly as `offset_rho` builds it
-            log_size = torch.log((total - (E * rho) @ Pg).clamp(min=1.0)) + δ
-            leak_rate = (E * rho) @ P                                  # [ncells, ngenes]
+        for rho, scale in settings:
+            if self.include_mixing:
+                A, bg_mix = mixing_tensors(scale)
+            if has_leak:
+                # the native size at this rho, exactly as `offset_rho` builds it
+                log_size = torch.log((total - (E * rho) @ Pg).clamp(min=1.0)) + δ
+                leak_rate = (E * rho) @ P                              # [ncells, ngenes]
+            else:
+                log_size = base_log_size + δ
+                leak_rate = None
             βr = np.empty((ncov, ngenes))
             for start in range(0, ngenes, chunk):
                 sl = slice(start, min(start + chunk, ngenes))
@@ -1249,7 +1314,7 @@ class Regression:
                         μ = A @ λ + (bg_mix * torch.exp(log_size)).unsqueeze(1) * bg_profile[sl].unsqueeze(0)
                     else:
                         μ = λ
-                    return λ, μ + leak_rate[:, sl]
+                    return λ, (μ + leak_rate[:, sl]) if leak_rate is not None else μ
 
                 def objective(B):
                     _, μ = mean(B)
@@ -1464,9 +1529,10 @@ class Regression:
             .reset_index(names="Covariate")
             )
 
-        if credible_interval is not None and self.leak is not None \
-                and self.leak.get("interval_method") == "refit":
-            lo, hi = self.leak_range_interval(credible_interval)
+        if credible_interval is not None and (
+                (self.leak is not None and self.leak.get("interval_method") == "refit")
+                or getattr(self, "mixing_range", None) is not None):
+            lo, hi = self.range_interval(credible_interval)
             df["Lower"] = lo.flatten(order="F")
             df["Upper"] = hi.flatten(order="F")
             df["MinimumCredible"] = np.where(
