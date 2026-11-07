@@ -1297,15 +1297,18 @@ class Regression:
             if has_leak:
                 # the native size at this rho, exactly as `offset_rho` builds it
                 log_size = torch.log((total - (E * rho) @ Pg).clamp(min=1.0)) + δ
-                leak_rate = (E * rho) @ P                              # [ncells, ngenes]
+                Erho = E * rho                                         # [ncells, nsources]
             else:
                 log_size = base_log_size + δ
-                leak_rate = None
+                Erho = None
             βr = np.empty((ncov, ngenes))
             for start in range(0, ngenes, chunk):
                 sl = slice(start, min(start + chunk, ngenes))
                 y = self._counts_chunk(sl, dev)
                 rg = r[sl].unsqueeze(0)
+                # Per chunk: the full [ncells, ngenes] leak rate does not fit on a
+                # GPU for a whole slide (307k cells x 5k genes is 11 GiB in float64).
+                leak_rate = Erho @ P[:, sl] if Erho is not None else None
 
                 def mean(B):
                     η = X @ B + gene_bias[sl].unsqueeze(0) + log_size.unsqueeze(1)
@@ -1314,7 +1317,7 @@ class Regression:
                         μ = A @ λ + (bg_mix * torch.exp(log_size)).unsqueeze(1) * bg_profile[sl].unsqueeze(0)
                     else:
                         μ = λ
-                    return λ, (μ + leak_rate[:, sl]) if leak_rate is not None else μ
+                    return λ, (μ + leak_rate) if leak_rate is not None else μ
 
                 def objective(B):
                     _, μ = mean(B)
