@@ -1286,6 +1286,10 @@ class Regression:
         γ = float(m.β_prior_σ)
         ncov, ngenes = B0.shape
         ncells = X.shape[0]
+        # The Jacobian J is [ncells, chunk, ncov] float64 and the Newton step holds
+        # a few of them; cap it at ~512 MiB so whole slides with wide designs fit
+        # (307k cells x 72 covariates is 177 MB per gene).
+        chunk = max(1, min(chunk, (512 << 20) // (ncells * ncov * 8)))
         eye = torch.eye(ncov, dtype=torch.float64, device=dev)
         lower = np.full((ncov, ngenes), np.inf)
         upper = np.full((ncov, ngenes), -np.inf)
