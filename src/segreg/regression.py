@@ -1242,18 +1242,22 @@ class Regression:
             if flag:
                 raise NotImplementedError(f"leak interval_method 'refit' with {name}")
         dev = next(m.parameters()).device
+        # Working precision. Everything that scales with ncells runs in float32
+        # (float64 is 1/64 rate on consumer GPUs); sums over cells accumulate in
+        # float64, and the small per-gene Newton solves and inverses are float64.
+        fd = torch.float32
         z = float(stats.norm.ppf(1.0 - (1.0 - credible_interval) / 2.0))
-        B0 = m.β_μ.detach().double()
-        gene_bias = m.gene_bias.detach().double()
-        r = torch.exp(m.log_r.detach().double()).clamp(min=1e-3)
-        bg_profile = torch.softmax(m.bg_rates.detach().double(), dim=-1)
+        B0 = m.β_μ.detach().to(fd)
+        gene_bias = m.gene_bias.detach().to(fd)
+        r = torch.exp(m.log_r.detach().to(fd)).clamp(min=1e-3)
+        bg_profile = torch.softmax(m.bg_rates.detach().to(fd), dim=-1)
         has_leak = getattr(m, "include_leak", False)
         if has_leak:
-            E = m.leak_E.detach().double().to(dev)
-            P = m.leak_P.detach().double().to(dev)
-            rho0 = torch.exp(m.log_ρ.detach().double().to(dev))
+            E = m.leak_E.detach().to(dev, fd)
+            P = m.leak_P.detach().to(dev, fd)
+            rho0 = torch.exp(m.log_ρ.detach().to(dev, fd))
         if leak_on:
-            sd = torch.as_tensor(self.leak["interval_sd"], dtype=torch.float64, device=dev)
+            sd = torch.as_tensor(self.leak["interval_sd"], dtype=fd, device=dev)
             rho_ends = [(rho0 - sd).clamp(min=0.0), rho0 + sd]
         s0 = getattr(self, "mixing_scale", 1.0)
         mix_ends = list(self.mixing_range) if mix_on else []
@@ -1265,12 +1269,12 @@ class Regression:
         else:
             settings = [(r_mid, mix_ends[0]), (r_mid, s0), (r_mid, mix_ends[1])]
 
-        X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
-        total = torch.as_tensor(np.asarray(self.X.sum(axis=1)).ravel().astype(np.float64), device=dev)
-        δ = (m.δ_size.detach().double().to(dev) if getattr(m, "include_cell_size", False)
+        X = torch.as_tensor(np.asarray(self.design, dtype=np.float32), device=dev)
+        total = torch.as_tensor(np.asarray(self.X.sum(axis=1)).ravel().astype(np.float32), device=dev)
+        δ = (m.δ_size.detach().to(dev, fd) if getattr(m, "include_cell_size", False)
              else torch.zeros_like(total))
         Pg = P.sum(1) if has_leak else None
-        base_log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
+        base_log_size = torch.as_tensor(self.log_size.astype(np.float32), device=dev)
 
         def mixing_tensors(scale):
             if getattr(m, "include_donor_scale", False):
@@ -1280,16 +1284,16 @@ class Regression:
             A = torch.sparse_csr_tensor(
                 torch.as_tensor(Aop.indptr, dtype=torch.int64, device=dev),
                 torch.as_tensor(Aop.indices, dtype=torch.int64, device=dev),
-                torch.as_tensor(Aop.data.astype(np.float64), device=dev), size=Aop.shape)
-            return A, torch.as_tensor(np.asarray(bg, dtype=np.float64), device=dev)
+                torch.as_tensor(Aop.data.astype(np.float32), device=dev), size=Aop.shape)
+            return A, torch.as_tensor(np.asarray(bg, dtype=np.float32), device=dev)
         cauchy = getattr(m, "β_prior", "normal") == "cauchy"
         γ = float(m.β_prior_σ)
         ncov, ngenes = B0.shape
         ncells = X.shape[0]
-        # The Jacobian J is [ncells, chunk, ncov] float64 and the Newton step holds
+        # The Jacobian J is [ncells, chunk, ncov] float32 and the Newton step holds
         # a few of them; cap it at ~512 MiB so whole slides with wide designs fit
-        # (307k cells x 72 covariates is 177 MB per gene).
-        chunk = max(1, min(chunk, (512 << 20) // (ncells * ncov * 8)))
+        # (307k cells x 72 covariates is 88 MB per gene).
+        chunk = max(1, min(chunk, (512 << 20) // (ncells * ncov * 4)))
         eye = torch.eye(ncov, dtype=torch.float64, device=dev)
         lower = np.full((ncov, ngenes), np.inf)
         upper = np.full((ncov, ngenes), -np.inf)
@@ -1305,10 +1309,10 @@ class Regression:
             else:
                 log_size = base_log_size + δ
                 Erho = None
-            βr = np.empty((ncov, ngenes))
+            βr = np.empty((ncov, ngenes), dtype=np.float32)
             for start in range(0, ngenes, chunk):
                 sl = slice(start, min(start + chunk, ngenes))
-                y = self._counts_chunk(sl, dev)
+                y = self._counts_chunk(sl, dev).to(fd)
                 rg = r[sl].unsqueeze(0)
                 # Per chunk: the full [ncells, ngenes] leak rate does not fit on a
                 # GPU for a whole slide (307k cells x 5k genes is 11 GiB in float64).
@@ -1325,7 +1329,7 @@ class Regression:
 
                 def objective(B):
                     _, μ = mean(B)
-                    nll = -(y * torch.log(μ + 1e-8) - (y + rg) * torch.log(rg + μ + 1e-8)).sum(0)
+                    nll = -(y * torch.log(μ + 1e-8) - (y + rg) * torch.log(rg + μ + 1e-8)).sum(0, dtype=torch.float64)
                     if cauchy:
                         return nll + torch.log1p((B / γ) ** 2).sum(0)
                     return nll + (B ** 2).sum(0) / (2.0 * γ ** 2)
@@ -1340,21 +1344,23 @@ class Regression:
                              ).reshape(ncells, G, ncov)
                     else:
                         J = λ.unsqueeze(2) * X.unsqueeze(1)
+                    Bd = B.double()
                     if cauchy:
-                        pgrad, pprec = 2.0 * B / (γ ** 2 + B ** 2), 2.0 / (γ ** 2 + B ** 2)
+                        pgrad, pprec = 2.0 * Bd / (γ ** 2 + Bd ** 2), 2.0 / (γ ** 2 + Bd ** 2)
                     else:
-                        pgrad, pprec = B / γ ** 2, torch.full_like(B, 1.0 / γ ** 2)
+                        pgrad, pprec = Bd / γ ** 2, torch.full_like(Bd, 1.0 / γ ** 2)
                     w = rg / (μ * (rg + μ) + 1e-12)
-                    grad = torch.einsum("ngc,ng->gc", J, w * (y - μ)) - pgrad.T
-                    H = torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2)) + pprec.T.unsqueeze(2) * eye
+                    grad = torch.einsum("ngc,ng->gc", J, w * (y - μ)).double() - pgrad.T
+                    H = (torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2)).double()
+                         + pprec.T.unsqueeze(2) * eye)
                     return grad, H
 
                 B = B0[:, sl].clone()
                 nll = objective(B)
                 for _ in range(max_iter):
                     grad, H = curvature(B)
-                    step = torch.linalg.solve(H, grad.unsqueeze(2)).squeeze(2).T     # [ncov, G]
-                    t = torch.ones(B.shape[1], dtype=torch.float64, device=dev)
+                    step = torch.linalg.solve(H, grad.unsqueeze(2)).squeeze(2).T.to(fd)  # [ncov, G]
+                    t = torch.ones(B.shape[1], dtype=fd, device=dev)
                     for _ in range(20):  # per-gene step halving, on the objective alone
                         nll_new = objective(B + step * t)
                         bad = ~(nll_new <= nll + 1e-10)
