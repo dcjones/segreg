@@ -6,6 +6,7 @@ from anndata import AnnData
 from patsy import dmatrix
 from patsy.design_info import DesignMatrix
 from scipy.sparse import coo_matrix, csr_matrix, issparse
+from scipy.sparse import diags as sp_diags
 from scipy.sparse import identity as sp_identity
 from spatialdata import SpatialData
 from torch import Tensor
@@ -386,12 +387,15 @@ class Regression:
         # without the segmenter's contact uncertainty.
         self._A_full = A.astype(np.float32)
         self._bg_full = (to_bg_trans_count / normalizer).astype(np.float32)
-        if not 0.0 <= mixing_scale <= 1.0:
-            raise ValueError(f"mixing_scale must be in [0, 1], got {mixing_scale}")
+        # s > 1 extrapolates: more of each cell's transcripts are taken to have
+        # moved than the segmenter estimated (for platforms where its diffusion
+        # model is too narrow). See _mixing_at for how rows are kept valid.
+        if not 0.0 <= mixing_scale:
+            raise ValueError(f"mixing_scale must be >= 0, got {mixing_scale}")
         if mixing_range is not None:
             lo, hi = mixing_range
-            if not (0.0 <= lo <= mixing_scale <= hi <= 1.0):
-                raise ValueError("mixing_range must satisfy 0 <= lo <= mixing_scale <= hi <= 1")
+            if not (0.0 <= lo <= mixing_scale <= hi):
+                raise ValueError("mixing_range must satisfy 0 <= lo <= mixing_scale <= hi")
             if not include_mixing:
                 raise ValueError("mixing_range needs include_mixing=True")
         self.mixing_scale = float(mixing_scale)
@@ -1172,12 +1176,26 @@ class Regression:
         return out
 
     def _mixing_at(self, scale: float) -> tuple[csr_matrix, npt.NDArray[np.float32]]:
-        """(A_s, bg_s) at mixing scale s: (1 - s) I + s A and s·bg."""
+        """(A_s, bg_s) at mixing scale s: (1 - s) I + s A and s·bg.
+
+        Equivalently I + s (A - I): s scales everything a cell loses (to other
+        cells and to background). For s > 1 a row whose loss 1 - A_ii is more
+        than 1/s would get a negative diagonal, so its scale is capped at
+        1 / (1 - A_ii): that cell is taken to keep none of its transcripts.
+        Rows still sum to 1 and stay non-negative.
+        """
         if scale == 1.0:
             return self._A_full, self._bg_full
         n = self._A_full.shape[0]
-        A = (sp_identity(n, format="csr", dtype=np.float32) * (1.0 - scale) + self._A_full * scale).tocsr()
-        return A.astype(np.float32), (self._bg_full * scale).astype(np.float32)
+        I = sp_identity(n, format="csr", dtype=np.float32)
+        if scale <= 1.0:
+            A = (I * (1.0 - scale) + self._A_full * scale).tocsr()
+            return A.astype(np.float32), (self._bg_full * scale).astype(np.float32)
+        loss = 1.0 - self._A_full.diagonal().astype(np.float64)
+        s_row = np.where(loss > 0, np.minimum(scale, 1.0 / np.maximum(loss, 1e-12)), scale)
+        A = (I + sp_diags(s_row.astype(np.float32)) @ (self._A_full - I)).tocsr()
+        A.data = np.maximum(A.data, 0.0)  # rounding at capped rows
+        return A.astype(np.float32), (self._bg_full * s_row).astype(np.float32)
 
     def range_interval(self, credible_interval: float, chunk: int = 64,
                        max_iter: int = 30, tol: float = 1e-4):
