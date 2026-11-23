@@ -50,7 +50,6 @@ class Regression:
         include_cell_size: bool = False,
         mixing_scale: float = 1.0,
         mixing_range: tuple[float, float] | None = None,
-        leak: dict | None = None,
     ):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
@@ -277,18 +276,11 @@ class Regression:
         X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
         log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
 
-        # The FITTED offset, for the same reason the fitted operator is used below:
-        # a Laplace at rates the model never used is the curvature of a different
-        # model. This CONDITIONS on δ̂ rather than marginalizing it.
-        if getattr(m, "include_cell_size", False):
+        # The fitted offset: this conditions on δ̂ rather than marginalizing it.
+        if m.include_cell_size:
             log_size = log_size + m.δ_size.detach().to(dev).double()
 
-        # The FITTED operator, not proseg's raw one. With a donor-cluster scale the
-        # model's mixing matrix is A' -- off-diagonals scaled by exp(u) and rows
-        # renormalized -- so computing the Laplace against A would evaluate the
-        # curvature of a model that was never fitted. Note this does NOT marginalize
-        # u: it conditions on û, exactly as the interval conditioned on a point κ
-        # before propagate_κ existed, and it is the same gap.
+        # The operator the model was fitted with, i.e. A at mixing_scale.
         A = torch.sparse_csr_tensor(
             torch.as_tensor(self.A.indptr, dtype=torch.int64, device=dev),
             torch.as_tensor(self.A.indices, dtype=torch.int64, device=dev),
@@ -312,7 +304,7 @@ class Regression:
         # is per-(covariate, gene) rather than a scalar, which is the whole point:
         # a large coefficient is barely penalized and gets a likelihood-driven
         # interval, while a null one is prior-dominated.
-        if getattr(m, "β_prior", "normal") == "cauchy":
+        if m.β_prior == "cauchy":
             prior_prec = 2.0 / (float(m.β_prior_σ) ** 2 + B**2)
         else:
             prior_prec = torch.full_like(B, 1.0 / float(m.β_prior_σ) ** 2)
@@ -335,13 +327,12 @@ class Regression:
             chunk = 64
             if dev.type == "cuda":
                 free, _ = torch.cuda.mem_get_info(dev)
-                per_gene = ncells * ncov * 8 * (7 if sandwich else 5)
+                per_gene = ncells * ncov * 8 * 5
                 chunk = int(min(chunk, max(1, (0.7 * free) // per_gene)))
 
-        def laplace_block(sl: slice):
-            """Likelihood block K and the covariance H⁻¹ (sandwiched if asked) for
-            one chunk of genes. Free of side effects apart from phi_out[sl], so a
-            chunk that runs out of memory can simply be retried smaller."""
+        def laplace_cov(sl: slice) -> Tensor:
+            """Laplace covariance H⁻¹ for one chunk of genes. Free of side effects,
+            so a chunk that runs out of memory can simply be retried smaller."""
             G = sl.stop - sl.start
             η = X @ B[:, sl] + gene_bias[sl].unsqueeze(0) + log_size.unsqueeze(1)
             λ = torch.exp(η.clamp(max=30.0))
@@ -361,15 +352,13 @@ class Regression:
             # [G, ncov, ncov] diagonal, since the precision now varies by
             # coefficient as well as by gene.
             H = K + prior_prec[:, sl].T.unsqueeze(2) * eye
-            cov = torch.linalg.inv(H)
-
-            return K, cov
+            return torch.linalg.inv(H)
 
         start = 0
         while start < ngenes:
             sl = slice(start, min(start + chunk, ngenes))
             try:
-                K, cov = laplace_block(sl)
+                cov = laplace_cov(sl)
             except torch.OutOfMemoryError:
                 if chunk == 1:
                     raise
@@ -393,39 +382,28 @@ class Regression:
         ).tocsr()
         return A.astype(np.float32), (self._bg_full * scale).astype(np.float32)
 
-    # TODO: rewrite this super wordy docstring
     def range_interval(
         self,
         credible_interval: float,
         chunk: int = 64,
         max_iter: int = 30,
         tol: float = 1e-4,
-    ):
-        """Posterior interval on β over the declared mixing range.
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        """(lower, upper) bounds on β, [ncovariates, ngenes], over the mixing range.
 
-        The range is rho in [max(rho0 - sd, 0), rho0 + sd] per source, with rho0
-        the fitted (fixed) rate and sd the leak `interval_sd`; with the usual
-        rho0 = sd = rho_max / 2 that is [0, rho_max]. At each of the range's two
-        ends and its middle, every gene's beta is re-solved at that rho -- leak
-        rate AND the matching native-size offset log(n_i - sum_s rho_s E_is P_s.),
-        as `offset_rho` builds it -- and its Laplace interval taken there. The
-        reported interval is the union of the three, so a coefficient is
-        significant only if it is significant everywhere in the range.
+        β is re-solved at each end of `mixing_range` and at `mixing_scale`, and the
+        reported interval is the union of the three Laplace intervals, so a
+        coefficient is significant only if it is significant across the range.
 
-        Each refit conditions on the fitted nuisance parameters (gene_bias, r, the
-        background profile, the cell sizes, A) and solves beta's MAP under the same
-        prior by Fisher scoring with step halving, per gene (the problem is block
-        diagonal by gene), from the fitted beta. The middle is refitted too, so the
-        three intervals are on one footing; the reported Mean stays the fitted one.
+        Each refit holds the other fitted parameters fixed (gene_bias, r, the
+        background profile, cell sizes) and finds β's MAP under the same prior by
+        per-gene Fisher scoring with step halving, starting from the fitted β.
         """
         if self.model is None:
             raise Exception("fit() must be called before range_interval")
+        if self.mixing_range is None:
+            raise ValueError("range_interval needs a mixing_range")
         m = self.model
-
-        if self.include_mixing and getattr(self, "mixing_range", None) is None:
-            raise ValueError(
-                "range_interval needs a mixing_range"
-            )
 
         dev = next(m.parameters()).device
         z = float(stats.norm.ppf(1.0 - (1.0 - credible_interval) / 2.0))
@@ -434,31 +412,23 @@ class Regression:
         r = torch.exp(m.log_r.detach().double()).clamp(min=1e-3)
         bg_profile = torch.softmax(m.bg_rates.detach().double(), dim=-1)
 
-        s0 = getattr(self, "mixing_scale", 1.0)
-        assert self.mixing_range is not None
-        (mix0, mix1) = self.mixing_range
-        settings = [mix0, s0, mix1]
+        lo, hi = self.mixing_range
+        settings = [lo, self.mixing_scale, hi]
 
         X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
-        total = torch.as_tensor(
-            np.asarray(self.X.sum(axis=1)).ravel().astype(np.float64), device=dev
-        )
-        δ = (
-            m.δ_size.detach().double().to(dev)
-            if getattr(m, "include_cell_size", False)
-            else torch.zeros_like(total)
-        )
-        base_log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
+        log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
+        if m.include_cell_size:
+            log_size = log_size + m.δ_size.detach().double().to(dev)
 
         def mixing_tensors(scale):
-            Aop, bg = self._mixing_at(scale) if hasattr(self, "_A_full") else (self.A, self.bg_mix_rate)
+            Aop, bg = self._mixing_at(scale)
             A = torch.sparse_csr_tensor(
                 torch.as_tensor(Aop.indptr, dtype=torch.int64, device=dev),
                 torch.as_tensor(Aop.indices, dtype=torch.int64, device=dev),
                 torch.as_tensor(Aop.data.astype(np.float64), device=dev), size=Aop.shape)
             return A, torch.as_tensor(np.asarray(bg, dtype=np.float64), device=dev)
 
-        cauchy = getattr(m, "β_prior", "normal") == "cauchy"
+        cauchy = m.β_prior == "cauchy"
         γ = float(m.β_prior_σ)
         ncov, ngenes = B0.shape
         ncells = X.shape[0]
@@ -468,7 +438,6 @@ class Regression:
 
         for scale in settings:
             A, bg_mix = mixing_tensors(scale)
-            log_size = base_log_size + δ
 
             for start in range(0, ngenes, chunk):
                 sl = slice(start, min(start + chunk, ngenes))
@@ -551,7 +520,7 @@ class Regression:
     def _counts_chunk(self, sl: slice, dev) -> Tensor:
         """Observed counts for a slice of genes, as a dense [ncells, G] tensor.
 
-        Column-slicing a CSR matrix costs a pass over its nnz, and posterior_sd asks
+        Column-slicing a CSR matrix costs a pass over its nnz, and range_interval asks
         for ~n_genes/chunk slices (over a thousand on a WTA panel), so the CSC copy
         is built once and cached. It is the same nnz as self.X, not a densification.
         """
@@ -574,11 +543,10 @@ class Regression:
 
         Read `delta` against `log_size_fixed`: a δ that is uncorrelated with the
         cell's total is the mixing correction the offset could not express, while a δ
-        that tracks the total is the model disagreeing about depth itself -- and the
-        latter is the case where it can compete with the DE signal, since a planted
-        effect carrying real mass moves the total too (DESIGN_v2 §74).
+        that tracks the total is the model disagreeing about depth itself, which can
+        compete with the DE signal.
         """
-        if self.model is None or not getattr(self.model, "include_cell_size", False):
+        if self.model is None or not self.model.include_cell_size:
             raise Exception("no cell size factor on this fit")
         d = self.model.δ_size.detach().cpu().numpy().astype(np.float64)
         return pd.DataFrame(
@@ -605,21 +573,15 @@ class Regression:
             .reset_index(names="Covariate")
         )
 
-        if credible_interval is not None and getattr(self, "mixing_range", None) is not None:
-            lo, hi = self.range_interval(credible_interval)
+        if credible_interval is not None:
+            if self.mixing_range is not None:
+                lo, hi = self.range_interval(credible_interval)
+            else:
+                β_σ = self.posterior_sd()
+                z = stats.norm.ppf(1.0 - (1.0 - credible_interval) / 2.0)
+                lo, hi = β_μ - z * β_σ, β_μ + z * β_σ
             df["Lower"] = lo.flatten(order="F")
             df["Upper"] = hi.flatten(order="F")
-            df["MinimumCredible"] = np.where(
-                df["Lower"] > 0,
-                df["Lower"],
-                np.where(df["Upper"] < 0, df["Upper"], 0.0),
-            )
-        elif credible_interval is not None:
-            β_σ = self.posterior_sd()
-
-            z = stats.norm.ppf(1.0 - (1.0 - credible_interval) / 2.0)
-            df["Lower"] = (β_μ - z * β_σ).flatten(order="F")
-            df["Upper"] = (β_μ + z * β_σ).flatten(order="F")
             df["MinimumCredible"] = np.where(
                 df["Lower"] > 0,
                 df["Lower"],
@@ -635,7 +597,6 @@ class RegressionModel(nn.Module):
     """
 
     include_mixing: bool
-    include_drift: bool
 
     def __init__(
         self,

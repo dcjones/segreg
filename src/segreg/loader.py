@@ -30,8 +30,7 @@ class RegressionBatch:
     bg_weight: Tensor  # [nnodes] mixing weight with bg
 
     # [nnodes] each node's index in the FULL cell ordering, receivers first.
-    # Needed by any term that carries a per-cell quantity the loader does not
-    # already stage (the cell-space drift field); nothing else reads it.
+    # Used to index per-cell parameters (the cell size factor δ).
     nodes: Tensor
 
 
