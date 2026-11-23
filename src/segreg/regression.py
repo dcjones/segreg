@@ -1,22 +1,19 @@
-
 import warnings
 from typing import cast
 
+import numpy as np
+import numpy.typing as npt
+import pandas as pd
+import torch
 from anndata import AnnData
 from patsy import dmatrix
 from patsy.design_info import DesignMatrix
+from scipy import stats
 from scipy.sparse import coo_matrix, csr_matrix, issparse
 from scipy.sparse import identity as sp_identity
 from spatialdata import SpatialData
-from torch import Tensor
-import numpy as np
-import numpy.typing as npt
-import torch
-import torch.nn as nn
-import pandas as pd
-import scipy.stats as stats
+from torch import Tensor, nn
 
-from .drift import compute_drift
 from .loader import RegressionBatch, RegressionBatchLoader
 
 
@@ -45,23 +42,16 @@ class Regression:
     # true if the estimated mixing matrix should be used
     include_mixing: bool
 
-    def __init__(self, data: SpatialData | AnnData, formula: str, include_mixing: bool=True,
-                 mixing_interval_correction: bool=False, include_drift: bool=False,
-                 drift: pd.DataFrame | None=None, include_cellspace: bool=False,
-                 cellspace: dict | None=None, cellspace_percluster: bool=False,
-                 cellspace_shrink_σ: float=1.0, propagate_κ: bool | None=None,
-                 κ_rel_sd: float | None=None, include_donor_scale: bool=False,
-                 donor_clusters: np.ndarray | None=None,
-                 include_cell_size: bool=False, quasi_interval: bool=False,
-                 mixing_scale: float=1.0,
-                 mixing_range: tuple[float, float] | None=None,
-                 offset: npt.NDArray[np.float64] | pd.Series | None=None,
-                 drift_clusters: np.ndarray | None=None,
-                 drift_weights: str="none", drift_resolution: float=1.0,
-                 drift_n_pcs: int=50, drift_n_top_genes: int=2000,
-                 drift_gene_chunk: int=500, drift_seed: int=0,
-                 drift_transform: str="linear", drift_mu_ridge: float=10.0,
-                 drift_verbose: bool=True, leak: dict | None=None):
+    def __init__(
+        self,
+        data: SpatialData | AnnData,
+        formula: str,
+        include_mixing: bool = True,
+        include_cell_size: bool = False,
+        mixing_scale: float = 1.0,
+        mixing_range: tuple[float, float] | None = None,
+        leak: dict | None = None,
+    ):
         if isinstance(data, SpatialData):
             adata = data.tables["table"]
         elif isinstance(data, AnnData):
@@ -71,179 +61,6 @@ class Regression:
 
         self.var_names = list(adata.var_names)
         self.include_mixing = include_mixing
-        # Widen the reported intervals for the correlation that molecule
-        # reallocation induces between cells sharing a donor. Off by default, and
-        # it changes only posterior_sd() -- never the fit, never a point estimate.
-        self.mixing_interval_correction = mixing_interval_correction
-        # --- what VARIANCE FUNCTION the reported interval is built from ----------
-        # The likelihood's own NB curvature, r/(mu(r+mu)), or the quasi-Poisson one,
-        # 1/(phi_g mu), with phi_g the per-gene Pearson dispersion of the same fit.
-        # Off by default: the NB weight is the model's own curvature and swapping it
-        # is a claim about the variance function, not a bug fix. Like
-        # mixing_interval_correction it changes only posterior_sd() -- never the fit,
-        # never a point estimate.
-        #
-        # WHY IT IS HERE (simple-seg-sim DESIGN_v2 §84-§85). Graded against the true
-        # sampling sd -- measured across emission replicates, so it references no
-        # truth at all -- the NB interval is 1.55x (313-gene panel) to 1.95x
-        # (16.7k-gene panel) too WIDE on the well-measured coefficients, and that
-        # width is the entire power deficit against a plain quasi-Poisson GLM. Two
-        # things cause it and they compound:
-        #
-        #   * r_hat is biased LOW. The fitted NB variance claims ~2x the squared
-        #     residual the data shows at the fitted mean, on 84-91% of genes.
-        #   * the mu^2/r term MISPLACES that error. NB information per cell saturates
-        #     at r as mu grows while quasi-Poisson information keeps growing, so a
-        #     uniform level error in r_hat becomes an abundance-GRADED width error:
-        #     sd_qp/sd_nb is ~1.0 at the median pair and 0.49-0.53 on the abundant
-        #     genes, which is where any real effect is measurable in the first place.
-        #
-        # Measured, the swap lands on the sampling sd (reported/empirical 1.55 -> 0.89
-        # and 1.95 -> 0.93) and is a Pareto move rather than a trade: it makes the
-        # interval WIDER on nulls and NARROWER on effects at the same time, so false
-        # positives fall with false negatives.
-        #
-        # It is NOT a substitute for the sandwich and the two may not be combined:
-        # both re-state the same covariance from different premises (a different
-        # variance function vs. a between-cell correlation the variance function
-        # cannot express), and composing them would double-count.
-        self.quasi_interval = quasi_interval
-        self.include_drift = include_drift
-        # --- what β's INTERVAL knows about κ -------------------------------------
-        # Reported β is what is left after δ = κ*u, so β's uncertainty ought to
-        # include not knowing the split. By default it does NOT: posterior_sd
-        # conditions on the fitted point κ, which is a MAP parameter. These two
-        # knobs are the two available answers, and they are different in kind.
-        #
-        # `propagate_κ` is the HONEST IN-MODEL one: marginalize κ out of the joint
-        # Laplace instead of pinning it (see posterior_sd). It needs no assumption,
-        # and its size is a property of the panel rather than a choice --
-        # measured on simple-seg-sim, the implied sd(κ) is σ/sqrt(Σ_g u²), which is
-        # 0.027-0.075 on the 16.7k-gene WTA and 0.083-0.627 on the 313-gene panel.
-        # So it is expected to be negligible on a large panel and material on a
-        # small one, for the reason DESIGN_v2 §62 gives: β's prior outvotes κ by
-        # ~n_genes to 1, and n_genes is what differs.
-        #
-        # `κ_rel_sd` is the DECLARED MISSPECIFICATION one, mirroring the post-hoc
-        # arm's `kappa_rel_sd`: extra sd `κ_rel_sd * |κ_k| * |u[k,g]|` added in
-        # quadrature. It exists because the in-model uncertainty above answers
-        # "how well is the split determined GIVEN this prior", not "how wrong might
-        # this κ be" -- and on a WTA panel the first is ~0 while the second plainly
-        # is not. It is an assumption, of exactly the epistemic status of the
-        # post-hoc arm's 0.5, and it is recorded as one.
-        #
-        # Both change only posterior_sd(); neither touches the fit or a point
-        # estimate. They compose (variances add).
-        #
-        # `propagate_κ=None` (the default) resolves to ON whenever there IS a drift
-        # term and off otherwise, because measured on both benchmark datasets it is
-        # free where it cannot help and a real gain where it can: on the 313-gene
-        # panel it moves FP panel 0.250 -> 0.217 and cur FP 0.289 -> 0.257 for FN
-        # +0.003, a ~10:1 exchange, while on the 16.7k-gene panel every metric is
-        # unchanged to 3-4 decimals (§65). It cannot cost power in the ordinary
-        # sense either -- it only widens intervals, and only the pairs whose β
-        # actually depended on the split. Pass False explicitly for the
-        # κ-conditional interval, which is what every result before §65 used.
-        self.propagate_κ = (include_drift if propagate_κ is None
-                            else propagate_κ)
-        self.κ_rel_sd = κ_rel_sd
-
-        # --- a LEARNED scale on A's off-diagonal, indexed by the DONOR's cluster --
-        # A is otherwise a known constant. This makes it uncertain in the one way
-        # that is both identified and cheap: one scalar per unsupervised donor
-        # cluster, `A'[i,j] = A[i,j] exp(u_c(j))`, with each row renormalized so its
-        # total (and therefore the background share) is untouched.
-        #
-        # WHY THIS PARAMETERIZATION, from simple-seg-sim DESIGN_v2 §71-§72:
-        #   * per-cell freedom cannot work -- missegmentation is not independent
-        #     noise, so per-cell adjustment adds variance without touching the
-        #     correlated part that makes coefficients spurious;
-        #   * a constant or per-gene scale is too crude, and cell-type indexing needs
-        #     annotations this model does not assume;
-        #   * a donor-cluster scale IS identified by data: 76-81% of the variance of
-        #     each cell's donor-composition vector is orthogonal to the design
-        #     (against the drift covariate's 0%, which is why κ was exactly flat and
-        #     had to be settled by a prior), and only ~1% lies on the exposure
-        #     columns, so it cannot steal the DE signal;
-        #   * and it captures ~47-60% of the variance of A's error where it MATTERS,
-        #     i.e. projected onto the coefficients, at correlation 0.93 -- against
-        #     only 13% of A's raw off-diagonal L1 error, which is why §71's
-        #     truth-matching experiment looked so much worse than this.
-        #
-        # ⚠ THE INTERVAL PAYOFF IS NOT AUTOMATIC. Mean-field VI factorizes
-        # q(β, u) = q(β)q(u), so it carries no β-u posterior correlation and β's
-        # reported width stays at its CONDITIONAL value. §72's measured effect --
-        # A's error correlated across cells by ~3 orders of magnitude over an
-        # independent-rows model, worth ~1.2-1.4x in sd -- reaches β's interval only
-        # once u is MARGINALIZED in posterior_sd, exactly as κ is under propagate_κ.
-        # This object fits u and applies it consistently; the marginalization is a
-        # separate step and is not done here.
-        self.include_donor_scale = include_donor_scale
-        self.donor_clusters = None
-        if include_donor_scale:
-            if donor_clusters is None:
-                raise ValueError(
-                    "include_donor_scale=True requires `donor_clusters`: an integer "
-                    "label per cell, in this object's cell order, giving the cluster "
-                    "a cell belongs to WHEN IT ACTS AS A DONOR. -1 means unlabelled, "
-                    "and such a donor's weight is left exactly as proseg had it.")
-            dc = np.asarray(donor_clusters).astype(np.int64).ravel()
-            if len(dc) != adata.n_obs:
-                raise ValueError(
-                    f"`donor_clusters` has {len(dc)} entries for {adata.n_obs} cells")
-            self.donor_clusters = dc
-        elif donor_clusters is not None:
-            raise ValueError(
-                "`donor_clusters` supplied but include_donor_scale is False")
-        # --- the CELL-SPACE alternative to the drift term ------------------------
-        # `include_drift` adds kappa*u to the COEFFICIENT, where u is frac projected
-        # onto the design; this adds kappa*frac[i,g] to each cell's linear predictor
-        # directly, keeping the component of frac ORTHOGONAL to the design that the
-        # projection discards.
-        #
-        # Why it might win: simple-seg-sim DESIGN_v2 §60 measured that the rank-one
-        # residual is reproducibly structured (cross-seed rho 0.31-0.34) but is
-        # explained by NO analytic second direction we could construct (best
-        # |corr| 0.12 against headroom 0.19-0.24 R²). Using the full field requires
-        # no such guess.
-        #
-        # Why it might lose: (d/s - 1) is wildly heterogeneous (IQR 1.3 breast,
-        # 2.8 Atera), so a single kappa is an average either way -- and the
-        # coefficient-space version averages it over exactly the direction that
-        # biases beta, while this averages over the whole field, most of which is
-        # orthogonal to the design and cannot bias anything.
-        #
-        # frac is never materialized (3.0 GB on Atera); the pieces are held and
-        # recombined per minibatch. See cellspace_frac().
-        self.include_cellspace = include_cellspace
-        # RUNG 2 of the scale ladder. With one global kappa the cell-space term
-        # INJECTS bias: fitted at -2.31 (breast) / -3.43 (Atera) it lands on an
-        # average dominated by the large tumor types and then distorts every type
-        # whose frac-design alignment differs from that average -- breast Invasive
-        # Tumor's null bias went +0.005 -> +0.370 and its FP 0.273 -> 0.870
-        # (simple-seg-sim DESIGN_v2 §61).
-        #
-        # That is also what made the §61 comparison UNFAIR: the drift arms carry
-        # kappa per design column, which is kappa per cell type (13 breast, 9
-        # Atera), against a single scalar here. Per-cluster kappa is the like-for-
-        # like test -- Leiden clusters are annotation-free and at least as granular
-        # (56 breast, 225 Atera).
-        #
-        # Parameterized as kappa_c = kappa0 + delta_c with delta penalized, so the
-        # cluster count does not buy unchecked freedom against a likelihood that is
-        # exactly flat in this direction per parameter.
-        self.cellspace_percluster = cellspace_percluster
-        self.cellspace_shrink_σ = cellspace_shrink_σ
-        self.cellspace = None
-        if include_cellspace:
-            if cellspace is None:
-                raise ValueError(
-                    "include_cellspace=True requires `cellspace`: the dict written "
-                    "by bench/scripts/cluster_mixing_covariates.py --reduce field "
-                    "(M, sw, own, P, original_cell_id, genes).")
-            self.cellspace = cellspace
-        elif cellspace is not None:
-            raise ValueError("`cellspace` supplied but include_cellspace is False")
 
         # In anndata X can be practically anything array like, but proseg always outputs csr matrices
         assert isinstance(adata.X, csr_matrix)
@@ -255,112 +72,18 @@ class Regression:
         design_df = dmatrix(formula, adata.obs, return_type="dataframe")
         self.design = cast(DesignMatrix, design_df)
 
-        # --- the DRIFT covariate ------------------------------------------------
-        # u[k, g] is the exposure slope of gene g's foreign share along design
-        # column k -- the direction along which missegmentation biases a
-        # coefficient. COMPUTED HERE by default, from this object's own counts,
-        # transition matrix and design matrix (see drift.py for the construction
-        # and why it is the projection form). `drift=` remains as a seam for a
-        # covariate built some other way -- an oracle-built or deliberately
-        # perturbed u is how u's own robustness gets measured -- but the leading
-        # correction now needs no preprocessing step.
-        #
-        # WHY THIS IDENTIFIES. The mean model fits design @ (β + κ*u), so β and δ
-        # = κ*u compete to explain the same exposure-correlated variation. What
-        # separates them is that β carries the N(0, β_prior_σ²) KL prior and κ does
-        # not, so variation that u can explain is explained by κ -- one scalar per
-        # design column -- leaving β shrunk toward zero. That asymmetry, not an
-        # extra prior on κ, is the mechanism: a coefficient is pulled to zero
-        # exactly where the data are consistent with contamination. Which is also
-        # why κ has no prior of its own; adding one would fight the mechanism.
-        #
-        # Reported coefficients are β, NOT β + δ, so get_regression_coefficients()
-        # returns the de-biased estimate without any change.
-        self.drift = None
-        self.drift_supplied = drift is not None
-        self.drift_clusters = drift_clusters
-        # Recorded so a caller reading settings back off the object (bench's
-        # `resolved_kwargs` does exactly this) sees what the build actually used,
-        # not what the config asked for.
-        self.drift_weights = drift_weights
-        self.drift_resolution = drift_resolution
-        self.drift_n_pcs = drift_n_pcs
-        self.drift_n_top_genes = drift_n_top_genes
-        self.drift_gene_chunk = drift_gene_chunk
-        self.drift_seed = drift_seed
-        self.drift_transform = drift_transform
-        self.drift_mu_ridge = drift_mu_ridge
-        self.drift_verbose = drift_verbose
-        if include_drift:
-            cols = list(self.design.design_info.column_names)
-            if drift is None:
-                # The counts and the transition matrix are read straight off the
-                # AnnData rather than from self.X / self.A: the covariate is defined
-                # on the raw transition counts (background excluded), while self.A is
-                # row-normalized WITH background, and self.X may later be reassigned.
-                u, labels = compute_drift(
-                    adata.X,
-                    adata.obsp["state_transitions"],
-                    np.asarray(design_df, dtype=np.float64),
-                    self.var_names,
-                    clusters=drift_clusters,
-                    weights=drift_weights,
-                    resolution=drift_resolution,
-                    n_pcs=drift_n_pcs,
-                    n_top_genes=drift_n_top_genes,
-                    gene_chunk=drift_gene_chunk,
-                    seed=drift_seed,
-                    transform=drift_transform,
-                    mu_ridge=drift_mu_ridge,
-                    verbose=drift_verbose,
-                )
-                self.drift_clusters = labels
-                self.drift = u.astype(np.float32)
-            else:
-                if drift_transform != "linear":
-                    raise ValueError(
-                        "`drift_transform` applies only to a covariate computed here; "
-                        "a supplied `drift=` table is used as given.")
-                self.drift_clusters = None
-                aligned = drift.reindex(index=cols, columns=self.var_names)
-                # A silent misalignment produces an all-zero u and an arm that looks
-                # like a no-op rather than like a bug, so it is an error.
-                n_ok = int(aligned.notna().any(axis=1).sum())
-                if n_ok == 0:
-                    raise ValueError(
-                        "`drift` shares no index value with the design's column "
-                        f"names. Design columns look like {cols[:3]}; drift index "
-                        f"looks like {list(drift.index[:3])}. The index must be "
-                        "design column names, not cell-type labels."
-                    )
-                self.drift = aligned.fillna(0.0).to_numpy(dtype=np.float32)
-        elif drift is not None:
-            raise ValueError("`drift` was supplied but include_drift is False")
-        elif drift_clusters is not None:
-            raise ValueError(
-                "`drift_clusters` was supplied but include_drift is False")
-
         # Construct the neighbor mixing matrix
         state_transitions = adata.obsp["state_transitions"]
         assert isinstance(state_transitions, csr_matrix)
 
-        # TODO: Okay, where does from_bg_trans_count come into play? Do we actually need that?
-        # assert "from_bg_trans_count" in adata.obs
-        # from_bg_trans_count = np.asarray(adata.obs["from_bg_trans_count"])
-
         assert "to_bg_trans_count" in adata.obs
         to_bg_trans_count = np.asarray(adata.obs["to_bg_trans_count"])
 
-        total_transitions = np.asarray(state_transitions.sum(axis=1)).squeeze() + to_bg_trans_count
+        total_transitions = (
+            np.asarray(state_transitions.sum(axis=1)).squeeze() + to_bg_trans_count
+        )
 
-        # A cell with no transcripts has no recorded transitions either, so this
-        # normalization would be 0/0. Dividing by 1 instead leaves such a cell
-        # with an all-zero mixing row and a zero background weight, which makes
-        # its λ_obs exactly 0 against an all-zero X: a likelihood term of ~0 that
-        # contributes to no gradient. That is equivalent to dropping the cell,
-        # but keeps the batch indexing and the cell ordering intact. Without the
-        # guard the NaN reaches every shared parameter on the first step and the
-        # whole fit is NaN.
+        # Avoid division by zero, typically in cases with entirely empty cells
         empty = total_transitions == 0
         if empty.any():
             warnings.warn(
@@ -375,15 +98,7 @@ class Regression:
         assert isinstance(A, coo_matrix)
         A = A.tocsr()
         assert isinstance(A, csr_matrix)
-        # The segmenter's mixing at full strength. `mixing_scale` s interpolates
-        # between no mixing and that: A_s = (1 - s) I + s A, background share s·bg,
-        # so every row still sums to 1. Taken at face value (s = 1) proseg's mixing
-        # over-corrects on real data (segreg-rcc: the likelihood wants ~1-13% of
-        # it), so `mixing_range` = (lo, hi) treats s as a DECLARED nuisance the way
-        # the leak range treats rho: the point estimate is fitted at mixing_scale,
-        # and the interval is the union of refits at the range's ends (see
-        # range_interval). A coefficient is then significant only if it is with and
-        # without the segmenter's contact uncertainty.
+
         self._A_full = A.astype(np.float32)
         self._bg_full = (to_bg_trans_count / normalizer).astype(np.float32)
         if not 0.0 <= mixing_scale <= 1.0:
@@ -391,216 +106,25 @@ class Regression:
         if mixing_range is not None:
             lo, hi = mixing_range
             if not (0.0 <= lo <= mixing_scale <= hi <= 1.0):
-                raise ValueError("mixing_range must satisfy 0 <= lo <= mixing_scale <= hi <= 1")
+                raise ValueError(
+                    "mixing_range must satisfy 0 <= lo <= mixing_scale <= hi <= 1"
+                )
             if not include_mixing:
                 raise ValueError("mixing_range needs include_mixing=True")
         self.mixing_scale = float(mixing_scale)
-        self.mixing_range = None if mixing_range is None else (float(mixing_range[0]), float(mixing_range[1]))
+        self.mixing_range = (
+            None
+            if mixing_range is None
+            else (float(mixing_range[0]), float(mixing_range[1]))
+        )
         self.A, self.bg_mix_rate = self._mixing_at(self.mixing_scale)
 
-        # Observed totals are very nearly a fixed point of the mixing model
-        # (median relative error of A @ s + bg vs s is -0.2%), so they are used as a
-        # fixed offset rather than fitting per-cell size factors.
-        #
-        # ⚠ THAT FIXED POINT IS A MEDIAN, AND THE COST IS A SPREAD (simple-seg-sim
-        # DESIGN_v2 §74). Summing the model over genes gives cell i a predicted total
-        # of `sum_j A[i,j] gamma_j s_j + b_i s_i`, a weighted average of its
-        # NEIGHBOURS' totals, and `rho_i = predicted/observed` is exactly 1 for every
-        # cell only when mixing is off. Its median is indeed ~1 on both benchmark
-        # datasets (1.015 breast / 1.056 Atera) while its SPREAD is not (sd log rho
-        # 0.247 vs 0.711; 5.2% vs 16.8% of cells beyond 0.5 in log). The Poisson cost
-        # of a scale error goes like c (log rho)²/2, so it is billed on the spread:
-        # measured, it accounts for 0.6-0.7 of a 37.7 nats/cell penalty that made
-        # mixing WORSE than no mixing on the 16.7k-gene panel.
-        #
-        # `include_cell_size` is the response: a per-cell log-scale learned as a
-        # DEVIATION from this offset, so that unset (or shrunk hard) reproduces the
-        # behaviour above exactly.
         counts = np.asarray(self.X.sum(axis=1)).squeeze()
         self.log_size = np.log(np.maximum(counts, 1)).astype(np.float32)
-        # --- an EXTERNALLY SUPPLIED offset, replacing the observed total ----------
-        # The observed total is what the segmenter ASSIGNED to a cell -- its retained
-        # mass plus INFLOW -- while λ_i is the rate of what the cell EMITTED, retained
-        # plus OUTFLOW. A caller that can compute the emitted total (it is derivable
-        # from the segmenter's own transition matrix; see simple-seg-sim
-        # bench/scripts/flow_offset.py and DESIGN_v2 §95) can pass it here.
-        #
-        # A SEAM, not a mechanism: nothing in this class computes an offset, and the
-        # default is unchanged. It exists because the fixed-point argument above is a
-        # MEDIAN and the cost is a SPREAD, and because the offset is the one input the
-        # mixing model is known to be coupled to (§74) -- so whether a better offset
-        # helps is a question this class could not previously be asked.
-        #
-        # Supplied on the LOG scale and as a per-cell vector in this object's row
-        # order, or as a pandas Series indexed by `original_cell_id`, which is checked
-        # against the obs column rather than trusted -- a silent misalignment here
-        # would read as a weak result rather than as a bug.
-        self.offset_supplied = offset is not None
-        if offset is not None:
-            if isinstance(offset, pd.Series):
-                if "original_cell_id" not in adata.obs:
-                    raise ValueError(
-                        "offset given as a Series (indexed by original_cell_id) but "
-                        "the AnnData has no original_cell_id column to align to")
-                oid_o = np.asarray(adata.obs["original_cell_id"]).astype(np.int64)
-                v = offset.reindex(oid_o)
-                if v.isna().any():
-                    raise ValueError(
-                        f"offset is missing {int(v.isna().sum())} of {len(oid_o)} "
-                        "cells by original_cell_id; refusing to fill a size factor")
-                offset = v.to_numpy()
-            offset = np.asarray(offset, dtype=np.float64).squeeze()
-            if offset.shape != (self.X.shape[0],):
-                raise ValueError(
-                    f"offset has shape {offset.shape}, expected "
-                    f"({self.X.shape[0]},) -- one log-scale value per cell")
-            if not np.all(np.isfinite(offset)):
-                raise ValueError("offset contains non-finite values")
-            self.log_size = offset.astype(np.float32)
         self.include_cell_size = include_cell_size
-
-        if self.cellspace is not None:
-            cs = self.cellspace
-            # Align to THIS object's cell order by original_cell_id and to its gene
-            # order by name. A silent misalignment here would look like a weak
-            # result rather than a bug, so both are errors.
-            oid = np.asarray(adata.obs["original_cell_id"]).astype(np.int64)
-            pos = pd.Series(np.arange(len(cs["original_cell_id"])),
-                            index=np.asarray(cs["original_cell_id"]).astype(np.int64))
-            pos = pos[~pos.index.duplicated()]
-            row = pos.reindex(oid)
-            if row.isna().any():
-                raise ValueError(
-                    f"`cellspace` is missing {int(row.isna().sum())} of "
-                    f"{len(oid)} cells; it must cover every cell of this object.")
-            gi = pd.Series(np.arange(len(cs["genes"])),
-                           index=np.asarray(cs["genes"]).astype(str))
-            gi = gi[~gi.index.duplicated()].reindex(
-                [str(v) for v in self.var_names])
-            if gi.isna().all():
-                raise ValueError(
-                    "`cellspace` shares no gene name with this object.")
-            self._cs_gene = gi.fillna(-1).to_numpy().astype(np.int64)
-            r_ = row.to_numpy().astype(int)
-            self.cellspace = dict(
-                M=np.ascontiguousarray(cs["M"][r_]),
-                sw=np.ascontiguousarray(cs["sw"][r_]),
-                own=np.ascontiguousarray(cs["own"][r_]).astype(np.int64),
-                P=np.ascontiguousarray(cs["P"]),
-                gene_index=self._cs_gene,
-            )
-            n_missing = int((self._cs_gene < 0).sum())
-            if n_missing:
-                warnings.warn(
-                    f"{n_missing} of {len(self._cs_gene)} genes absent from "
-                    "`cellspace`; their cell-space correction is 0.",
-                    stacklevel=2)
-
-        # --- a LONG-RANGE LEAK nuisance -------------------------------------------
-        #
-        # MODEL. Indices: i index cell, j source cell, g gene, s source group (e.g.
-        # a segmenter component), k design column.
-        #
-        #   X_ig ~ NegBin(mu_ig, r_g)
-        #   mu_ig = lambda_ig (+ mixing/background) + L_ig
-        #   log lambda_ig = log n_i + b_g + sum_k D_ik beta_kg
-        #   L_ig = sum_s rho_s E_is P_sg
-        #   E_is = A_i sum_{j in s, j != i} N_j K(x_i - x_j)
-        #
-        # P_sg: group s's profile (fraction of its counts in gene g, rows sum to 1).
-        # E_is: expected leaked transcripts (all genes) landing in cell i per unit
-        # rate -- A_i cell area, N_j source total count, x centroids, K a 2D leak
-        # kernel density integrating to 1. rho_s: fraction of a source's emission
-        # that leaks AND is still in X; one per group, shared across genes. All of
-        # E and P are built by the caller (simple-seg-sim2 eval/leak_nuisance.py
-        # builds them from proseg components with a fixed 0.5*G12 + 0.5*G48 kernel).
-        #
-        # rho is not fitted for reporting (it is not identified; see below). The
-        # point estimate uses a stated rho0 (fit's leak_prior_μ = log rho0 with
-        # leak_prior_σ = 0, and `offset_rho` = rho0 so the offset is the native size
-        # log(n_i - sum_s rho0_s E_is)), and `interval_sd` sigma_s adds
-        #   Var(beta_kg) += sum_s (d beta_kg / d rho_s)^2 sigma_s^2,
-        #   d beta_g / d rho = -H_gg^-1 H_g,rho,  H_g,rho = sum_i J_ig w_ig E_is P_sg
-        # in posterior_sd. A declared range rho_s in [0, rho_max_s] maps to
-        # rho0 = sigma = rho_max / 2. See proseg leakage-field-mvp.md, "Model
-        # specification: leak as a segreg nuisance".
-        #
-        # Additive in count space: lambda_obs[i, g] += sum_s rho_s E[i, s] P[s, g].
-        # E[i, s] is cell i's exposure to leak from source group s (the source
-        # group's emission density blurred by a fixed leak kernel and integrated
-        # over the cell) and P[s, g] the source group's gene profile, so E P is the
-        # expected leak count at rho = 1. Only rho, one scalar per source group,
-        # SHARED ACROSS GENES, is fitted (see fit's leak_prior_*).
-        #
-        # Why here rather than in the segmenter (proseg leakage-field-mvp.md): a
-        # leak term only decontaminates when it competes against a POOLED native
-        # rate; against per-cell or per-component rates the native model absorbs
-        # the leak. This regression's design already pools by cell type, and
-        # because rho is shared across genes, a leak-shaped effect (the source's
-        # whole profile, in proportion) is separable from a gene-specific niche
-        # effect at the same length scale.
-        #
-        # `leak` = dict(E=[ncells, nsources], P=[nsources, ngenes_P],
-        # genes=[ngenes_P] names, optional names=[nsources], optional offset_rho). P is aligned to this
-        # object's genes by name; genes absent from P get no leak.
-        self.leak = None
-        if leak is not None:
-            E = np.asarray(leak["E"], dtype=np.float32)
-            if E.ndim != 2 or E.shape[0] != adata.n_obs:
-                raise ValueError(f"leak E has shape {E.shape}, expected ({adata.n_obs}, nsources)")
-            gpos = pd.Series(np.arange(len(leak["genes"])), index=np.asarray(leak["genes"]).astype(str))
-            gpos = gpos[~gpos.index.duplicated()].reindex([str(v) for v in self.var_names])
-            if gpos.isna().all():
-                raise ValueError("leak P shares no gene name with this object")
-            Psrc = np.asarray(leak["P"], dtype=np.float32)
-            if Psrc.shape[0] != E.shape[1]:
-                raise ValueError(f"leak P has {Psrc.shape[0]} sources, E has {E.shape[1]}")
-            P = np.zeros((E.shape[1], len(self.var_names)), dtype=np.float32)
-            ok = gpos.notna().to_numpy()
-            P[:, ok] = Psrc[:, gpos[ok].to_numpy().astype(int)]
-            if not (np.isfinite(E).all() and np.isfinite(P).all() and (E >= 0).all() and (P >= 0).all()):
-                raise ValueError("leak E and P must be finite and non-negative")
-            names = list(leak.get("names", [f"source{i}" for i in range(E.shape[1])]))
-            # `interval_sd`: a DECLARED uncertainty on the residual leak rate per
-            # source (absolute rho units), propagated into beta's interval in
-            # posterior_sd -- not fitted. Fitting rho from the regression's own data
-            # confuses leak with source-shaped biology and with the segmenter's
-            # gene-dependent filtering (both measured on simple-seg-sim2), so the
-            # range is the segmenter's to declare: how much residual leak its counts
-            # may still contain. A better segmenter declares a tighter range.
-            isd = leak.get("interval_sd")
-            if isd is not None:
-                isd = np.broadcast_to(np.asarray(isd, dtype=np.float64), (E.shape[1],)).copy()
-                if not (np.isfinite(isd).all() and (isd >= 0).all()):
-                    raise ValueError("leak interval_sd must be finite and non-negative")
-            # `interval_method`: how the declared range [rho0 - sd, rho0 + sd]
-            # (clipped at 0) reaches beta's interval. "linear" (default) adds
-            # (d beta / d rho)^2 sd^2 at rho0 (posterior_sd). "refit" re-solves
-            # each gene's beta at the range's ends and middle and reports the union
-            # of their Laplace intervals (leak_range_interval) -- exact for any
-            # monotone dependence on rho, where the linear term under-covers:
-            # leak is additive in count space but beta is on the log scale, so for
-            # a source's specific genes beta(rho) is strongly curved.
-            method = leak.get("interval_method", "linear")
-            if method not in ("linear", "refit"):
-                raise ValueError(f"leak interval_method must be 'linear' or 'refit', got {method!r}")
-            if method == "refit" and isd is None:
-                raise ValueError("leak interval_method 'refit' needs interval_sd (the range half-width)")
-            self.leak = dict(E=E, P=P, names=names, interval_sd=isd, interval_method=method)
-            # The offset is log(observed total), and the observed total INCLUDES the
-            # leaked counts, so exposed cells' native rates are already inflated by
-            # the leak and adding it on top double-counts (a known rate then
-            # over-corrects; a free rate silently fits low to compensate). With
-            # `offset_rho` (one value or one per source) the offset is instead
-            # log(total - expected leak at that rate), i.e. the native size. Ignored
-            # if an explicit `offset` was supplied.
-            if leak.get("offset_rho") is not None and offset is None:
-                rho_ref = np.broadcast_to(np.asarray(leak["offset_rho"], dtype=np.float64), (E.shape[1],))
-                leaked = (E.astype(np.float64) * rho_ref) @ P.sum(1).astype(np.float64)
-                total = np.asarray(self.X.sum(axis=1)).squeeze().astype(np.float64)
-                self.log_size = np.log(np.maximum(total - leaked, 1.0)).astype(np.float32)
-
-        self.spatial = np.asarray(adata.obsm["spatial"]) if "spatial" in adata.obsm else None
+        self.spatial = (
+            np.asarray(adata.obsm["spatial"]) if "spatial" in adata.obsm else None
+        )
 
     def fit(
         self,
@@ -609,12 +133,7 @@ class Regression:
         lr: float = 0.01,
         β_prior: str = "cauchy",
         β_prior_σ: float = 1.0,
-        κ_prior_μ: float = 0.0,
-        κ_prior_σ: float | None = None,
-        u_prior_σ: float = 0.1,
         size_prior_σ: float = 0.2,
-        leak_prior_μ: float | np.ndarray = np.log(0.05),
-        leak_prior_σ: float | None = None,
         seed: int | None = None,
         device: torch.device | str | None = None,
         verbose: bool = True,
@@ -637,12 +156,7 @@ class Regression:
         if seed is not None:
             torch.manual_seed(seed)
 
-        # Recorded on the object, not only passed on, because it is the one
-        # fit-time argument a caller may need to ASSERT is live: bench's
-        # `requires:` check resolves attributes here, and "cauchy but silently
-        # normal" and "cauchy" look identical in a topline.
         self.β_prior = β_prior
-        self.u_prior_σ = u_prior_σ
         self.size_prior_σ = size_prior_σ
 
         ncells, ngenes = self.X.shape
@@ -653,19 +167,8 @@ class Regression:
             include_mixing=self.include_mixing,
             β_prior=β_prior,
             β_prior_σ=β_prior_σ,
-            drift=self.drift,
-            κ_prior_μ=κ_prior_μ,
-            κ_prior_σ=κ_prior_σ,
-            cellspace=self.cellspace,
-            cellspace_percluster=self.cellspace_percluster,
-            cellspace_shrink_σ=self.cellspace_shrink_σ,
-            donor_clusters=self.donor_clusters,
-            u_prior_σ=u_prior_σ,
             include_cell_size=self.include_cell_size,
             size_prior_σ=size_prior_σ,
-            leak=self.leak,
-            leak_prior_μ=leak_prior_μ,
-            leak_prior_σ=leak_prior_σ,
         )
         if device is not None:
             model = model.to(device)
@@ -678,30 +181,11 @@ class Regression:
             model.parameters(), lr=lr, fused=param_device.type == "cuda"
         )
 
-        # The likelihood is a long chain of elementwise ops over [ncells, ngenes]
-        # blocks, so a step is bound by kernel launches rather than by the GPU.
-        # Fusing them is worth roughly a factor of two. Batch shapes differ from
-        # tile to tile, hence dynamic.
-        #
-        # Note that this changes fitted coefficients slightly even at a fixed
-        # seed: inductor draws the β reparameterization noise from its own RNG
-        # stream, so a compiled fit follows a different (equally valid) sample
-        # path. With the noise held fixed the two agree to ~1e-7 relative.
         step = model.forward
         if compile:
             step = torch.compile(model.forward, dynamic=True)
 
-        # --- convergence diagnostic ---------------------------------------------
-        # ASSERTED, not assumed. `nepochs` was validated on a 313-gene panel and
-        # transferred to a 16.7k-gene one, where 200 epochs left individual
-        # coefficients 4 log-FC from their optimum (simple-seg-sim DESIGN_v2 §68) --
-        # a defect that read as a model or simulator bug for a whole afternoon. The
-        # cost here is one clone of β_μ and one extra sync at 90% of training.
-        #
-        # The measure is scale-free because β_μ is initialized at exactly 0: the
-        # movement over the last 10% of epochs, relative to β's final magnitude,
-        # says what fraction of the fit was still happening at the end. A converged
-        # fit leaves it near 0; Atera at 200 epochs does not.
+        # snapshot β after 90% of nepochs to compute convergence statistics against the final β
         snap_at = max(int(nepochs * 0.9) - 1, 0)
         β_snap = None
         losses = []
@@ -731,8 +215,11 @@ class Regression:
         β_fin = model.β_μ.detach()
         tail = max(len(losses) // 10, 1)
         norm = float(torch.linalg.vector_norm(β_fin))
-        move = (float(torch.linalg.vector_norm(β_fin - β_snap))
-                if β_snap is not None else float("nan"))
+        move = (
+            float(torch.linalg.vector_norm(β_fin - β_snap))
+            if β_snap is not None
+            else float("nan")
+        )
         self.fit_diagnostics = {
             "nepochs": nepochs,
             "steps_per_epoch": int(np.ceil(ncells / batch_size)),
@@ -743,127 +230,42 @@ class Regression:
             # requiring the experiment that found it.
             "β_rel_move_last10pct": move / norm if norm > 0 else float("nan"),
             "β_max_abs_move_last10pct": (
-                float((β_fin - β_snap).abs().max()) if β_snap is not None
-                else float("nan")),
+                float((β_fin - β_snap).abs().max())
+                if β_snap is not None
+                else float("nan")
+            ),
             "β_l2": norm,
             "loss_first": losses[0] if losses else float("nan"),
             "loss_final": losses[-1] if losses else float("nan"),
             # Improvement still being made at the end, as a share of the whole run's
             # improvement. A converged fit has this near 0.
             "loss_tail_share": (
-                (np.mean(losses[-2 * tail:-tail]) - np.mean(losses[-tail:]))
+                (np.mean(losses[-2 * tail : -tail]) - np.mean(losses[-tail:]))
                 / (losses[0] - losses[-1])
                 if len(losses) >= 2 * tail and losses[0] != losses[-1]
-                else float("nan")),
+                else float("nan")
+            ),
             # Per-cell loss per epoch, for plotting the trajectory itself.
             "losses": losses,
         }
         if verbose:
             d = self.fit_diagnostics
-            print(f"convergence: β moved {d['β_rel_move_last10pct']:.4f} of its norm "
-                  f"in the last 10% of epochs (max |Δβ| "
-                  f"{d['β_max_abs_move_last10pct']:.4f}); tail loss share "
-                  f"{d['loss_tail_share']:.4f}")
+            print(
+                f"convergence: β moved {d['β_rel_move_last10pct']:.4f} of its norm "
+                f"in the last 10% of epochs (max |Δβ| "
+                f"{d['β_max_abs_move_last10pct']:.4f}); tail loss share "
+                f"{d['loss_tail_share']:.4f}"
+            )
         return model
 
-    def posterior_sd(self, chunk: int | None = None, sandwich: bool | None = None,
-                     quasi: bool | None = None) -> npt.NDArray[np.float64]:
+    def posterior_sd(self, chunk: None | int = None) -> npt.NDArray[np.float64]:
         """Marginal posterior sd of β, [ncovariates, ngenes].
 
-        NOT `exp(β_logσ)`. The surrogate posterior is factorized over every
-        (covariate, gene) entry, so it can only represent the CONDITIONAL sd —
-        every other coefficient pinned at its mean — while a credible interval for
-        one coefficient needs the MARGINAL one, integrating over the others. The two
-        differ by however correlated the design is, and here that is a lot: a
-        per-type exposure column is supported only on that type's cells, so it
-        shares its support with that type's indicator. Measured on the breast
-        benchmark the marginal is up to 3.6x wider, and the gap tracks the
-        false-positive rate almost exactly.
-
-        So the width is recomputed here, from the Laplace approximation at the
-        fitted β. The negative-binomial likelihood factorizes over genes and β[:,g]
-        reaches only gene g, so the Hessian is block diagonal with one
-        [ncov, ncov] block per gene, and the marginal sd is just
-        sqrt(diag(H⁻¹)) — cheap, because the block is the width of the DESIGN, not
-        the gene count.
-
-        For a log link, d(-loglik)/dη² under Fisher information is r/(μ(r+μ)) per
-        cell with η = log μ, so H = J' diag(w) J where J = dμ/dβ. Mixing enters only
-        through J: λ is the cell's own rate but μ is A λ + background, so
-        J = A diag(λ) X rather than diag(λ) X.
-
-        WITH `quasi` the weight becomes the QUASI-POISSON one, 1/(φ_g μ), with φ_g
-        the per-gene Pearson dispersion at this fitted mean. Only w changes -- same
-        J, same prior curvature, same algebra -- because the claim is about the
-        variance FUNCTION and nothing else. It matters most where the NB weight
-        saturates: r/(μ(r+μ)) → r as μ grows, so NB information stops responding to
-        the data on exactly the well-measured genes, while 1/(φ_g μ) keeps
-        responding. See `quasi_interval` in __init__ for the measurement that
-        motivates it, and note the two may not be combined with the sandwich.
-
-        The prior's curvature (1/β_prior_σ² per coefficient) is added, and it is not
-        a formality. Under mixing, spatially-intermixed cell types lose most of their
-        identifiability — Stromal's conditional sd goes 0.145 to 9.5 — and without
-        the prior term those pairs would be handed enormous likelihood-only
-        intervals, when the honest posterior there is prior-dominated and the fitted
-        β̂ is shrunk to match.
-
-        WITH `propagate_κ`, κ is MARGINALIZED rather than pinned. The drift term
-        makes the mean depend on β + κ*u, so β[:,g] and the global κ are coupled and
-        the joint Hessian is no longer block diagonal: it gains a κ row/column that
-        touches EVERY gene. Marginalizing κ out of the joint Gaussian is one Schur
-        complement,
-
-            S          = H_κκ + prior_κ − Σ_g H_κg H_gg⁻¹ H_gκ        [ncov, ncov]
-            Cov(β_g)   = H_gg⁻¹ + H_gg⁻¹ H_gκ S⁻¹ H_κg H_gg⁻¹
-
-        with H_gκ = K_g diag(u[:,g]) and H_κκ = Σ_g diag(u_g) K_g diag(u_g), where
-        K_g = J'WJ is the likelihood block. The priors do not couple β to κ, so they
-        enter only their own diagonals. Two things make this well behaved:
-
-        * The likelihood is EXACTLY flat along (β + c·u, κ − c), so H_κκ − Σ_g …
-          cancels to the PRIOR's curvature along that direction. S is therefore
-          essentially Σ_g u_g²/β_prior_σ² (Gaussian), i.e. the marginal precision of
-          κ is supplied by β's prior over all genes -- which is the algebraic form
-          of DESIGN_v2 §62's "κ is outnumbered ~n_genes to 1".
-        * A pinned κ (`κ_prior_σ → 0`, the fixed-κ arm) sends S → ∞ and the
-          correction to 0, which is the correct limit: nothing is being estimated.
-
-        `κ_rel_sd` instead adds a DECLARED (κ_rel_sd·|κ_k|·|u[k,g]|)² in quadrature.
-        The two are independent and may both be on.
+        Rather than use the surrogate posterior sd (`exp(β_logσ)`), this uses
+        the Laplace approximation at the fitted β.
         """
         if self.model is None:
             raise Exception("fit() must be called before posterior_sd")
-        if sandwich is None:
-            sandwich = getattr(self, "mixing_interval_correction", False)
-        if quasi is None:
-            quasi = getattr(self, "quasi_interval", False)
-        if quasi and sandwich:
-            # Both replace the covariance the NB curvature implies, from premises
-            # that are not composable: `quasi` says the variance FUNCTION is wrong
-            # (phi*mu, not mu + mu^2/r) while the sandwich says the cells are
-            # CORRELATED at a variance function taken as given. Applying both would
-            # count the same excess scatter twice, once as dispersion and once as
-            # covariance. Refuse rather than emit a number nobody can interpret --
-            # the same call as for propagate_κ below.
-            raise ValueError(
-                "quasi_interval and the sandwich correction cannot be combined; "
-                "both restate the same covariance from different premises and "
-                "would double-count the excess scatter.")
-        # A FIXED κ (κ_prior_σ == 0) is the limit in which the correction vanishes:
-        # nothing is being estimated, so there is nothing to marginalize.
-        propagate = (getattr(self, "propagate_κ", False)
-                     and getattr(self.model, "include_drift", False)
-                     and not getattr(self.model, "κ_fixed", False))
-        if propagate and sandwich:
-            # Both rewrite the covariance from different premises -- the sandwich
-            # replaces H⁻¹ with H⁻¹ M H⁻¹, the marginalization adds a rank-ncov term
-            # to H⁻¹ -- and there is no defensible way to compose them without
-            # deriving the sandwich for the joint (β, κ) parameter. Refuse rather
-            # than emit a number nobody can interpret.
-            raise ValueError(
-                "propagate_κ and the sandwich correction cannot be combined; the "
-                "sandwich would need re-deriving for the joint (β, κ) Hessian.")
 
         m = self.model
         dev = next(m.parameters()).device
@@ -871,62 +273,31 @@ class Regression:
         gene_bias = m.gene_bias.detach().double()
         r = torch.exp(m.log_r.detach().double())
         bg_profile = torch.softmax(m.bg_rates.detach().double(), dim=-1)
-        # Leak nuisance: an additive known rate at the fitted rho (beta's interval
-        # CONDITIONS on rho-hat, as it does on kappa without propagate_κ). It does
-        # not depend on beta, so it changes only mu (the weights), not J.
-        leak_Eρ = leak_P = leak_E = leak_var = None
-        if getattr(m, "include_leak", False):
-            leak_E = m.leak_E.detach().double().to(dev)
-            leak_Eρ = leak_E * torch.exp(m.log_ρ.detach().double().to(dev))
-            leak_P = m.leak_P.detach().double().to(dev)
-            isd = self.leak.get("interval_sd") if self.leak is not None else None
-            if isd is not None:
-                leak_var = torch.as_tensor(isd ** 2, dtype=torch.float64, device=dev)
 
         X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
         log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
+
         # The FITTED offset, for the same reason the fitted operator is used below:
         # a Laplace at rates the model never used is the curvature of a different
         # model. This CONDITIONS on δ̂ rather than marginalizing it.
         if getattr(m, "include_cell_size", False):
             log_size = log_size + m.δ_size.detach().to(dev).double()
+
         # The FITTED operator, not proseg's raw one. With a donor-cluster scale the
         # model's mixing matrix is A' -- off-diagonals scaled by exp(u) and rows
         # renormalized -- so computing the Laplace against A would evaluate the
         # curvature of a model that was never fitted. Note this does NOT marginalize
         # u: it conditions on û, exactly as the interval conditioned on a point κ
         # before propagate_κ existed, and it is the same gap.
-        self.A = self._scaled_A() if getattr(m, "include_donor_scale", False) \
-            else self.A
         A = torch.sparse_csr_tensor(
             torch.as_tensor(self.A.indptr, dtype=torch.int64, device=dev),
             torch.as_tensor(self.A.indices, dtype=torch.int64, device=dev),
             torch.as_tensor(self.A.data.astype(np.float64), device=dev),
             size=self.A.shape,
         )
-        bg_weight = (
-            torch.as_tensor(self.bg_mix_rate.astype(np.float64), device=dev)
-            * torch.exp(log_size)
-        )
-        if sandwich:
-            # A' as a second operator. The meat below needs the mass flowing OUT of
-            # each donor (a column of A); the likelihood only ever needs what flows
-            # in (a row).
-            at = self.A.tocoo()
-            At = torch.sparse_coo_tensor(
-                torch.as_tensor(np.vstack([at.col, at.row]), dtype=torch.int64,
-                                device=dev),
-                torch.as_tensor(at.data.astype(np.float64), device=dev),
-                size=self.A.shape,
-            ).coalesce()
-            # A elementwise-squared, which turns the i == k term of A D A' into a
-            # single sparse product rather than a dense diagonal.
-            A2 = torch.sparse_coo_tensor(
-                torch.as_tensor(np.vstack([at.row, at.col]), dtype=torch.int64,
-                                device=dev),
-                torch.as_tensor((at.data.astype(np.float64)) ** 2, device=dev),
-                size=self.A.shape,
-            ).coalesce()
+        bg_weight = torch.as_tensor(
+            self.bg_mix_rate.astype(np.float64), device=dev
+        ) * torch.exp(log_size)
 
         ncov, ngenes = B.shape
         ncells = X.shape[0]
@@ -944,19 +315,9 @@ class Regression:
         if getattr(m, "β_prior", "normal") == "cauchy":
             prior_prec = 2.0 / (float(m.β_prior_σ) ** 2 + B**2)
         else:
-            prior_prec = torch.full_like(
-                B, 1.0 / float(m.β_prior_σ) ** 2)
+            prior_prec = torch.full_like(B, 1.0 / float(m.β_prior_σ) ** 2)
         eye = torch.eye(ncov, dtype=torch.float64, device=dev)
         out = np.empty((ncov, ngenes), dtype=np.float64)
-        # Recorded even when unused, so `interval_phi` is never a stale array from a
-        # previous call with a different flag.
-        phi_out = np.full(ngenes, np.nan, dtype=np.float64)
-        if propagate:
-            # u is [ncov, ngenes] and is a buffer, so it already follows .to(device).
-            u_all = m.u.detach().double()
-            Hκκ = torch.zeros((ncov, ncov), dtype=torch.float64, device=dev)
-            Σ_gg = torch.zeros((ncov, ncov), dtype=torch.float64, device=dev)
-            stash = []          # (slice, cov, H_gκ) per chunk; ~22 MB on the WTA panel
 
         # --- gene chunk size ------------------------------------------------------
         # Each chunk materializes a handful of dense [ncells, G, ncov] float64
@@ -966,8 +327,10 @@ class Regression:
         # default the chunk is sized to the memory actually free, and halved and
         # retried if a chunk still runs out. Chunking over genes is exact -- the
         # Hessian is block diagonal by gene -- so this changes nothing but speed.
+
         if dev.type == "cuda":
             torch.cuda.empty_cache()
+
         if chunk is None:
             chunk = 64
             if dev.type == "cuda":
@@ -992,99 +355,14 @@ class Regression:
             else:
                 J = λ.unsqueeze(2) * X.unsqueeze(1)
                 μ = λ
-            if leak_Eρ is not None:
-                μ = μ + leak_Eρ @ leak_P[:, sl]
-            if quasi:
-                # The QUASI-POISSON weight, 1/(phi_g mu), with phi_g the per-gene
-                # Pearson dispersion AT THIS FITTED MEAN -- the same estimator a
-                # quasi-Poisson GLM uses, so the two are directly comparable. It is
-                # computed here rather than at fit time on purpose: it must be the
-                # dispersion of the mean the interval is being reported around.
-                #
-                # Floored at 1, exactly as a quasi-Poisson GLM floors it: a gene
-                # measured as UNDER-dispersed relative to Poisson is a small-sample
-                # artifact, and letting phi < 1 would report an interval narrower
-                # than the Poisson one. Not capped above -- a genuinely wild gene
-                # deserves a wide interval, and that is the direction that is safe.
-                yb = self._counts_chunk(sl, dev)
-                res2 = (yb - μ) ** 2
-                φ = (res2 / μ.clamp(min=1e-10)).mean(0).clamp(min=1.0)
-                phi_out[sl] = φ.cpu().numpy()
-                w = 1.0 / (φ.unsqueeze(0) * μ + 1e-12)
-            else:
-                w = r[sl].unsqueeze(0) / (μ * (r[sl].unsqueeze(0) + μ) + 1e-12)
+            w = r[sl].unsqueeze(0) / (μ * (r[sl].unsqueeze(0) + μ) + 1e-12)
+
             K = torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2))
             # [G, ncov, ncov] diagonal, since the precision now varies by
             # coefficient as well as by gene.
             H = K + prior_prec[:, sl].T.unsqueeze(2) * eye
             cov = torch.linalg.inv(H)
-            if leak_var is not None:
-                # Propagate the declared residual-leak uncertainty: to first order
-                # dβ̂_g/dρ_s = -H_gg⁻¹ H_gρ, with H_gρ = Σ_i J_ig w_ig E_is P_sg (the
-                # leak enters μ additively, so ∂μ_ig/∂ρ_s = E_is P_sg). The added
-                # variance Σ_s (dβ/dρ_s)² sd_s² is large exactly where a leak-shaped
-                # effect could explain the coefficient (a source's specific genes in
-                # an exposed index type) and ~0 elsewhere.
-                Hgρ = torch.einsum("ngc,ng,ns->gcs", J, w, leak_E) * leak_P[:, sl].T.unsqueeze(1)
-                dβ = -torch.einsum("gcd,gds->gcs", cov, Hgρ)
-                leak_extra = torch.diag_embed((dβ ** 2 * leak_var).sum(2))
-            if sandwich:
-                # Missegmentation reallocates MOLECULES, so two cells fed by the
-                # same donor share that donor's one realized expression and their
-                # residuals are correlated. With a_ij the mixing weights and N_j a
-                # donor's realized count, X_i = sum_j Binomial(N_j, a_ij) gives
-                #
-                #   Var(X_i)      = mu_i + sum_j a_ij^2 lambda_j^2 / r
-                #   Cov(X_i, X_k) =        sum_j a_ij a_kj lambda_j^2 / r
-                #
-                # The likelihood assumes those cells are independent, so the
-                # posterior concentrates as though there were more independent
-                # observations than there are. The fitted r absorbs the MARGINAL
-                # variance; it cannot absorb the correlation, and since exposure is
-                # spatially structured the correlated part projects onto it -- which
-                # is the measured failure: coverage 0.575 at nominal 0.95.
-                #
-                # H is already the bread of a sandwich, and the naive interval is
-                # the case Cov = diag(V), for which the meat collapses back to H.
-                # Substituting the covariance above gives J'W Cov WJ. The full
-                # [ncells, ncells] covariance is never formed: only A'(WJ) is
-                # needed, one sparse product of the shape the Jacobian already uses.
-                # The donor-level dispersion is CALIBRATED, not taken from r_g.
-                #
-                # Two earlier attempts failed for related reasons. Substituting the
-                # whole reallocation covariance with D = lambda^2/r_g made intervals
-                # narrower (FP 0.182 -> 0.436), because r_g is fitted at the
-                # OBSERVED level and has already absorbed the marginal
-                # overdispersion, while sum_j a_ij^2 lambda_j^2 <= mu_i^2 makes the
-                # reallocation-implied marginal smaller. Deleting the diagonal to
-                # avoid that double-count then made the added term INDEFINITE -- an
-                # off-diagonal-only matrix has zero trace -- so it widened some
-                # coefficients and narrowed others (planted coverage up, null FP up).
-                #
-                # Both are fixed by asking what donor-level variance is CONSISTENT
-                # with the dispersion the model actually fitted. Writing the donor
-                # variance as D_j = c_g lambda_j^2, the implied marginal is
-                # sum_j a_ij^2 D_j, and the fitted marginal overdispersion is
-                # mu_i^2 / r_g; matching them in aggregate per gene gives
-                #
-                #     c_g = sum_i (mu_i^2 / r_g)  /  sum_i sum_j a_ij^2 lambda_j^2
-                #
-                # so the marginal is preserved BY CONSTRUCTION and the covariance
-                # diag(mu) + A diag(D) A' stays PSD. What is left over is purely the
-                # between-cell correlation the likelihood omits -- which is the term
-                # this correction exists to add.
-                M = J * w.unsqueeze(2)                        # [ncells, G, ncov]
-                lam2 = λ * λ
-                s_i = A2 @ lam2                               # sum_j a_ij^2 lam_j^2
-                c_g = ((μ * μ) / r[sl].unsqueeze(0)).sum(0) / s_i.sum(0).clamp(min=1e-12)
-                dvar = c_g.unsqueeze(0) * lam2                # donor-rate variance
-                U = (At @ M.reshape(ncells, G * ncov)).reshape(ncells, G, ncov)
-                meat = torch.einsum("ngc,ngd->gcd", M, M * μ.unsqueeze(2))
-                meat = meat + torch.einsum("ngc,ngd->gcd", U, U * dvar.unsqueeze(2))
-                cov = cov @ meat @ cov
-            if leak_var is not None:
-                # Added after the sandwich: dβ/dρ is built from the bread H⁻¹.
-                cov = cov + leak_extra
+
             return K, cov
 
         start = 0
@@ -1099,76 +377,9 @@ class Regression:
                 torch.cuda.empty_cache()
                 continue
             start = sl.stop
-            if propagate:
-                # H_gκ[j,k] = K_g[j,k] * u[k,g]: κ_k enters gene g's mean exactly as
-                # β[k,g] does, scaled by u[k,g], and the priors do not couple them.
-                ug = u_all[:, sl].T                            # [G, ncov]
-                cross = K * ug.unsqueeze(1)                    # [G, β, κ]
-                Hκκ = Hκκ + (cross * ug.unsqueeze(2)).sum(0)
-                Σ_gg = Σ_gg + torch.einsum("gak,gac,gcl->kl", cross, cov, cross)
-                stash.append((sl, cov, cross))
-                continue
             sd = torch.diagonal(cov, dim1=1, dim2=2).clamp(min=0.0).sqrt()
             out[:, sl] = sd.T.cpu().numpy()
 
-        if propagate:
-            # S is κ's MARGINAL precision. The likelihood is exactly flat along
-            # (β + c·u, κ − c), so Hκκ and Σ_gg very nearly cancel and what is left
-            # is the curvature β's prior supplies along that direction -- which is
-            # why S grows with the gene count and why this correction is small on a
-            # WTA panel and large on a 313-gene one.
-            S = Hκκ - Σ_gg
-            if m.κ_prior_σ is not None:
-                S = S + eye / float(m.κ_prior_σ) ** 2
-            # Symmetrize before inverting: S is symmetric in exact arithmetic, and
-            # the einsum accumulation over ~16.7k genes is not.
-            S = 0.5 * (S + S.T)
-            # S is STRUCTURALLY SINGULAR on every design column the covariate does
-            # not cover -- the drift table is supplied on the exposure columns only,
-            # so u is exactly 0 on the intercept and the type contrasts (12 of 20
-            # columns on Atera). Those κ entries are not parameters of anything and
-            # there is nothing to marginalize, so the Schur complement is inverted on
-            # the ACTIVE sub-block and left at zero elsewhere. Ridging the whole
-            # matrix instead would fire a warning on every real fit and quietly
-            # invent uncertainty for columns that have none.
-            active = (u_all.abs().sum(dim=1) > 0)
-            na = int(active.sum())
-            Sinv = torch.zeros_like(S)
-            if na:
-                idx = torch.nonzero(active, as_tuple=True)[0]
-                Sa = S[idx][:, idx]
-                ev = torch.linalg.eigvalsh(Sa)
-                if float(ev.min()) <= 0:
-                    # A column the covariate DOES cover, still not identified: a
-                    # genuine pathology worth a warning rather than a silent ridge.
-                    warnings.warn(
-                        f"κ's marginal precision is singular on a covered design "
-                        f"column (min eigenvalue {float(ev.min()):.3g}); ridging. "
-                        "Check the drift covariate for a near-constant column.",
-                        stacklevel=2)
-                    Sa = Sa + torch.eye(na, dtype=S.dtype, device=S.device) * (
-                        abs(float(ev.min())) + 1e-10)
-                Sinv[idx.unsqueeze(1), idx.unsqueeze(0)] = torch.linalg.inv(Sa)
-            # Reported as a VARIANCE with inf on the uncovered columns, so a caller
-            # cannot mistake a structural zero for a precisely known κ.
-            κcov = Sinv.clone()
-            κcov[~active, ~active] = float("nan")
-            self._κ_marginal_cov = κcov.cpu().numpy()
-            for sl, cov, cross in stash:
-                T = cov @ cross                                # [G, β, κ]
-                cov = cov + torch.einsum("gak,kl,gbl->gab", T, Sinv, T)
-                sd = torch.diagonal(cov, dim1=1, dim2=2).clamp(min=0.0).sqrt()
-                out[:, sl] = sd.T.cpu().numpy()
-
-        # The DECLARED misspecification term, independent of everything above: how
-        # wrong κ might be, rather than how well this prior determines it. Mirrors
-        # the post-hoc arm's kappa_rel_sd, and is an assumption of the same standing.
-        self._interval_phi = phi_out
-        rel = getattr(self, "κ_rel_sd", None)
-        if rel is not None and getattr(m, "include_drift", False):
-            κ = m.κ.detach().double().cpu().numpy()[:, None]
-            u_np = m.u.detach().double().cpu().numpy()
-            out = np.sqrt(out**2 + (float(rel) * np.abs(κ) * np.abs(u_np)) ** 2)
         return out
 
     def _mixing_at(self, scale: float) -> tuple[csr_matrix, npt.NDArray[np.float32]]:
@@ -1176,18 +387,21 @@ class Regression:
         if scale == 1.0:
             return self._A_full, self._bg_full
         n = self._A_full.shape[0]
-        A = (sp_identity(n, format="csr", dtype=np.float32) * (1.0 - scale) + self._A_full * scale).tocsr()
+        A = (
+            sp_identity(n, format="csr", dtype=np.float32) * (1.0 - scale)
+            + self._A_full * scale
+        ).tocsr()
         return A.astype(np.float32), (self._bg_full * scale).astype(np.float32)
 
-    def range_interval(self, credible_interval: float, chunk: int = 64,
-                       max_iter: int = 30, tol: float = 1e-4):
-        """leak_range_interval over the declared leak range and/or mixing range."""
-        return self.leak_range_interval(credible_interval, chunk, max_iter, tol)
-
-    def leak_range_interval(self, credible_interval: float, chunk: int = 64,
-                            max_iter: int = 30, tol: float = 1e-4):
-        """(lower, upper), each [ncovariates, ngenes]: beta's interval over a
-        DECLARED leak range, by refitting rather than linearizing.
+    # TODO: rewrite this super wordy docstring
+    def range_interval(
+        self,
+        credible_interval: float,
+        chunk: int = 64,
+        max_iter: int = 30,
+        tol: float = 1e-4,
+    ):
+        """Posterior interval on β over the declared mixing range.
 
         The range is rho in [max(rho0 - sd, 0), rho0 + sd] per source, with rho0
         the fitted (fixed) rate and sd the leak `interval_sd`; with the usual
@@ -1198,25 +412,6 @@ class Regression:
         reported interval is the union of the three, so a coefficient is
         significant only if it is significant everywhere in the range.
 
-        Why not the linear term in posterior_sd: leak enters mu additively, beta
-        acts on the log scale, so where leak dominates a gene's native rate (a
-        source's specific genes in an exposed type) d beta / d rho changes a lot
-        across the range, and the first-order interval at rho0 under-covers its
-        ends (simple-seg-sim2 findings §11: a range [0, alpha] around the true
-        alpha still left 12% Tumor-niche FP; [0, 2 alpha] was needed).
-
-        It also catches what the linear term leaves out: the native-size offset
-        moves with rho too, and where exposure correlates with a covariate that
-        shifts EVERY gene's coefficient on it (a composition effect: how much of
-        an exposed cell's total is native is uncertain), not only the leaked
-        genes'.
-
-        The union is exact when each beta is monotone in rho between the ends.
-        With several sources the ends are the two CORNERS of the box (all at the
-        low end, all at the high end), not every corner: right when the
-        coefficient moves the same way in every source's rate, which is the case
-        for leak (more leak subtracted, lower beta for the leaked genes).
-
         Each refit conditions on the fitted nuisance parameters (gene_bias, r, the
         background profile, the cell sizes, A) and solves beta's MAP under the same
         prior by Fisher scoring with step halving, per gene (the problem is block
@@ -1224,64 +419,45 @@ class Regression:
         three intervals are on one footing; the reported Mean stays the fitted one.
         """
         if self.model is None:
-            raise Exception("fit() must be called before leak_range_interval")
+            raise Exception("fit() must be called before range_interval")
         m = self.model
-        # Which declared ranges are active: the leak rate (refit interval) and/or
-        # the mixing scale (mixing_range). With both, the refits are at the middle
-        # and the four corners of the (rho, s) box.
-        leak_on = (getattr(m, "include_leak", False) and self.leak is not None
-                   and self.leak.get("interval_method") == "refit")
-        mix_on = getattr(self, "mixing_range", None) is not None
-        if not (leak_on or mix_on):
-            raise ValueError("range_interval needs a refit leak range or a mixing_range")
-        for flag, name in ((getattr(m, "include_drift", False), "drift"),
-                           (getattr(m, "include_donor_scale", False) and mix_on, "a donor scale"),
-                           (getattr(m, "include_cellspace", False), "cellspace"),
-                           (getattr(self, "mixing_interval_correction", False), "the sandwich"),
-                           (getattr(self, "quasi_interval", False), "quasi_interval")):
-            if flag:
-                raise NotImplementedError(f"leak interval_method 'refit' with {name}")
+
+        if self.include_mixing and getattr(self, "mixing_range", None) is None:
+            raise ValueError(
+                "range_interval needs a mixing_range"
+            )
+
         dev = next(m.parameters()).device
         z = float(stats.norm.ppf(1.0 - (1.0 - credible_interval) / 2.0))
         B0 = m.β_μ.detach().double()
         gene_bias = m.gene_bias.detach().double()
         r = torch.exp(m.log_r.detach().double()).clamp(min=1e-3)
         bg_profile = torch.softmax(m.bg_rates.detach().double(), dim=-1)
-        has_leak = getattr(m, "include_leak", False)
-        if has_leak:
-            E = m.leak_E.detach().double().to(dev)
-            P = m.leak_P.detach().double().to(dev)
-            rho0 = torch.exp(m.log_ρ.detach().double().to(dev))
-        if leak_on:
-            sd = torch.as_tensor(self.leak["interval_sd"], dtype=torch.float64, device=dev)
-            rho_ends = [(rho0 - sd).clamp(min=0.0), rho0 + sd]
+
         s0 = getattr(self, "mixing_scale", 1.0)
-        mix_ends = list(self.mixing_range) if mix_on else []
-        r_mid = rho0 if has_leak else None
-        if leak_on and mix_on:
-            settings = [(r_mid, s0)] + [(rr, ss) for rr in rho_ends for ss in mix_ends]
-        elif leak_on:
-            settings = [(rho_ends[0], s0), (r_mid, s0), (rho_ends[1], s0)]
-        else:
-            settings = [(r_mid, mix_ends[0]), (r_mid, s0), (r_mid, mix_ends[1])]
+        assert self.mixing_range is not None
+        (mix0, mix1) = self.mixing_range
+        settings = [mix0, s0, mix1]
 
         X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
-        total = torch.as_tensor(np.asarray(self.X.sum(axis=1)).ravel().astype(np.float64), device=dev)
-        δ = (m.δ_size.detach().double().to(dev) if getattr(m, "include_cell_size", False)
-             else torch.zeros_like(total))
-        Pg = P.sum(1) if has_leak else None
+        total = torch.as_tensor(
+            np.asarray(self.X.sum(axis=1)).ravel().astype(np.float64), device=dev
+        )
+        δ = (
+            m.δ_size.detach().double().to(dev)
+            if getattr(m, "include_cell_size", False)
+            else torch.zeros_like(total)
+        )
         base_log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
 
         def mixing_tensors(scale):
-            if getattr(m, "include_donor_scale", False):
-                Aop, bg = self._scaled_A(), self.bg_mix_rate
-            else:
-                Aop, bg = self._mixing_at(scale) if hasattr(self, "_A_full") else (self.A, self.bg_mix_rate)
+            Aop, bg = self._mixing_at(scale) if hasattr(self, "_A_full") else (self.A, self.bg_mix_rate)
             A = torch.sparse_csr_tensor(
                 torch.as_tensor(Aop.indptr, dtype=torch.int64, device=dev),
                 torch.as_tensor(Aop.indices, dtype=torch.int64, device=dev),
                 torch.as_tensor(Aop.data.astype(np.float64), device=dev), size=Aop.shape)
             return A, torch.as_tensor(np.asarray(bg, dtype=np.float64), device=dev)
+
         cauchy = getattr(m, "β_prior", "normal") == "cauchy"
         γ = float(m.β_prior_σ)
         ncov, ngenes = B0.shape
@@ -1289,19 +465,11 @@ class Regression:
         eye = torch.eye(ncov, dtype=torch.float64, device=dev)
         lower = np.full((ncov, ngenes), np.inf)
         upper = np.full((ncov, ngenes), -np.inf)
-        self._leak_range_β = []
 
-        for rho, scale in settings:
-            if self.include_mixing:
-                A, bg_mix = mixing_tensors(scale)
-            if has_leak:
-                # the native size at this rho, exactly as `offset_rho` builds it
-                log_size = torch.log((total - (E * rho) @ Pg).clamp(min=1.0)) + δ
-                leak_rate = (E * rho) @ P                              # [ncells, ngenes]
-            else:
-                log_size = base_log_size + δ
-                leak_rate = None
-            βr = np.empty((ncov, ngenes))
+        for scale in settings:
+            A, bg_mix = mixing_tensors(scale)
+            log_size = base_log_size + δ
+
             for start in range(0, ngenes, chunk):
                 sl = slice(start, min(start + chunk, ngenes))
                 y = self._counts_chunk(sl, dev)
@@ -1310,43 +478,50 @@ class Regression:
                 def mean(B):
                     η = X @ B + gene_bias[sl].unsqueeze(0) + log_size.unsqueeze(1)
                     λ = torch.exp(η.clamp(max=30.0))
-                    if self.include_mixing:
-                        μ = A @ λ + (bg_mix * torch.exp(log_size)).unsqueeze(1) * bg_profile[sl].unsqueeze(0)
-                    else:
-                        μ = λ
-                    return λ, (μ + leak_rate[:, sl]) if leak_rate is not None else μ
+                    μ = A @ λ + (bg_mix * torch.exp(log_size)).unsqueeze(
+                        1
+                    ) * bg_profile[sl].unsqueeze(0)
+                    return λ, μ
 
                 def objective(B):
                     _, μ = mean(B)
-                    nll = -(y * torch.log(μ + 1e-8) - (y + rg) * torch.log(rg + μ + 1e-8)).sum(0)
+                    nll = -(
+                        y * torch.log(μ + 1e-8) - (y + rg) * torch.log(rg + μ + 1e-8)
+                    ).sum(0)
                     if cauchy:
                         return nll + torch.log1p((B / γ) ** 2).sum(0)
-                    return nll + (B ** 2).sum(0) / (2.0 * γ ** 2)
+                    return nll + (B**2).sum(0) / (2.0 * γ**2)
 
                 def curvature(B):
                     """Ascent direction (score minus prior gradient) and the Fisher
                     information plus the prior's gradient-matched curvature."""
                     λ, μ = mean(B)
-                    if self.include_mixing:
-                        G = B.shape[1]
-                        J = (A @ (λ.unsqueeze(2) * X.unsqueeze(1)).reshape(ncells, G * ncov)
-                             ).reshape(ncells, G, ncov)
-                    else:
-                        J = λ.unsqueeze(2) * X.unsqueeze(1)
+                    G = B.shape[1]
+                    J = (
+                        A
+                        @ (λ.unsqueeze(2) * X.unsqueeze(1)).reshape(
+                            ncells, G * ncov
+                        )
+                    ).reshape(ncells, G, ncov)
                     if cauchy:
-                        pgrad, pprec = 2.0 * B / (γ ** 2 + B ** 2), 2.0 / (γ ** 2 + B ** 2)
+                        pgrad, pprec = 2.0 * B / (γ**2 + B**2), 2.0 / (γ**2 + B**2)
                     else:
-                        pgrad, pprec = B / γ ** 2, torch.full_like(B, 1.0 / γ ** 2)
+                        pgrad, pprec = B / γ**2, torch.full_like(B, 1.0 / γ**2)
                     w = rg / (μ * (rg + μ) + 1e-12)
                     grad = torch.einsum("ngc,ng->gc", J, w * (y - μ)) - pgrad.T
-                    H = torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2)) + pprec.T.unsqueeze(2) * eye
+                    H = (
+                        torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2))
+                        + pprec.T.unsqueeze(2) * eye
+                    )
                     return grad, H
 
                 B = B0[:, sl].clone()
                 nll = objective(B)
                 for _ in range(max_iter):
                     grad, H = curvature(B)
-                    step = torch.linalg.solve(H, grad.unsqueeze(2)).squeeze(2).T     # [ncov, G]
+                    step = (
+                        torch.linalg.solve(H, grad.unsqueeze(2)).squeeze(2).T
+                    )  # [ncov, G]
                     t = torch.ones(B.shape[1], dtype=torch.float64, device=dev)
                     for _ in range(20):  # per-gene step halving, on the objective alone
                         nll_new = objective(B + step * t)
@@ -1354,18 +529,23 @@ class Regression:
                         if not bad.any():
                             break
                         t = torch.where(bad, t / 2, t)
-                    t = torch.where(bad, torch.zeros_like(t), t)  # no descent found: stay
+                    t = torch.where(
+                        bad, torch.zeros_like(t), t
+                    )  # no descent found: stay
                     B = B + step * t
                     nll = torch.where(bad, nll, nll_new)
                     if float((step * t).abs().max()) < tol:
                         break
                 _, H = curvature(B)
-                sdv = torch.diagonal(torch.linalg.inv(H), dim1=1, dim2=2).clamp(min=0.0).sqrt().T
+                sdv = (
+                    torch.diagonal(torch.linalg.inv(H), dim1=1, dim2=2)
+                    .clamp(min=0.0)
+                    .sqrt()
+                    .T
+                )
                 Bn, sdn = B.cpu().numpy(), sdv.cpu().numpy()
                 lower[:, sl] = np.minimum(lower[:, sl], Bn - z * sdn)
                 upper[:, sl] = np.maximum(upper[:, sl], Bn + z * sdn)
-                βr[:, sl] = Bn
-            self._leak_range_β.append(βr)
         return lower, upper
 
     def _counts_chunk(self, sl: slice, dev) -> Tensor:
@@ -1385,68 +565,6 @@ class Regression:
             blk = np.asarray(X[:, sl], dtype=np.float64)
         return torch.as_tensor(blk, device=dev)
 
-    @property
-    def interval_phi(self) -> npt.NDArray[np.float64]:
-        """Per-gene Pearson dispersion the last `quasi` posterior_sd used.
-
-        NaN everywhere if that call did not use the quasi-Poisson weight, so a
-        caller recording it cannot mistake an NB fit's intervals for quasi ones.
-        Compare against `exp(model.log_r)`: the two are the same misfit measured
-        under different variance functions, and DESIGN_v2 §85 is the account.
-        """
-        phi = getattr(self, "_interval_phi", None)
-        if phi is None:
-            raise Exception("call posterior_sd() before interval_phi")
-        return phi
-
-    def κ_posterior_sd(self) -> npt.NDArray[np.float64]:
-        """Marginal posterior sd of κ, one per design column.
-
-        A by-product of `posterior_sd(propagate_κ=True)`'s Schur complement, exposed
-        because it is the quantity that says whether propagating κ can matter at all:
-        it is ~σ/sqrt(Σ_g u[k,g]²), so it shrinks with the panel size. Requires a
-        `posterior_sd()` call with `propagate_κ` set.
-        """
-        cov = getattr(self, "_κ_marginal_cov", None)
-        if cov is None:
-            raise Exception(
-                "call posterior_sd() on a propagate_κ model before κ_posterior_sd")
-        return np.sqrt(np.diag(cov))
-
-    def _scaled_A(self) -> csr_matrix:
-        """proseg's A with the fitted donor-cluster scale applied, rows renormalized
-        to their original totals -- the operator the fit actually used."""
-        u = self.model.u_μ.detach().cpu().numpy().astype(np.float64)
-        dc = self.donor_clusters
-        C = self.A.tocoo()
-        off = C.row != C.col
-        lab = dc[C.col]
-        sc = np.ones(len(C.data), dtype=np.float64)
-        ok = off & (lab >= 0)
-        sc[ok] = np.exp(u[lab[ok]])
-        new = C.data.astype(np.float64) * sc
-        n = self.A.shape[0]
-        old_tot = np.bincount(C.row, weights=C.data.astype(np.float64), minlength=n)
-        new_tot = np.bincount(C.row, weights=new, minlength=n)
-        f = np.where(new_tot > 0, old_tot / np.maximum(new_tot, 1e-300), 1.0)
-        out = coo_matrix((new * f[C.row], (C.row, C.col)), shape=self.A.shape)
-        return out.tocsr().astype(np.float32)
-
-    def get_donor_scales(self) -> pd.DataFrame:
-        """The fitted donor-cluster scale, one row per cluster.
-
-        Auditability, not a result: `exp(u)` is the factor by which a donor cluster's
-        contribution to every neighbour was raised or lowered relative to proseg's
-        estimate, and `sd` is what the data had to say about it. A cluster whose sd is
-        at the prior width was not identified by anything.
-        """
-        if self.model is None or not getattr(self.model, "include_donor_scale", False):
-            raise Exception("no donor scale on this fit")
-        u = self.model.u_μ.detach().cpu().numpy()
-        sd = np.exp(self.model.u_logσ.detach().cpu().numpy().clip(max=2.0))
-        return pd.DataFrame({"cluster": np.arange(len(u)), "u": u, "u_sd": sd,
-                             "scale": np.exp(u)})
-
     def get_cell_sizes(self) -> pd.DataFrame:
         """The fitted per-cell size factor, one row per cell.
 
@@ -1463,60 +581,18 @@ class Regression:
         if self.model is None or not getattr(self.model, "include_cell_size", False):
             raise Exception("no cell size factor on this fit")
         d = self.model.δ_size.detach().cpu().numpy().astype(np.float64)
-        return pd.DataFrame({"delta": d, "scale": np.exp(d),
-                             "log_size_fixed": self.log_size.astype(np.float64),
-                             "log_size_fitted": self.log_size.astype(np.float64) + d})
-
-    def get_cellspace_scales(self) -> np.ndarray:
-        """The fitted cell-space kappa: a scalar, or one per Leiden cluster."""
-        if self.model is None or not self.include_cellspace:
-            raise Exception("no cell-space term on this fit")
-        k0 = float(self.model.κ_cs.detach().cpu().numpy())
-        if not getattr(self.model, "cellspace_percluster", False):
-            return np.array([k0])
-        return k0 + self.model.δ_cs.detach().cpu().numpy()
-
-    def get_leak_rates(self) -> pd.Series:
-        """Fitted leak rate rho per source group (exp of the MAP log rho)."""
-        if self.model is None or not getattr(self.model, "include_leak", False):
-            raise Exception("fit() with a `leak` nuisance must be called first")
-        return pd.Series(torch.exp(self.model.log_ρ.detach()).cpu().numpy(),
-                         index=self.leak["names"], name="rho")
-
-    def get_drift_scales(self) -> pd.Series:
-        """The fitted κ, one per design column.
-
-        Auditability, not a result: κ is the amount of each column's
-        exposure-correlated signal the model attributed to missegmentation rather
-        than to regulation. A κ whose sign disagrees with the drift covariate's
-        construction is the sparsity assumption failing for that column, and the
-        coefficients there should be read as uncorrected.
-        """
-        if self.model is None:
-            raise Exception("fit() must be called before get_drift_scales")
-        if not self.include_drift:
-            raise Exception("this model was fit without include_drift")
-        return pd.Series(
-            self.model.κ.detach().cpu().numpy(),
-            index=list(self.design.design_info.column_names), name="kappa",
-        )
-
-    def get_drift_covariate(self) -> pd.DataFrame:
-        """u itself: [design column x gene], whether computed here or supplied.
-
-        Auditability, and the thing to compare against when checking that the
-        in-model build reproduces an externally built covariate. Available as soon
-        as the constructor returns -- it is not a fit result.
-        """
-        if not self.include_drift or self.drift is None:
-            raise Exception("this model was constructed without include_drift")
         return pd.DataFrame(
-            self.drift.astype(np.float64),
-            index=list(self.design.design_info.column_names),
-            columns=list(self.var_names),
+            {
+                "delta": d,
+                "scale": np.exp(d),
+                "log_size_fixed": self.log_size.astype(np.float64),
+                "log_size_fitted": self.log_size.astype(np.float64) + d,
+            }
         )
 
-    def get_regression_coefficients(self, credible_interval: float | None = None) -> pd.DataFrame:
+    def get_regression_coefficients(
+        self, credible_interval: float | None = None
+    ) -> pd.DataFrame:
         if self.model is None:
             raise Exception("fit() must be called before get_regression_coefficients")
 
@@ -1527,11 +603,9 @@ class Regression:
             pd.DataFrame(β_μ, index=covariate_names, columns=self.var_names)
             .melt(ignore_index=False, var_name="Gene", value_name="Mean")
             .reset_index(names="Covariate")
-            )
+        )
 
-        if credible_interval is not None and (
-                (self.leak is not None and self.leak.get("interval_method") == "refit")
-                or getattr(self, "mixing_range", None) is not None):
+        if credible_interval is not None and getattr(self, "mixing_range", None) is not None:
             lo, hi = self.range_interval(credible_interval)
             df["Lower"] = lo.flatten(order="F")
             df["Upper"] = hi.flatten(order="F")
@@ -1571,106 +645,24 @@ class RegressionModel(nn.Module):
         include_mixing: bool = True,
         β_prior: str = "cauchy",
         β_prior_σ: float = 1.0,
-        drift: np.ndarray | None = None,
-        κ_prior_μ: float = 0.0,
-        κ_prior_σ: float | None = None,
-        cellspace: dict | None = None,
-        cellspace_percluster: bool = False,
-        cellspace_shrink_σ: float = 1.0,
-        donor_clusters: np.ndarray | None = None,
-        u_prior_σ: float = 0.1,
         include_cell_size: bool = False,
         size_prior_σ: float = 0.2,
-        leak: dict | None = None,
-        leak_prior_μ: float | np.ndarray = np.log(0.05),
-        leak_prior_σ: float | None = None,
     ):
         super().__init__()
 
-        # Long-range leak nuisance (see Regression.__init__): rho_s = exp(log_ρ[s]),
-        # a MAP parameter per source group with a N(leak_prior_μ, leak_prior_σ²)
-        # prior on log rho. leak_prior_σ None = unpenalized, 0 = fixed at the prior
-        # mean (e.g. a known/oracle rate).
-        self.include_leak = leak is not None
-        if leak is not None:
-            self.register_buffer("leak_E", torch.as_tensor(np.ascontiguousarray(leak["E"]),
-                                                           dtype=torch.float32).clone())
-            self.register_buffer("leak_P", torch.as_tensor(np.ascontiguousarray(leak["P"]),
-                                                           dtype=torch.float32).clone())
-            nsrc = leak["E"].shape[1]
-            μ0 = torch.as_tensor(np.broadcast_to(np.asarray(leak_prior_μ, dtype=np.float32), (nsrc,)).copy())
-            self.register_buffer("leak_prior_μ", μ0.clone())
-            self.leak_prior_σ = leak_prior_σ
-            self.leak_fixed = leak_prior_σ == 0
-            if self.leak_fixed:
-                self.register_buffer("log_ρ", μ0.clone())
-            else:
-                self.log_ρ = nn.Parameter(μ0.clone())
-
         self.include_mixing = include_mixing
-        self.include_drift = drift is not None
-        # A's donor-cluster scale. u is variational like β (mean-field), with a
-        # N(0, u_prior_σ²) prior; the scale multiplies each off-diagonal weight and
-        # every row is renormalized to its ORIGINAL total, so the background share is
-        # exactly untouched -- §55 measured slack at 15x the matrix effect, so letting
-        # it move would make this experiment about slack instead.
-        self.include_donor_scale = donor_clusters is not None
-        self.u_prior_σ = u_prior_σ
-        if donor_clusters is not None:
-            self.register_buffer("donor_cluster", torch.as_tensor(
-                np.ascontiguousarray(donor_clusters), dtype=torch.long).clone())
-            K = int(np.asarray(donor_clusters).max()) + 1
-            self.n_donor_clusters = K
-            self.u_μ = nn.Parameter(torch.zeros(K))
-            self.u_logσ = nn.Parameter(torch.full((K,), -3.0))
-        # A per-cell log-scale, learned as a DEVIATION from log(observed total):
-        # `log_size_eff[i] = log_size[i] + δ_size[i]`, with a N(0, size_prior_σ²)
-        # shrinkage penalty. δ = 0 is exactly the fixed offset, so the prior width is
-        # the whole knob and the status quo is one end of it.
-        #
-        # It sits on λ, BEFORE the mixing, which is the point: a scale applied to the
-        # observed side would fix each cell's own predicted total and still hand every
-        # neighbour the wrong donor rate. Here a cell's scale propagates through A to
-        # everyone it donates to, which is what makes this a deconvolution of the
-        # totals rather than a per-cell fudge factor. It scales the background term
-        # with the cell too, since `bg_weight` is a FRACTION of the cell's own size.
-        #
-        # MAP rather than variational, following δ_cs: each δ has ngenes observations
-        # behind it, so the posterior is sharp and the mode is nearly the mean. β's
-        # interval therefore CONDITIONS on δ̂ -- the same gap κ had before propagate_κ
-        # and u has now.
+
+        # A per-cell log-scale, learned as a deviation from log(observed total).
         self.include_cell_size = include_cell_size
         self.size_prior_σ = size_prior_σ
         if include_cell_size:
             self.δ_size = nn.Parameter(torch.zeros(ncells))
-        self.include_cellspace = cellspace is not None
-        self.cellspace_percluster = False
 
         # Needed to weight the KL against a minibatch's share of the likelihood.
         self.ncells = ncells
 
-        # Prior on the regression coefficients: Cauchy(0, β_prior_σ) by DEFAULT,
-        # or N(0, β_prior_σ²) with `β_prior="normal"` -- one scale parameter either
-        # way, so a caller switches the FAMILY without also retuning a knob. See
-        # β_kl for the two cross-entropy terms and why the Cauchy one is a
-        # single-sample estimate.
-        #
-        # WHY THE CAUCHY IS THE DEFAULT (simple-seg-sim bench/DESIGN_v2 §63). At
-        # γ=1 it is at or above the Gaussian on false positives AND on power for
-        # the largest effects at the same time -- Atera cur FP 0.176 vs 0.179, FP
-        # panel 0.150 vs 0.160, power at |log-FC| > 0.65 0.85 vs 0.83 -- so it is
-        # the one setting on this axis that costs nothing. Tightening γ below 1
-        # then buys FP at a steady ~8 points of large-effect power per 0.04 of cur
-        # FP, with no sweet spot anywhere in between: γ is a DIAL for the caller,
-        # not a tuned constant.
-        #
-        # It matters ONLY where the likelihood is flat, which in practice means the
-        # drift term's β/κ split; with β facing the likelihood alone the family is
-        # worth nothing (σ 1.0 vs 0.3 moves the null bias in the 4th decimal). So
-        # this default is not a general claim about regularizing β.
         if β_prior not in ("normal", "cauchy"):
-            raise ValueError(
-                f"β_prior must be 'normal' or 'cauchy', got {β_prior!r}")
+            raise ValueError(f"β_prior must be 'normal' or 'cauchy', got {β_prior!r}")
         self.β_prior = β_prior
         self.β_prior_σ = β_prior_σ
 
@@ -1689,68 +681,6 @@ class RegressionModel(nn.Module):
         self.β_μ = nn.Parameter(torch.full((ncovariates, ngenes), 0.0))
         self.β_logσ = nn.Parameter(torch.full((ncovariates, ngenes), -2.0))
 
-        # The drift direction is FIXED (a buffer, so it follows .to(device) and is
-        # not optimized); only its per-column scale κ is fitted. One scalar per
-        # design column, initialized at 0 so the fit starts from the uncorrected
-        # solution and κ has to earn its way off it.
-        # A prior on κ, and WHY it is worth having one. The likelihood is EXACTLY
-        # invariant along (β + c*u, κ - c) -- the drift enters the mean only through
-        # β + κ*u -- so the split is chosen entirely by the priors, not fitted. With
-        # κ unpenalized that choice falls wholly on β_prior_σ, whose right value
-        # depends on the panel and the effect-size distribution and so does not
-        # transfer between datasets.
-        #
-        # κ transfers much better. Fitted per design group against measured damage it
-        # sits at mean -1.46, sd 1.04 over 17 groups spanning breast (313 genes) and
-        # Atera (16.7k-gene WTA) -- simple-seg-sim DESIGN_v2 §57. It also has an
-        # external check no prior on β has: compare the fitted κ against the prior on
-        # any new dataset. So N(-1.5, 1) is weakly informative rather than tuned, and
-        # it takes the arbitrariness off β_prior_σ.
-        #
-        # NOT derived from the mixing geometry, which was tried and fails: the
-        # per-gene donor/self ratio the first-order theory calls for is a ratio of two
-        # tiny noisy numbers, and using it pointwise destroys the covariate (median R²
-        # 0.24 -> 0.05 breast, 0.22 -> 0.01 Atera). Group-level geometry anchors
-        # correlate only +0.33 with κ. The fitted scalar is doing real variance
-        # reduction, not merely absorbing ignorance.
-        self.κ_prior_μ = κ_prior_μ
-        self.κ_prior_σ = κ_prior_σ
-        if κ_prior_σ is not None and κ_prior_σ < 0:
-            raise ValueError(f"κ_prior_σ must be >= 0 or None; got {κ_prior_σ}")
-        self.κ_fixed = κ_prior_σ == 0
-        if cellspace is not None:
-            # frac is rebuilt per minibatch from these; materializing it would be
-            # 3.0 GB on the Atera panel. One kappa, as for the drift term.
-            for nm, arr, dt in (("cs_M", cellspace["M"], torch.float32),
-                                ("cs_sw", cellspace["sw"], torch.float32),
-                                ("cs_own", cellspace["own"], torch.long),
-                                ("cs_P", cellspace["P"], torch.float32),
-                                ("cs_gene", cellspace["gene_index"], torch.long)):
-                self.register_buffer(nm, torch.as_tensor(
-                    np.ascontiguousarray(arr)).to(dt).clone())
-            self.κ_cs = nn.Parameter(torch.zeros(()))
-            self.cellspace_percluster = cellspace_percluster
-            self.cellspace_shrink_σ = cellspace_shrink_σ
-            if cellspace_percluster:
-                self.δ_cs = nn.Parameter(
-                    torch.zeros(int(cellspace["P"].shape[0])))
-        if drift is not None:
-            # np.ascontiguousarray: a reindexed DataFrame's array can be read-only,
-            # which torch warns about and would make the buffer's writability
-            # undefined.
-            self.register_buffer(
-                "u", torch.as_tensor(np.ascontiguousarray(drift),
-                                     dtype=torch.float32).clone())
-            # κ_prior_σ == 0 FIXES κ at κ_prior_μ: a buffer, not a parameter. A
-            # tight prior is not a substitute, because the likelihood's gradient on
-            # κ sums over every gene and cell in a batch and easily outvotes it.
-            κ0 = torch.full((ncovariates,), float(κ_prior_μ))
-            if self.κ_fixed:
-                self.register_buffer("κ", κ0)
-            else:
-                self.κ = nn.Parameter(κ0)
-
-
     def forward(self, batch: RegressionBatch):
         if self.training:
             β_σ = torch.exp(self.β_logσ.clamp(max=4.0))
@@ -1759,39 +689,13 @@ class RegressionModel(nn.Module):
             β = self.β_μ
 
         # regression
-        # TODO: if this proves to be too inflexible, we may have to revive our old scheme of encoding
-        # some amount of extra per-cell variation using a VAE term.
-        #
-        # log_size is a fixed offset, so exp(gene_bias) is a gene's share of a
-        # cell's total and λ is on the absolute count scale, which is what the
-        # mixing below needs in order to redistribute molecules correctly.
-        # δ = κ*u is the contamination bias in coefficient space. It enters the
-        # MEAN, so the fit reproduces the observed (biased) coefficients, while β
-        # -- what is reported -- is what is left after it. β is penalized and κ is
-        # not, which is what makes the split identifiable; see Regression.__init__.
-        β_eff = β + self.κ.unsqueeze(1) * self.u if self.include_drift else β
         log_size = batch.log_size
         if self.include_cell_size:
             log_size = log_size + self.δ_size[batch.nodes]
-        η = batch.design @ β_eff + self.gene_bias + log_size.unsqueeze(1)
-        if self.include_cellspace:
-            κc = self.κ_cs
-            if self.cellspace_percluster:
-                κc = (self.κ_cs + self.δ_cs[self.cs_own[batch.nodes]]).unsqueeze(1)
-            η = η + κc * self.cellspace_frac(batch)
+        η = batch.design @ β + self.gene_bias + log_size.unsqueeze(1)
         λ = torch.exp(η)
 
-        u = None
-        if self.include_donor_scale:
-            if self.training:
-                u_σ = torch.exp(self.u_logσ.clamp(max=2.0))
-                u = self.u_μ + torch.randn_like(u_σ) * u_σ
-            else:
-                u = self.u_μ
-
-        λ_obs = self.mix(λ, batch, u=u, log_size=log_size)
-        if self.include_leak:
-            λ_obs = λ_obs + self.leak_rate(batch.nodes[: batch.nreceivers])
+        λ_obs = self.mix(λ, batch, log_size=log_size)
 
         # Senders-only nodes exist to supply λ for the mixing; only receivers are
         # modeled, so the likelihood is over the leading block of the batch.
@@ -1800,60 +704,17 @@ class RegressionModel(nn.Module):
         # loss
         ll = self.negbinom_likelihood(λ_obs, X_obs)
 
-        # β is a global parameter but the likelihood only covers this batch, so
-        # the KL is down-weighted by the batch's share of the data. Summed over
-        # an epoch these weights come to exactly 1, i.e. the prior is applied
-        # once per pass. Without this it is applied once per *batch*, which is
-        # ncells/batch_size times too strong.
+        # Scale kl, since β is a global parameter, but here we are computing
+        # loss for a single batch. Otherwise the strength of β's prior is not
+        # properly scaled.
         kl = self.β_kl(β) * (batch.nreceivers / self.ncells)
-        # κ is a MAP parameter, not variational, so its prior is a plain penalty --
-        # weighted like the KL so that a pass over the data applies it exactly once.
-        if self.include_cellspace and self.cellspace_percluster:
-            # Partial pooling on the per-cluster deviations, weighted like the KL so
-            # one pass applies it exactly once.
-            kl = kl + ((self.δ_cs ** 2).sum()
-                       / (2.0 * self.cellspace_shrink_σ ** 2)) * (
-                           batch.nreceivers / self.ncells)
-        if self.include_donor_scale:
-            kl = kl + self.u_kl() * (batch.nreceivers / self.ncells)
+
         if self.include_cell_size:
-            kl = kl + ((self.δ_size ** 2).sum()
-                       / (2.0 * self.size_prior_σ ** 2)) * (
-                           batch.nreceivers / self.ncells)
-        if self.include_leak and self.leak_prior_σ is not None and not self.leak_fixed:
-            kl = kl + (((self.log_ρ - self.leak_prior_μ) ** 2).sum()
-                       / (2.0 * self.leak_prior_σ ** 2)) * (batch.nreceivers / self.ncells)
-        if self.include_drift and self.κ_prior_σ is not None and not self.κ_fixed:
-            kl = kl + (((self.κ - self.κ_prior_μ) ** 2).sum()
-                       / (2.0 * self.κ_prior_σ ** 2)) * (batch.nreceivers / self.ncells)
+            kl = kl + ((self.δ_size**2).sum() / (2.0 * self.size_prior_σ**2)) * (
+                batch.nreceivers / self.ncells
+            )
 
         return -ll.sum() + kl
-
-    def leak_rate(self, nodes: Tensor) -> Tensor:
-        """Expected leak counts sum_s rho_s E[i, s] P[s, g] for these cells, [n, ngenes]."""
-        return (self.leak_E[nodes] * torch.exp(self.log_ρ)) @ self.leak_P
-
-    def cellspace_frac(self, batch: RegressionBatch) -> Tensor:
-        """frac[i, g] for this batch's nodes, [nnodes, ngenes].
-
-            F = M_i @ P          what the donor neighbourhood expresses
-            O = sw_i * P[own_i]  what the cell's own cluster expresses
-            frac = F / (F + O)
-
-        Rebuilt rather than stored: the full field is 3.0 GB on Atera, while a
-        2048-node batch is ~137 MB. Genes absent from the field get 0, which makes
-        their correction a no-op rather than a NaN.
-        """
-        idx = batch.nodes
-        F = self.cs_M[idx] @ self.cs_P                     # [nnodes, ngenes_field]
-        O = self.cs_sw[idx].unsqueeze(1) * self.cs_P[self.cs_own[idx]]
-        frac = F / (F + O).clamp(min=1e-9)
-        g = self.cs_gene
-        out = torch.zeros((frac.shape[0], g.shape[0]), dtype=frac.dtype,
-                          device=frac.device)
-        keep = g >= 0
-        out[:, keep] = frac[:, g[keep]]
-        return out
 
     def β_kl(self, β: Tensor) -> Tensor:
         """KL(q(β) || prior), summed over all covariates and genes.
@@ -1866,11 +727,7 @@ class RegressionModel(nn.Module):
         CAUCHY: KL(q || Cauchy(0, β_prior_σ)), split as -H(q) - E_q[log p]. The
         entropy is exact; the cross-entropy is a ONE-SAMPLE estimate at the draw
         the likelihood already made. A second draw would add variance without
-        information, and the gradient through β is unbiased either way. The point
-        of the heavy tail: the penalty gradient is 2β/(γ² + β²), which pulls like
-        2β/γ² near zero but decays like 2/β in the tail, so a scale tight enough
-        to shrink the nulls does not also attenuate a real log-FC -- the coupling
-        that refuted `β_prior_σ = 0.1` (simple-seg-sim DESIGN_v2 §62).
+        information, and the gradient through β is unbiased either way.
 
         In eval mode β is β_μ and the Cauchy estimate degenerates to a point
         evaluation; nothing calls this outside training.
@@ -1879,7 +736,8 @@ class RegressionModel(nn.Module):
         if self.β_prior == "cauchy":
             neg_entropy = -(0.5 * np.log(2.0 * np.pi * np.e) + β_logσ)
             cross = np.log(np.pi * self.β_prior_σ) + torch.log1p(
-                (β / self.β_prior_σ) ** 2)
+                (β / self.β_prior_σ) ** 2
+            )
             return (neg_entropy + cross).sum()
         prior_var = self.β_prior_σ**2
         return (
@@ -1889,15 +747,12 @@ class RegressionModel(nn.Module):
             - 0.5
         ).sum()
 
-    def u_kl(self) -> Tensor:
-        """KL(q(u) || N(0, u_prior_σ²)) over the donor-cluster scales."""
-        lg = self.u_logσ.clamp(max=2.0)
-        pv = self.u_prior_σ ** 2
-        return (np.log(self.u_prior_σ) - lg
-                + (torch.exp(2.0 * lg) + self.u_μ ** 2) / (2.0 * pv) - 0.5).sum()
-
-    def mix(self, λ: Tensor, batch: RegressionBatch, u: Tensor | None = None,
-            log_size: Tensor | None = None) -> Tensor:
+    def mix(
+        self,
+        λ: Tensor,
+        batch: RegressionBatch,
+        log_size: Tensor | None = None,
+    ) -> Tensor:
         """Corrupt per-cell rates by missegmentation, [nnodes, ngenes] -> [nreceivers, ngenes].
 
         A[i,j] is the posterior probability that a molecule counted in cell i was
@@ -1911,27 +766,6 @@ class RegressionModel(nn.Module):
             return λ[:nr, :]
 
         w = batch.weights
-        if u is not None:
-            # Off-diagonal weights scale by exp(u) of the DONOR's cluster, then each
-            # row is renormalized to its original total. Renormalizing (rather than
-            # letting the diagonal absorb additively) keeps every weight positive
-            # with no clipping, and holds the row total -- hence the background
-            # share -- exactly fixed. Self edges are exactly `senders == receivers`,
-            # because receivers occupy local positions 0..nreceivers-1; and every
-            # edge of a receiver is present in its batch, so the row sums below are
-            # complete rather than partial.
-            d = self.donor_cluster[batch.nodes[batch.senders]]
-            sc = torch.where(d >= 0, torch.exp(u[d.clamp(min=0)]),
-                             torch.ones((), dtype=w.dtype, device=w.device))
-            is_self = batch.senders == batch.receivers
-            sc = torch.where(is_self, torch.ones_like(sc), sc)
-            w_new = w * sc
-            nr_ = batch.nreceivers
-            old_tot = torch.zeros(nr_, dtype=w.dtype, device=w.device)
-            old_tot.index_add_(0, batch.receivers, w)
-            new_tot = torch.zeros(nr_, dtype=w.dtype, device=w.device)
-            new_tot.index_add_(0, batch.receivers, w_new)
-            w = w_new * (old_tot / new_tot.clamp(min=1e-12))[batch.receivers]
 
         # [nedges, ngenes], one row per (receiver, sender) pair
         contrib = w.unsqueeze(1) * λ[batch.senders, :]
@@ -1953,9 +787,9 @@ class RegressionModel(nn.Module):
         log_r_over_r_plus_mu = torch.log(r / (r + λ + eps))
         log_mu_over_r_plus_mu = torch.log((λ + eps) / (r + λ + eps))
         return (
-                torch.lgamma(X + r)
-                - torch.lgamma(r)
-                - torch.lgamma(X + 1)
-                + r * log_r_over_r_plus_mu
-                + X * log_mu_over_r_plus_mu
-            ).sum(dim=-1)
+            torch.lgamma(X + r)
+            - torch.lgamma(r)
+            - torch.lgamma(X + 1)
+            + r * log_r_over_r_plus_mu
+            + X * log_mu_over_r_plus_mu
+        ).sum(dim=-1)
