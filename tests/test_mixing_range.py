@@ -70,6 +70,27 @@ def test_scaled_mixing_rows_stay_STOCHASTIC():
     assert np.allclose(A0.diagonal(), 1.0) and A0.nnz == A0.shape[0] and np.all(bg0 == 0)
 
 
+def test_EXTRAPOLATED_mixing_rows_stay_valid_and_cap_at_full_loss():
+    """s > 1 scales each cell's loss up, capped at losing everything."""
+    ad, _ = make_data()
+    # a few cells lose 70% instead of 30%, so s = 2 would drive A_ii below 0
+    st = ad.obsp["state_transitions"].tolil()
+    for i in range(5):
+        off = st[i].sum() - st[i, i]
+        st[i, i] = off * 0.3 / 0.7
+    ad.obsp["state_transitions"] = st.tocsr()
+    reg = Regression(ad, FORMULA, include_mixing=True)
+    full = np.asarray(reg._A_full.sum(1)).ravel() + reg._bg_full
+    loss = 1.0 - reg._A_full.diagonal()
+    A, bg = reg._mixing_at(2.0)
+    assert np.allclose(np.asarray(A.sum(1)).ravel() + bg, full, atol=1e-5)
+    assert A.data.min() >= 0 and bg.min() >= 0
+    d = A.diagonal()
+    capped = loss > 0.5
+    assert capped[:5].all() and not capped[5:].any()
+    assert np.allclose(d[capped], 0.0, atol=1e-6)
+    assert np.allclose(d[~capped], 1.0 - 2.0 * loss[~capped], atol=1e-5)
+
 def test_a_ZERO_width_mixing_range_is_the_ordinary_interval():
     ad, _ = make_data()
     _, lin = _fit(ad)
@@ -88,9 +109,9 @@ def test_a_full_mixing_range_COVERS_both_ends():
 
 
 @pytest.mark.parametrize("kw, match", [
-    ({"mixing_scale": 1.5}, "mixing_scale must be in"),
+    ({"mixing_scale": -0.1}, "mixing_scale must be >= 0"),
     ({"mixing_scale": 0.5, "mixing_range": (0.6, 1.0)}, "mixing_range must satisfy"),
-    ({"mixing_scale": 0.5, "mixing_range": (0.0, 1.2)}, "mixing_range must satisfy"),
+    ({"mixing_scale": 1.5, "mixing_range": (0.0, 1.2)}, "mixing_range must satisfy"),
     ({"include_mixing": False, "mixing_range": (0.0, 1.0)}, "needs include_mixing"),
 ])
 def test_bad_mixing_arguments_are_ERRORS(kw, match):

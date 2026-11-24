@@ -10,6 +10,7 @@ from patsy import dmatrix
 from patsy.design_info import DesignMatrix
 from scipy import stats
 from scipy.sparse import coo_matrix, csr_matrix, issparse
+from scipy.sparse import diags as sp_diags
 from scipy.sparse import identity as sp_identity
 from spatialdata import SpatialData
 from torch import Tensor, nn
@@ -100,13 +101,16 @@ class Regression:
 
         self._A_full = A.astype(np.float32)
         self._bg_full = (to_bg_trans_count / normalizer).astype(np.float32)
-        if not 0.0 <= mixing_scale <= 1.0:
-            raise ValueError(f"mixing_scale must be in [0, 1], got {mixing_scale}")
+        # s > 1 extrapolates: more of each cell's transcripts are taken to have
+        # moved than the segmenter estimated (for platforms where its diffusion
+        # model is too narrow). See _mixing_at for how rows are kept valid.
+        if not 0.0 <= mixing_scale:
+            raise ValueError(f"mixing_scale must be >= 0, got {mixing_scale}")
         if mixing_range is not None:
             lo, hi = mixing_range
-            if not (0.0 <= lo <= mixing_scale <= hi <= 1.0):
+            if not (0.0 <= lo <= mixing_scale <= hi):
                 raise ValueError(
-                    "mixing_range must satisfy 0 <= lo <= mixing_scale <= hi <= 1"
+                    "mixing_range must satisfy 0 <= lo <= mixing_scale <= hi"
                 )
             if not include_mixing:
                 raise ValueError("mixing_range needs include_mixing=True")
@@ -372,15 +376,28 @@ class Regression:
         return out
 
     def _mixing_at(self, scale: float) -> tuple[csr_matrix, npt.NDArray[np.float32]]:
-        """(A_s, bg_s) at mixing scale s: (1 - s) I + s A and s·bg."""
+        """(A_s, bg_s) at mixing scale s: (1 - s) I + s A and s·bg.
+
+        Equivalently I + s (A - I): s scales everything a cell loses (to other
+        cells and to background). For s > 1 a row whose loss 1 - A_ii is more
+        than 1/s would get a negative diagonal, so its scale is capped at
+        1 / (1 - A_ii): that cell is taken to keep none of its transcripts.
+        Rows still sum to 1 and stay non-negative.
+        """
         if scale == 1.0:
             return self._A_full, self._bg_full
         n = self._A_full.shape[0]
-        A = (
-            sp_identity(n, format="csr", dtype=np.float32) * (1.0 - scale)
-            + self._A_full * scale
-        ).tocsr()
-        return A.astype(np.float32), (self._bg_full * scale).astype(np.float32)
+        I = sp_identity(n, format="csr", dtype=np.float32)
+        if scale <= 1.0:
+            A = (I * (1.0 - scale) + self._A_full * scale).tocsr()
+            return A.astype(np.float32), (self._bg_full * scale).astype(np.float32)
+        loss = 1.0 - self._A_full.diagonal().astype(np.float64)
+        s_row = np.where(
+            loss > 0, np.minimum(scale, 1.0 / np.maximum(loss, 1e-12)), scale
+        )
+        A = (I + sp_diags(s_row.astype(np.float32)) @ (self._A_full - I)).tocsr()
+        A.data = np.maximum(A.data, 0.0)  # rounding at capped rows
+        return A.astype(np.float32), (self._bg_full * s_row).astype(np.float32)
 
     def range_interval(
         self,
@@ -406,32 +423,40 @@ class Regression:
         m = self.model
 
         dev = next(m.parameters()).device
+        # Working precision. Everything that scales with ncells runs in float32
+        # (float64 is 1/64 rate on consumer GPUs); sums over cells accumulate in
+        # float64, and the small per-gene Newton solves and inverses are float64.
+        fd = torch.float32
         z = float(stats.norm.ppf(1.0 - (1.0 - credible_interval) / 2.0))
-        B0 = m.β_μ.detach().double()
-        gene_bias = m.gene_bias.detach().double()
-        r = torch.exp(m.log_r.detach().double()).clamp(min=1e-3)
-        bg_profile = torch.softmax(m.bg_rates.detach().double(), dim=-1)
+        B0 = m.β_μ.detach().to(fd)
+        gene_bias = m.gene_bias.detach().to(fd)
+        r = torch.exp(m.log_r.detach().to(fd)).clamp(min=1e-3)
+        bg_profile = torch.softmax(m.bg_rates.detach().to(fd), dim=-1)
 
         lo, hi = self.mixing_range
         settings = [lo, self.mixing_scale, hi]
 
-        X = torch.as_tensor(np.asarray(self.design, dtype=np.float64), device=dev)
-        log_size = torch.as_tensor(self.log_size.astype(np.float64), device=dev)
+        X = torch.as_tensor(np.asarray(self.design, dtype=np.float32), device=dev)
+        log_size = torch.as_tensor(self.log_size.astype(np.float32), device=dev)
         if m.include_cell_size:
-            log_size = log_size + m.δ_size.detach().double().to(dev)
+            log_size = log_size + m.δ_size.detach().to(dev, fd)
 
         def mixing_tensors(scale):
             Aop, bg = self._mixing_at(scale)
             A = torch.sparse_csr_tensor(
                 torch.as_tensor(Aop.indptr, dtype=torch.int64, device=dev),
                 torch.as_tensor(Aop.indices, dtype=torch.int64, device=dev),
-                torch.as_tensor(Aop.data.astype(np.float64), device=dev), size=Aop.shape)
-            return A, torch.as_tensor(np.asarray(bg, dtype=np.float64), device=dev)
+                torch.as_tensor(Aop.data.astype(np.float32), device=dev), size=Aop.shape)
+            return A, torch.as_tensor(np.asarray(bg, dtype=np.float32), device=dev)
 
         cauchy = m.β_prior == "cauchy"
         γ = float(m.β_prior_σ)
         ncov, ngenes = B0.shape
         ncells = X.shape[0]
+        # The Jacobian J is [ncells, chunk, ncov] float32 and the Newton step holds
+        # a few of them; cap it at ~512 MiB so whole slides with wide designs fit
+        # (307k cells x 72 covariates is 88 MB per gene).
+        chunk = max(1, min(chunk, (512 << 20) // (ncells * ncov * 4)))
         eye = torch.eye(ncov, dtype=torch.float64, device=dev)
         lower = np.full((ncov, ngenes), np.inf)
         upper = np.full((ncov, ngenes), -np.inf)
@@ -441,7 +466,7 @@ class Regression:
 
             for start in range(0, ngenes, chunk):
                 sl = slice(start, min(start + chunk, ngenes))
-                y = self._counts_chunk(sl, dev)
+                y = self._counts_chunk(sl, dev).to(fd)
                 rg = r[sl].unsqueeze(0)
 
                 def mean(B):
@@ -456,7 +481,7 @@ class Regression:
                     _, μ = mean(B)
                     nll = -(
                         y * torch.log(μ + 1e-8) - (y + rg) * torch.log(rg + μ + 1e-8)
-                    ).sum(0)
+                    ).sum(0, dtype=torch.float64)
                     if cauchy:
                         return nll + torch.log1p((B / γ) ** 2).sum(0)
                     return nll + (B**2).sum(0) / (2.0 * γ**2)
@@ -472,14 +497,17 @@ class Regression:
                             ncells, G * ncov
                         )
                     ).reshape(ncells, G, ncov)
+                    Bd = B.double()
                     if cauchy:
-                        pgrad, pprec = 2.0 * B / (γ**2 + B**2), 2.0 / (γ**2 + B**2)
+                        pgrad, pprec = 2.0 * Bd / (γ**2 + Bd**2), 2.0 / (γ**2 + Bd**2)
                     else:
-                        pgrad, pprec = B / γ**2, torch.full_like(B, 1.0 / γ**2)
+                        pgrad, pprec = Bd / γ**2, torch.full_like(Bd, 1.0 / γ**2)
                     w = rg / (μ * (rg + μ) + 1e-12)
-                    grad = torch.einsum("ngc,ng->gc", J, w * (y - μ)) - pgrad.T
+                    grad = (
+                        torch.einsum("ngc,ng->gc", J, w * (y - μ)).double() - pgrad.T
+                    )
                     H = (
-                        torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2))
+                        torch.einsum("ngc,ngd->gcd", J, J * w.unsqueeze(2)).double()
                         + pprec.T.unsqueeze(2) * eye
                     )
                     return grad, H
@@ -489,9 +517,9 @@ class Regression:
                 for _ in range(max_iter):
                     grad, H = curvature(B)
                     step = (
-                        torch.linalg.solve(H, grad.unsqueeze(2)).squeeze(2).T
+                        torch.linalg.solve(H, grad.unsqueeze(2)).squeeze(2).T.to(fd)
                     )  # [ncov, G]
-                    t = torch.ones(B.shape[1], dtype=torch.float64, device=dev)
+                    t = torch.ones(B.shape[1], dtype=fd, device=dev)
                     for _ in range(20):  # per-gene step halving, on the objective alone
                         nll_new = objective(B + step * t)
                         bad = ~(nll_new <= nll + 1e-10)
